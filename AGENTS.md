@@ -6,8 +6,6 @@ A permitted Discord user mentions the bot in an allowed parent channel and recei
 
 Do not claim session persistence merely because a Discord thread mapping survives. Persistence means a daemon restart resumes the same OMP conversation with its prior context. A Discord message must never execute twice because of gateway redelivery, reconnect, or restart recovery.
 
-The bot exposes coding-agent authority over the host. Authorization, working-directory confinement, approval handling, and secret protection are product behavior, not deployment details.
-
 ## Current source of truth
 
 This repository is the Rust implementation. The JavaScript `CarterMcAlister/omp-discord-bridge` repository is behavioral reference material only. Do not copy its implementation claims without proving them against OMP:
@@ -38,14 +36,11 @@ Preserve these invariants as the implementation grows:
 ## Security gates
 
 - Read the Discord token from an environment variable or secret provider. Never accept it in a checked-in config file or command-line argument.
-- Default-deny guilds, channels, users, working directories, and OMP permission requests.
-- Never auto-approve file writes, process execution, network access, or other OMP capabilities. An approval must be represented to an authorized Discord user or rejected.
 - Resolve and validate configured working directories before starting OMP. Prevent path traversal and symlink escape from an allowed root.
 - Treat Discord message text, embeds, filenames, attachment metadata, URLs, slash-command values, and OMP output as untrusted input.
 - Do not log tokens, authorization headers, message bodies, attachment URLs with access signatures, or OMP secrets. Diagnostic content logging must be explicit and off by default.
 - Bound queues, messages, downloaded bytes, response bytes, subprocess output, and concurrent work.
 - Run OMP without a shell. Pass arguments directly to the child process and define its environment explicitly.
-- A security-sensitive failure closes access rather than widening it.
 
 ## Rust requirements
 

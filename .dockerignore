@@ -1,0 +1,13 @@
+.git
+target
+container
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+discord-token

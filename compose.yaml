@@ -1,0 +1,36 @@
+name: omp-discord-bridge
+
+services:
+  bridge:
+    build:
+      context: .
+      args:
+        RUST_VERSION: "${RUST_VERSION:-1.99.1}"
+        OMP_VERSION: "${OMP_VERSION:-18.18.0}"
+    image: omp-discord-bridge:local
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      HOME: /data
+      OMP_DISCORD_BRIDGE_CONFIG: /config/config.toml
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - type: bind
+        source: ${BRIDGE_CONFIG_DIR:-./container/config}
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${BRIDGE_DATA_DIR:-./container/data}
+        target: /data
+      - type: bind
+        source: ${OMP_WORKSPACE_DIR:-.}
+        target: /workspace
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

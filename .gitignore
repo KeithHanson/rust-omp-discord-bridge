@@ -5,6 +5,8 @@ target/
 .env
 .env.*
 !.env.example
+*.token
+discord-token
 
 # Runtime state
 *.db
@@ -17,6 +19,9 @@ target/
 *.profraw
 core
 core.*
+
+# Local container mounts
+/container/
 
 # Editors and operating systems
 .DS_Store

@@ -1,0 +1,30 @@
+[discord]
+token_file = "/config/discord-token"
+thread_auto_archive_minutes = 1440
+
+[[discord.guilds]]
+id = "123456789012345678"
+allowed_channels = ["234567890123456789"]
+allowed_users = ["345678901234567890"]
+cwd = "/workspace"
+
+[omp]
+executable = "omp"
+session_dir = "/data/omp-sessions"
+allowed_root = "/workspace"
+# Omit model to use OMP's configured default, or set an exact provider/model ID.
+# model = "openai-codex/gpt-5.6-sol"
+# thinking_level = "medium"
+
+[runtime]
+database_path = "/data/bridge.sqlite"
+max_concurrency = 2
+discord_message_limit = 1900
+max_attachment_bytes = 25000000
+max_attachments = 10
+max_response_bytes = 1048576
+discord_history_max_days = 30
+discord_history_max_messages = 5000
+discord_history_max_bytes = 131072
+discord_history_timeout_seconds = 30
+turn_timeout_seconds = 3600
