@@ -1,0 +1,11 @@
+[package]
+name = "omp-discord-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Discord gateway for persistent per-thread OMP sessions"
+license = "MIT"
+
+[lints.rust]
+unsafe_code = "forbid"
