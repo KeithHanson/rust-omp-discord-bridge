@@ -111,6 +111,7 @@ pub trait ThreadMessenger: Send + Sync {
     async fn confirm(&self, thread_id: ThreadId, request: ApprovalRequest) -> bool;
     async fn notify(&self, thread_id: ThreadId, message: &str);
     async fn channel_history(&self, thread_id: ThreadId, days: u16) -> Result<String>;
+    async fn thread_participants(&self, thread_id: ThreadId) -> Result<String>;
 }
 
 pub struct ThreadQueueRunner {
@@ -469,6 +470,13 @@ impl OmpUi for RunnerUi<'_> {
             .await
             .map_err(|error| error.to_string())
     }
+
+    async fn thread_participants(&self) -> Result<String, String> {
+        self.messenger
+            .thread_participants(self.thread_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn outcome_notice(
@@ -691,6 +699,10 @@ mod tests {
         async fn notify(&self, _thread_id: ThreadId, _message: &str) {}
 
         async fn channel_history(&self, _thread_id: ThreadId, _days: u16) -> Result<String> {
+            Ok("[]".to_owned())
+        }
+
+        async fn thread_participants(&self, _thread_id: ThreadId) -> Result<String> {
             Ok("[]".to_owned())
         }
     }

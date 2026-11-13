@@ -22,9 +22,25 @@ The child inherits the bridge process environment, including `HOME` and provider
 
 The bridge does not pass `--approval-mode` or `--auto-approve`. OMP's project configuration in the session working directory governs `tools.approvalMode`; when the project does not set it, OMP's normal configuration layering and default apply. Read-only calls and approved actions retain their normal OMP capabilities.
 
-Before the first prompt in each process, the bridge registers one RPC host tool named `discord_channel_history` with `set_host_tools`. OMP calls it with an integer `days` argument. The bridge—not the OMP process—uses the Discord token to page backward through the managed session's authorized parent channel, stopping at the requested cutoff. Results are chronological JSON and include message text, author data, embeds, and attachment metadata.
+Before the first prompt in each process, the bridge registers `discord_channel_history`
+and `discord_thread_participants` with `set_host_tools`, and requires OMP to
+acknowledge both. The history tool accepts an integer `days` argument. The
+bridge—not the OMP process—uses the Discord token to page backward through the
+managed session's authorized parent channel, stopping at the requested cutoff.
+Results are chronological JSON containing message text, author data, embeds,
+and attachment metadata.
 
-The host tool enforces the configured maximum days, message count, encoded bytes, and request timeout. Crossing any limit returns a tool error and no partial history. Discord content and metadata remain untrusted; the tool result labels them as data. OMP receives neither the Discord token nor a general Discord API capability.
+The participants tool accepts no arguments and lists the current managed
+thread's members with their display names, usernames, bot flags, IDs, and
+explicit mentions. Membership is not online presence, access authorization, or
+proof of having read the thread. Neither tool accepts an arbitrary channel ID.
+
+History enforces the configured maximum days, message count, encoded bytes,
+and request timeout. Participant lookup shares `discord_history_timeout_seconds`,
+`discord_history_max_bytes`, and the `discord_history_max_messages` count cap.
+Crossing a limit returns a tool error rather than a partial result. Discord
+content and identity labels remain untrusted data. OMP receives neither the
+Discord token nor a general Discord API capability.
 
 ## Protocol behavior
 

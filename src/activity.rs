@@ -164,6 +164,10 @@ mod tests {
         async fn channel_history(&self, _: ThreadId, _: u16) -> Result<String> {
             unreachable!()
         }
+
+        async fn thread_participants(&self, _: ThreadId) -> Result<String> {
+            unreachable!()
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -214,7 +214,9 @@ Joining does not import the thread's previous conversation into OMP.
 There is no peer-bot ID configuration. Real bot accounts can initiate work only
 when their message directly addresses this bridge with an explicit `<@BOT_ID>`
 mention. Self-messages, webhooks, implicit reply pings, and unmentioned bot chatter
-are ignored. Peer prompts identify the sending bot and how to address it.
+are ignored. Peer prompts identify the sending bot by ID, display name (guild
+nickname, then global display name, then username), and username, and explain how
+to address it. Names are untrusted labels; use the explicit ID mention to reply.
 Humans can also address one bot explicitly; other joined bridges ignore messages
 directed solely at that other bot. Unaddressed authorized human messages are
 handled by each joined bridge.
@@ -276,6 +278,16 @@ interruption; the column is added automatically when opening an existing databas
 The bridge does not override OMP's approval mode, remove tools, or sandbox an approved call. OMP loads the project configuration from the configured working directory, including `tools.approvalMode`. When that policy asks for approval, the bridge translates OMP's one-shot request into Discord buttons. Persistent session-wide approval is intentionally unavailable through Discord.
 
 OMP can call `discord_channel_history` to read messages from the allowed parent channel that created the session. The tool accepts `days`, returns chronological JSON containing message text, author metadata, embeds, and attachment metadata, and never exposes the Discord token. Discord history is untrusted input. Requests outside the configured day window or resource limits fail explicitly; history is never silently truncated.
+
+OMP can call `discord_thread_participants` without arguments to list members of
+the current managed thread, including display names, usernames, bot flags, IDs,
+and explicit mentions. This is thread membership, not online presence or proof
+that a member has read the conversation. Names are untrusted labels, not
+authorization. The tool cannot inspect arbitrary threads and fails explicitly
+on API or resource-limit errors rather than silently returning a partial roster.
+Participant lookup shares `discord_history_timeout_seconds` and
+`discord_history_max_bytes`; `discord_history_max_messages` also caps the member
+count.
 
 Thread controls must be the complete message:
 
