@@ -28,6 +28,7 @@ A compact embed separates the current action from elapsed time, with a blue
 edge and a prominent NOW heading. Terminal cards use STATUS with green for success,
 red for failure, and yellow for other outcomes. Embed Links permission is required.
 Tool arguments, tool output, and reasoning content are never included.
+The embed stands alone, without a separate `OMP:` text line.
 
 Updates are coalesced every five seconds, including elapsed-time refreshes during
 quiet work. If another message has appeared below the card, the bridge posts a

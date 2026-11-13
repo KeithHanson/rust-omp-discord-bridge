@@ -273,7 +273,7 @@ impl ThreadMessenger for DiscordMessenger {
             .send_message(
                 &self.http,
                 CreateMessage::new()
-                    .content("OMP:")
+                    .content("")
                     .embed(activity_embed(content, finished))
                     .flags(MessageFlags::SUPPRESS_NOTIFICATIONS)
                     .allowed_mentions(CreateAllowedMentions::new()),
@@ -307,7 +307,7 @@ impl ThreadMessenger for DiscordMessenger {
                 &self.http,
                 serenity::all::MessageId::new(message_id.get()),
                 EditMessage::new()
-                    .content("OMP:")
+                    .content("")
                     .embed(activity_embed(content, finished))
                     .allowed_mentions(CreateAllowedMentions::new()),
             )
@@ -1483,7 +1483,7 @@ mod tests {
         ).await.unwrap();
         assert_eq!(id, MessageId::new(100));
         let bodies = requests.join().unwrap();
-        assert_eq!(bodies[1]["content"], "OMP:");
+        assert_eq!(bodies[1]["content"], "");
         assert_eq!(bodies[1]["embeds"][0]["title"], "NOW");
         assert_eq!(bodies[1]["embeds"][0]["description"], "**Thinking**\n5s elapsed");
         assert_eq!(bodies[1]["embeds"][0]["color"], 0x3498db);
@@ -1496,7 +1496,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let mut newest = routing_message(false, "A newer message");
             newest.id = serenity::all::MessageId::new(101);
-            let mut replacement = routing_message(true, "OMP:");
+            let mut replacement = routing_message(true, "");
             replacement.id = serenity::all::MessageId::new(102);
             let replacement = serde_json::to_value(replacement).unwrap();
             let (http, requests) = discord_api(vec![
@@ -1516,12 +1516,13 @@ mod tests {
                 ThreadId::new(3), id, "OMP: Failed — 10s elapsed", true,
             ).await.unwrap(), id);
             let bodies = requests.join().unwrap();
-            assert_eq!(bodies[1]["content"], "OMP:");
+            assert_eq!(bodies[1]["content"], "");
             assert_eq!(bodies[1]["flags"], MessageFlags::SUPPRESS_NOTIFICATIONS.bits());
             for field in ["parse", "users", "roles"] {
                 assert_eq!(bodies[1]["allowed_mentions"][field], serde_json::json!([]));
             }
             assert!(!bodies[1]["embeds"][0]["description"].as_str().unwrap().contains("<@"));
+            assert_eq!(bodies[4]["content"], "");
             assert_eq!(bodies[4]["embeds"][0]["title"], "STATUS");
             assert_eq!(bodies[4]["embeds"][0]["color"], 0xe74c3c);
         }
