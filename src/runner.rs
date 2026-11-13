@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use serde_json::Value;
 use tokio::{
     sync::{Mutex, Notify, Semaphore, mpsc, watch},
     time::timeout,
@@ -25,6 +26,7 @@ const MAX_PENDING_MESSAGES: usize = 64;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STATUS_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const STATUS_REVIEW_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_STATUS_ATTEMPTS: u32 = 5;
 
 struct QueuedMessage {
@@ -119,10 +121,11 @@ pub trait ThreadMessenger: Send + Sync {
         finished: bool,
     ) -> Result<MessageId>;
     async fn confirm(&self, thread_id: ThreadId, request: ApprovalRequest) -> bool;
+    async fn prompt(&self, thread_id: ThreadId, request: Value) -> Value;
     async fn notify(&self, thread_id: ThreadId, message: &str);
     async fn channel_history(&self, thread_id: ThreadId, days: u16) -> Result<String>;
     async fn thread_participants(&self, thread_id: ThreadId) -> Result<String>;
-    /// Change the status prefix without replacing the current thread title.
+    /// Review a working session's topic/phase, or mark its current topic completed.
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()>;
 }
 
@@ -205,7 +208,7 @@ async fn reconcile_thread_status(
                     if attempt == MAX_STATUS_ATTEMPTS {
                         tracing::error!(
                             %thread_id, status = status.as_str(),
-                            "thread status retries exhausted; awaiting a new desired state"
+                            "thread status retry batch exhausted"
                         );
                         break;
                     }
@@ -221,6 +224,18 @@ async fn reconcile_thread_status(
                 }
                 _ = tokio::time::sleep(Duration::from_secs(1 << attempt)) => {}
             }
+        }
+        if status == ThreadStatus::Working {
+            tokio::select! {
+                biased;
+                changed = desired.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(STATUS_REVIEW_INTERVAL) => {}
+            }
+            continue;
         }
         match timeout(STATUS_WORKER_IDLE_TIMEOUT, desired.changed()).await {
             Ok(Ok(())) => continue,
@@ -672,6 +687,14 @@ impl OmpUi for RunnerUi<'_> {
         approved
     }
 
+    async fn prompt(&self, request: Value) -> Value {
+        let _waiting = self.presence.awaiting_approval();
+        self.activity.update("Waiting for your answer");
+        let response = self.messenger.prompt(self.thread_id, request).await;
+        self.activity.update("Working");
+        response
+    }
+
     async fn notify(&self, message: &str) {
         self.messenger.notify(self.thread_id, message).await;
     }
@@ -862,6 +885,8 @@ mod tests {
         delivered: Option<mpsc::UnboundedSender<String>>,
         send_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
         approval_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
+        prompts: Mutex<Vec<(ThreadId, Value)>>,
+        prompt_response: Option<Value>,
         edit_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
         fail_after: Mutex<Option<usize>>,
         statuses: Mutex<Vec<String>>,
@@ -984,6 +1009,15 @@ mod tests {
                 gate.acquire().await.unwrap().forget();
             }
             false
+        }
+
+        async fn prompt(&self, thread_id: ThreadId, request: Value) -> Value {
+            self.prompts.lock().await.push((thread_id, request));
+            if let Some((started, gate)) = &self.approval_gate {
+                started.send(()).unwrap();
+                gate.acquire().await.unwrap().forget();
+            }
+            self.prompt_response.clone().expect("unexpected test prompt")
         }
 
         async fn notify(&self, _thread_id: ThreadId, _message: &str) {}
@@ -1117,6 +1151,58 @@ mod tests {
         drop(working);
         drop(other);
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
+        activity.finish("Finished").await;
+    }
+
+    #[tokio::test]
+    async fn prompts_forward_exact_frames_and_restore_presence_on_return_and_drop() {
+        let tracker = Arc::new(PresenceTracker::default());
+        let snapshots = tracker.subscribe();
+        let working = tracker.engage(THREAD);
+        let (started, mut requests) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let response = serde_json::json!({
+            "type": "extension_ui_response", "id": "form-field", "value": "answer",
+        });
+        let messenger = Arc::new(FakeMessenger {
+            approval_gate: Some((started, gate.clone())),
+            prompt_response: Some(response.clone()),
+            ..FakeMessenger::default()
+        });
+        let activity = ActivityReporter::start(messenger.clone(), THREAD);
+        let (delivery, _receiver) = MessageDelivery::new();
+        let ui = RunnerUi {
+            messenger: messenger.clone(),
+            thread_id: THREAD,
+            activity: &activity,
+            delivery: &delivery,
+            presence: &working,
+        };
+        let request = serde_json::json!({
+            "type": "extension_ui_request", "id": "form-field", "method": "input",
+            "title": "Your answer", "placeholder": "Type here",
+        });
+        let mut prompt = Box::pin(ui.prompt(request.clone()));
+        tokio::select! {
+            biased;
+            _ = &mut prompt => panic!("prompt unexpectedly completed"),
+            _ = std::future::ready(()) => {}
+        }
+        received(&mut requests).await;
+        assert_eq!(*messenger.prompts.lock().await, vec![(THREAD, request.clone())]);
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 0, awaiting_approval: 1 });
+        gate.add_permits(1);
+        assert_eq!(prompt.await, response);
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+        let mut cancelled = Box::pin(ui.prompt(request));
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => panic!("prompt unexpectedly completed"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(snapshots.borrow().awaiting_approval, 1);
+        drop(cancelled);
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
         activity.finish("Finished").await;
     }
 
@@ -1498,6 +1584,58 @@ mod tests {
         assert!(messenger.statuses.lock().await.is_empty());
         statuses.set(THREAD, ThreadStatus::Working);
         messenger.wait_status("working").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn working_reviews_repeat_stop_on_completion_and_reopen_after_retirement() {
+        let messenger = Arc::new(FakeMessenger::default());
+        let statuses = ThreadStatusReconciler {
+            messenger: messenger.clone(),
+            senders: Arc::new(StdMutex::new(HashMap::new())),
+        };
+        statuses.set(THREAD, ThreadStatus::Working);
+        messenger.wait_status_attempts(1).await;
+        tokio::time::advance(STATUS_REVIEW_INTERVAL).await;
+        messenger.wait_status_attempts(2).await;
+        assert_eq!(*messenger.statuses.lock().await, vec!["working", "working"]);
+
+        statuses.set(THREAD, ThreadStatus::Completed);
+        messenger.wait_status("completed").await;
+        let sender = statuses.senders.lock().unwrap()[&THREAD].clone();
+        sender.closed().await;
+        assert!(statuses.senders.lock().unwrap().is_empty());
+        tokio::time::advance(STATUS_REVIEW_INTERVAL * 3).await;
+        assert_eq!(messenger.status_attempts.lock().await.len(), 3);
+
+        statuses.set(THREAD, ThreadStatus::Working);
+        messenger.wait_status_attempts(4).await;
+        tokio::time::advance(STATUS_REVIEW_INTERVAL).await;
+        messenger.wait_status_attempts(5).await;
+        assert_eq!(
+            *messenger.statuses.lock().await,
+            vec!["working", "working", "completed", "working", "working"],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_working_reviews_resume_after_retry_batch_exhaustion() {
+        let messenger = Arc::new(FakeMessenger {
+            fail_status: true.into(),
+            ..FakeMessenger::default()
+        });
+        let statuses = ThreadStatusReconciler {
+            messenger: messenger.clone(),
+            senders: Arc::new(StdMutex::new(HashMap::new())),
+        };
+        statuses.set(THREAD, ThreadStatus::Working);
+        for attempt in 1..=MAX_STATUS_ATTEMPTS {
+            messenger.wait_status_attempts(attempt as usize).await;
+            tokio::time::advance(Duration::from_secs(1 << attempt)).await;
+        }
+        messenger.fail_status.store(false, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::advance(STATUS_REVIEW_INTERVAL).await;
+        messenger.wait_status("working").await;
+        assert_eq!(messenger.status_attempts.lock().await.len(), MAX_STATUS_ATTEMPTS as usize + 1);
     }
 
     #[tokio::test]

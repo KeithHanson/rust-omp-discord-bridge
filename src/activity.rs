@@ -174,6 +174,10 @@ mod tests {
             unreachable!()
         }
 
+        async fn prompt(&self, _: ThreadId, _: serde_json::Value) -> serde_json::Value {
+            unreachable!("activity must not request prompts")
+        }
+
         async fn notify(&self, _: ThreadId, _: &str) {
             unreachable!()
         }

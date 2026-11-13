@@ -81,3 +81,32 @@ BRIDGE_BUILD_REVISION="$(git rev-parse HEAD)" RUST_VERSION=1.99.1 OMP_VERSION=18
 ```
 
 Run `docker compose run --rm bridge check` after every image, configuration, credential, or mount change before restarting the gateway.
+
+## Upgrade to 2026-11-13-3
+
+This release adds Discord ask/forms and periodic semantic thread titles.
+Existing configuration remains valid; optional `omp.title_model` selects a
+separate title-review model. OMP 18.20.0 remains the minimum supported version.
+There is no new database migration for these features.
+
+Build from the release tag in a clean checkout:
+
+```bash
+git fetch origin --tags
+git checkout v2026-11-13-3
+BRIDGE_BUILD_REVISION="$(git rev-parse HEAD)" docker compose build bridge
+docker compose run --rm bridge --version
+```
+
+Wait until all conversations and final message delivery are idle before replacing
+the gateway. Back up the data directory consistently while the bridge is stopped;
+do not copy a live SQLite main file without its WAL. Keep the old image for rollback.
+Then run `docker compose run --rm bridge check` and `docker compose up -d bridge`.
+Use the same config/data mounts for the check and the service. Never run two
+gateways against the same SQLite database.
+
+Acceptance: ask for a choice and text field in an authorized thread, submit both,
+and check the returned values. For titles, keep work active beyond a minute:
+the topic/status should be inferred without blocking replies. Once delivery and
+the queue settle, the title should become `✅`; a new message reopens review.
+Discord rate limits may delay the visible change.

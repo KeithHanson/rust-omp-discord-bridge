@@ -19,7 +19,7 @@ use serenity::{
         Attachment, AutoArchiveDuration, ButtonStyle, Channel, ChannelId as SerenityChannelId,
         ChannelType, Client, Context, CreateAllowedMentions, CreateButton, CreateEmbed,
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
-        EditMessage, EditThread, Embed, EventHandler, GatewayIntents, GetMessages, GuildChannel, Http,
+        EditMessage, Embed, EventHandler, GatewayIntents, GetMessages, GuildChannel, Http,
         Interaction, Member, Message, MessageFlags, OnlineStatus, Ready, ResumedEvent, ThreadMember,
         Timestamp, User,
     },
@@ -40,7 +40,28 @@ use crate::{
     render::{chunk_message, thread_name},
     runner::{ThreadMessenger, ThreadQueueRunner},
     store::{CreateSessionResult, EnqueueResult, Store, TurnSource},
+    titles::{ReviewedTitle, TitleReviewer},
 };
+
+#[path = "discord_prompts.rs"]
+mod discord_prompts;
+use discord_prompts::PromptBroker;
+
+#[path = "title_http.rs"]
+mod title_http;
+use title_http::{Reply as TitleReply, TitleHttp, TitleState};
+
+#[async_trait]
+trait ReviewTitle: Send + Sync {
+    async fn review(&self, session: &crate::domain::Session) -> Result<ReviewedTitle>;
+}
+
+#[async_trait]
+impl ReviewTitle for TitleReviewer {
+    async fn review(&self, session: &crate::domain::Session) -> Result<ReviewedTitle> {
+        TitleReviewer::review(self, session).await
+    }
+}
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
@@ -50,11 +71,15 @@ pub async fn run(config: AppConfig, store: Store) -> Result<()> {
     let config = Arc::new(config);
     let http = Arc::new(Http::new(&token));
     let approvals = Arc::new(ApprovalBroker::default());
+    let prompts = Arc::new(PromptBroker::default());
     let messenger = Arc::new(DiscordMessenger {
+        title_http: TitleHttp::new(&http)?,
+        reviewer: Arc::new(TitleReviewer::new(config.omp.clone(), store.clone())),
         http: Arc::clone(&http),
         config: Arc::clone(&config),
         store: store.clone(),
         approvals: Arc::clone(&approvals),
+        prompts: Arc::clone(&prompts),
         titles: Mutex::new(HashMap::new()),
     });
     let transport = Arc::new(OmpTransport::new(
@@ -78,6 +103,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<()> {
         store: store.clone(),
         runner: Arc::clone(&runner),
         approvals,
+        prompts,
         bot_user_id,
         presence_target,
     };
@@ -315,7 +341,10 @@ struct DiscordMessenger {
     config: Arc<AppConfig>,
     store: Store,
     approvals: Arc<ApprovalBroker>,
-    titles: Mutex<HashMap<ThreadId, Arc<tokio::sync::Mutex<()>>>>,
+    prompts: Arc<PromptBroker>,
+    titles: Mutex<HashMap<ThreadId, Arc<tokio::sync::Mutex<TitleState>>>>,
+    title_http: TitleHttp,
+    reviewer: Arc<dyn ReviewTitle>,
 }
 
 #[async_trait]
@@ -407,6 +436,10 @@ impl ThreadMessenger for DiscordMessenger {
         }
     }
 
+    async fn prompt(&self, thread_id: ThreadId, request: serde_json::Value) -> serde_json::Value {
+        self.prompt_inner(thread_id, request).await
+    }
+
     async fn notify(&self, thread_id: ThreadId, message: &str) {
         if let Err(error) = send_without_mentions(&self.http, thread_id, message).await {
             tracing::error!(thread_id = %thread_id, error = %error, "failed to deliver OMP notification");
@@ -442,31 +475,87 @@ impl ThreadMessenger for DiscordMessenger {
     }
 
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()> {
-        let emoji = thread_status_emoji(status)?;
-        let session = self.authorize_thread_title(thread_id).await?;
+        let completed = match status {
+            "working" => false,
+            "completed" => true,
+            _ => bail!("status must be completed or working"),
+        };
         let lock = self.title_lock(thread_id);
-        let _guard = lock.lock().await;
-        let channel = self.title_channel(&session).await?;
-        let name = thread_status_name(&channel.name, emoji);
-        if name != channel.name {
-            channel.id.edit_thread(&self.http, EditThread::new().name(&name)).await
-                .context("failed to update Discord thread status")?;
+        let mut state = lock.lock().await;
+        loop {
+            // Never retain a session snapshot, model result, or channel name over a wait.
+            self.title_http.wait(&state).await;
+            let global_cooldown = self.title_http.global_deadline();
+            let session = self.authorize_thread_title(thread_id).await?;
+            let mut channel = match self.title_channel(&session, &mut state).await? {
+                TitleReply::Ready(channel) => channel,
+                TitleReply::Limited => continue,
+            };
+            if self.title_http.global_deadline() != global_cooldown
+                || self.title_http.patch_blocked(&state)
+            {
+                continue;
+            }
+            if !completed && (!state.working || channel.name.starts_with("✅")) {
+                // Queue lifecycle is known immediately, independently of model health.
+                // A failed semantic review still returns an error after this prefix update.
+                let name = thread_status_name(&channel.name, "🛠️");
+                if self.title_http.patch_blocked(&state) {
+                    continue;
+                }
+                if name != channel.name {
+                    match self.title_http.patch(thread_id, &name, &mut state).await? {
+                        TitleReply::Ready(()) => {}
+                        TitleReply::Limited => continue,
+                    }
+                    channel.name = name;
+                }
+                state.working = true;
+                if self.title_http.patch_blocked(&state) {
+                    continue;
+                }
+            }
+            let name = if completed {
+                thread_status_name(&channel.name, "✅")
+            } else {
+                let reviewed = self.reviewer.review(&session).await?;
+                thread_status_name(&reviewed.topic, reviewed.status.emoji())
+            };
+            // A different thread may establish a global cooldown during inference.
+            // Even a cooldown that expired mid-review invalidates that old snapshot.
+            if self.title_http.global_deadline() != global_cooldown
+                || self.title_http.patch_blocked(&state)
+            {
+                continue;
+            }
+            if name != channel.name {
+                match self.title_http.patch(thread_id, &name, &mut state).await? {
+                    TitleReply::Ready(()) => {}
+                    TitleReply::Limited => continue,
+                }
+            }
+            state.working = !completed;
+            return Ok(());
         }
-        Ok(())
     }
 }
 
 impl DiscordMessenger {
-    fn title_lock(&self, thread_id: ThreadId) -> Arc<tokio::sync::Mutex<()>> {
+    fn title_lock(&self, thread_id: ThreadId) -> Arc<tokio::sync::Mutex<TitleState>> {
         Arc::clone(self.titles.lock().expect("thread title lock poisoned")
             .entry(thread_id).or_default())
     }
 
-    async fn title_channel(&self, session: &crate::domain::Session) -> Result<GuildChannel> {
+    async fn title_channel(
+        &self,
+        session: &crate::domain::Session,
+        state: &mut TitleState,
+    ) -> Result<TitleReply<GuildChannel>> {
         let channel_id = SerenityChannelId::new(session.thread_id.get());
-        let Channel::Guild(channel) = self.http.get_channel(channel_id).await
-            .context("failed to read Discord thread title")? else {
-            bail!("Discord returned a non-guild channel for thread status");
+        let channel = match self.title_http.channel(session.thread_id, state).await? {
+            TitleReply::Ready(Channel::Guild(channel)) => channel,
+            TitleReply::Ready(_) => bail!("Discord returned a non-guild channel for thread status"),
+            TitleReply::Limited => return Ok(TitleReply::Limited),
         };
         if channel.id != channel_id
             || channel.guild_id.get() != session.guild_id.get()
@@ -475,7 +564,7 @@ impl DiscordMessenger {
         {
             bail!("Discord returned inconsistent thread identity for thread status");
         }
-        Ok(channel)
+        Ok(TitleReply::Ready(channel))
     }
 
     async fn authorize_thread_title(&self, thread_id: ThreadId) -> Result<crate::domain::Session> {
@@ -909,6 +998,7 @@ struct DiscordHandler {
     store: Store,
     runner: Arc<ThreadQueueRunner>,
     approvals: Arc<ApprovalBroker>,
+    prompts: Arc<PromptBroker>,
     bot_user_id: Arc<AtomicU64>,
     presence_target: watch::Sender<Option<ShardMessenger>>,
 }
@@ -939,6 +1029,9 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn interaction_create(&self, context: Context, interaction: Interaction) {
+        if self.prompt_interaction(&context.http, &interaction).await {
+            return;
+        }
         let Interaction::Component(component) = interaction else {
             return;
         };
@@ -1006,6 +1099,11 @@ impl DiscordHandler {
         if let Some(session) = self.store.session(thread_id).await? {
             if session.guild_id != guild_id
                 || !permits_message(policy, session.parent_channel_id, message, source)
+            {
+                return Ok(());
+            }
+            if matches!(source, TurnSource::Human)
+                && self.prompt_reply(http, message, bot_id).await?
             {
                 return Ok(());
             }
@@ -1505,20 +1603,15 @@ async fn send_without_mentions(http: &Http, thread_id: ThreadId, content: &str) 
     Ok(())
 }
 
-fn thread_status_emoji(status: &str) -> Result<&'static str> {
-    match status {
-        "completed" => Ok("✅"),
-        "working" => Ok("🛠️"),
-        _ => bail!("status must be completed or working"),
-    }
-}
-
 fn thread_status_name(title: &str, emoji: &str) -> String {
     let mut body = strip_activity_phase(title);
     while let Some(rest) = body.strip_prefix("✅")
         .or_else(|| body.strip_prefix("🛠️"))
         .or_else(|| body.strip_prefix("🛠"))
         .or_else(|| body.strip_prefix("🧠"))
+        .or_else(|| body.strip_prefix("⏳"))
+        .or_else(|| body.strip_prefix("⚠️"))
+        .or_else(|| body.strip_prefix("⚠"))
     {
         // Remove only the prefix separator, not whitespace belonging to the title.
         body = rest.strip_prefix(' ').unwrap_or(rest);
@@ -1808,40 +1901,189 @@ mod tests {
         }
     }
 
+    fn title_response(name: &str) -> serde_json::Value {
+        let mut channel = routing_channel();
+        channel.name = name.to_owned();
+        serde_json::to_value(channel).unwrap()
+    }
+
+    struct ScriptedReviewer {
+        reviews: Mutex<std::collections::VecDeque<Result<ReviewedTitle>>>,
+    }
+
+    #[async_trait]
+    impl ReviewTitle for ScriptedReviewer {
+        async fn review(&self, _: &crate::domain::Session) -> Result<ReviewedTitle> {
+            self.reviews.lock().unwrap().pop_front().expect("unexpected semantic review")
+        }
+    }
+
     #[tokio::test]
-    async fn lifecycle_titles_preserve_full_topic_without_activity_labels() {
+    async fn working_titles_infer_topic_and_phase_then_completion_preserves_live_topic() {
+        use crate::titles::TitlePhase;
         let root = tempfile::tempdir().unwrap();
-        let topic = format!("{}  ", "Detailed title ".repeat(6));
-        let legacy = format!("[OMP: Working] 🛠️ {topic}");
-        let working = format!("🛠️ {topic}");
-        let completed = format!("✅ {topic}");
-        let response = |name: &str| {
-            let mut channel = routing_channel();
-            channel.name = name.to_owned();
-            serde_json::to_value(channel).unwrap()
-        };
         let (http, requests) = discord_api(vec![
-            ("GET", "/channels/3", 200, response(&legacy)),
-            ("PATCH", "/channels/3", 200, response(&working)),
-            ("GET", "/channels/3", 200, response(&working)),
-            ("GET", "/channels/3", 200, response(&working)),
-            ("PATCH", "/channels/3", 200, response(&completed)),
-            ("GET", "/channels/3", 200, response(&completed)),
+            ("GET", "/channels/3", 200, title_response("✅ Old topic")),
+            ("PATCH", "/channels/3", 200, title_response("🛠️ Old topic")),
+            ("PATCH", "/channels/3", 200, title_response("🧠 Investigating timeout")),
+            ("GET", "/channels/3", 200, title_response("🧠 Investigating timeout")),
+            ("PATCH", "/channels/3", 200, title_response("⏳ Awaiting credentials")),
+            ("GET", "/channels/3", 200, title_response("⏳ Awaiting credentials")),
+            ("GET", "/channels/3", 200, title_response("⚠️ Operator edited topic")),
+            ("PATCH", "/channels/3", 200, title_response("✅ Operator edited topic")),
+            ("GET", "/channels/3", 200, title_response("✅ Operator edited topic")),
         ]);
-        let messenger = participants_messenger(root.path(), http).await;
-        messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
-        messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
-        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
-        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
+        let mut messenger = participants_messenger(root.path(), http).await;
+        let reviewer = Arc::new(ScriptedReviewer {
+            reviews: Mutex::new([
+                Ok(ReviewedTitle { topic: "Investigating timeout".into(), status: TitlePhase::Thinking }),
+                Ok(ReviewedTitle { topic: "Awaiting credentials".into(), status: TitlePhase::Waiting }),
+                Ok(ReviewedTitle { topic: "Awaiting credentials".into(), status: TitlePhase::Waiting }),
+            ].into()),
+        });
+        messenger.reviewer = reviewer.clone();
+        for status in ["working", "working", "working", "completed", "completed"] {
+            messenger.thread_status(ThreadId::new(3), status).await.unwrap();
+        }
+        assert!(reviewer.reviews.lock().unwrap().is_empty());
         let bodies = requests.join().unwrap();
-        assert_eq!(bodies, vec![
-            serde_json::Value::Null,
-            serde_json::json!({"name": working}),
-            serde_json::Value::Null,
-            serde_json::Value::Null,
-            serde_json::json!({"name": completed}),
-            serde_json::Value::Null,
+        assert_eq!(bodies.iter().filter_map(|body| body.get("name").and_then(|v| v.as_str())).collect::<Vec<_>>(),
+            vec!["🛠️ Old topic", "🧠 Investigating timeout", "⏳ Awaiting credentials", "✅ Operator edited topic"]);
+    }
+
+    #[tokio::test]
+    async fn failed_inference_keeps_immediate_working_prefix_but_reports_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![
+            ("GET", "/channels/3", 200, title_response("✅ Existing topic")),
+            ("PATCH", "/channels/3", 200, title_response("🛠️ Existing topic")),
         ]);
+        let mut messenger = participants_messenger(root.path(), http).await;
+        messenger.reviewer = Arc::new(ScriptedReviewer {
+            reviews: Mutex::new([Err(anyhow::anyhow!("review model unavailable"))].into()),
+        });
+        assert_eq!(messenger.thread_status(ThreadId::new(3), "working").await
+            .unwrap_err().to_string(), "review model unavailable");
+        assert_eq!(requests.join().unwrap()[1]["name"], "🛠️ Existing topic");
+    }
+
+    struct SessionReviewer {
+        store: Store,
+        observed: Mutex<Vec<(Instant, Option<std::path::PathBuf>)>>,
+    }
+
+    #[async_trait]
+    impl ReviewTitle for SessionReviewer {
+        async fn review(&self, session: &crate::domain::Session) -> Result<ReviewedTitle> {
+            self.observed.lock().unwrap().push((Instant::now(), session.omp_session_path.clone()));
+            // Simulate context changing immediately after the first review snapshot.
+            self.store.set_session_path(session.thread_id, std::path::Path::new("Latest topic")).await?;
+            Ok(ReviewedTitle {
+                topic: session.omp_session_path.as_ref().unwrap().display().to_string(),
+                status: crate::titles::TitlePhase::Working,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_inference_is_discarded_and_session_is_reread_after_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![
+            ("GET", "/channels/3", 200, title_response("🛠️ Existing topic")),
+            ("PATCH", "/channels/3", 429, serde_json::json!({"retry_after": 0.05, "global": false})),
+            ("GET", "/channels/3", 200, title_response("🛠️ Existing topic")),
+            ("PATCH", "/channels/3", 200, title_response("🛠️ Latest topic")),
+        ]);
+        let mut messenger = participants_messenger(root.path(), http).await;
+        messenger.store.set_session_path(ThreadId::new(3), std::path::Path::new("Stale topic")).await.unwrap();
+        let reviewer = Arc::new(SessionReviewer { store: messenger.store.clone(), observed: Mutex::new(Vec::new()) });
+        messenger.reviewer = reviewer.clone();
+        messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
+        let observed = reviewer.observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].1.as_deref(), Some(std::path::Path::new("Stale topic")));
+        assert_eq!(observed[1].1.as_deref(), Some(std::path::Path::new("Latest topic")));
+        assert!(observed[1].0.duration_since(observed[0].0) >= Duration::from_millis(50));
+        let bodies = requests.join().unwrap();
+        assert_eq!(bodies[1]["name"], "🛠️ Stale topic");
+        assert_eq!(bodies[3]["name"], "🛠️ Latest topic");
+    }
+
+    #[tokio::test]
+    async fn successful_patch_reset_delays_next_read_and_completion_uses_latest_topic() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api_headers(vec![
+            ("GET", "/channels/3", 200, title_response("🧠 Original topic"), ""),
+            ("PATCH", "/channels/3", 200, title_response("✅ Original topic"),
+                "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-After: 0.05\r\n"),
+            ("GET", "/channels/3", 200, title_response("⚠️ Changed while waiting"), ""),
+            ("PATCH", "/channels/3", 200, title_response("✅ Changed while waiting"), ""),
+        ], false);
+        let messenger = participants_messenger(root.path(), http).await;
+        let start = Instant::now();
+        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
+        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        let bodies = requests.join().unwrap();
+        assert_eq!(bodies[1]["name"], "✅ Original topic");
+        assert_eq!(bodies[3]["name"], "✅ Changed while waiting");
+    }
+
+    struct GlobalCooldownReviewer {
+        messenger: std::sync::Weak<DiscordMessenger>,
+        observed: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    #[async_trait]
+    impl ReviewTitle for GlobalCooldownReviewer {
+        async fn review(&self, _: &crate::domain::Session) -> Result<ReviewedTitle> {
+            let first = {
+                let mut observed = self.observed.lock().unwrap();
+                observed.push(Instant::now());
+                observed.len() == 1
+            };
+            if first {
+                // Another thread's title response establishes a global limit mid-review.
+                let messenger = self.messenger.upgrade().unwrap();
+                let mut other = TitleState::default();
+                assert!(matches!(messenger.title_http.patch(
+                    ThreadId::new(4), "Other thread", &mut other,
+                ).await?, TitleReply::Limited));
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            Ok(ReviewedTitle {
+                topic: if first { "Stale inference" } else { "Fresh inference" }.into(),
+                status: crate::titles::TitlePhase::Working,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn global_limit_during_inference_discards_result_before_any_patch() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api_headers(vec![
+            ("GET", "/channels/3", 200, title_response("🛠️ Existing topic"), ""),
+            ("PATCH", "/channels/4", 429, serde_json::json!({"retry_after": 0.025, "global": true}),
+                "Retry-After: 0.05\r\nX-RateLimit-Global: true\r\n"),
+            ("GET", "/channels/3", 200, title_response("🛠️ Updated during cooldown"), ""),
+            ("PATCH", "/channels/3", 200, title_response("🛠️ Fresh inference"), ""),
+        ], false);
+        let mut messenger = participants_messenger(root.path(), http).await;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let messenger = Arc::new_cyclic(|weak| {
+            messenger.reviewer = Arc::new(GlobalCooldownReviewer {
+                messenger: weak.clone(),
+                observed: observed.clone(),
+            });
+            messenger
+        });
+        messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[1].duration_since(observed[0]) >= Duration::from_millis(50));
+        let bodies = requests.join().unwrap();
+        assert_eq!(bodies[1]["name"], "Other thread");
+        assert_eq!(bodies[3]["name"], "🛠️ Fresh inference");
     }
 
     #[tokio::test]
@@ -1907,7 +2149,7 @@ mod tests {
         for (current, status, expected) in [
             (format!("🧠 🛠️ {}  ", "Detailed title ".repeat(5)), "completed",
                 format!("✅ {}  ", "Detailed title ".repeat(5))),
-            ("✅ Existing title".into(), "working", "🛠️ Existing title".into()),
+            ("⏳ ⚠️ Existing title".into(), "completed", "✅ Existing title".into()),
             ("✅ Existing title  ".into(), "completed", "✅ Existing title  ".into()),
         ] {
             let root = tempfile::tempdir().unwrap();
@@ -1979,22 +2221,23 @@ mod tests {
             let (http, requests) = discord_api(responses);
             let messenger = participants_messenger(root.path(), http).await;
             let error = messenger.thread_status(ThreadId::new(3), "completed").await.unwrap_err();
-            assert!(error.to_string().contains(if fail_patch {
-                "failed to update Discord thread status"
-            } else {
-                "failed to read Discord thread title"
-            }));
+            assert!(error.to_string().contains("403"));
+            assert!(!error.to_string().contains("test-token"));
             let bodies = requests.join().unwrap();
             assert_eq!(bodies.len(), if fail_patch { 2 } else { 1 });
         }
     }
 
-    #[test]
-    fn title_status_only_accepts_lifecycle_boundaries() {
-        assert_eq!(thread_status_emoji("working").unwrap(), "🛠️");
-        assert_eq!(thread_status_emoji("completed").unwrap(), "✅");
-        assert!(thread_status_emoji("thinking").is_err());
-        assert!(thread_status_emoji("failed").is_err());
+    #[tokio::test]
+    async fn title_status_only_accepts_runner_lifecycle_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![]);
+        let messenger = participants_messenger(root.path(), http).await;
+        for status in ["thinking", "blocked", "failed"] {
+            assert!(messenger.thread_status(ThreadId::new(3), status).await
+                .unwrap_err().to_string().contains("status must be completed or working"));
+        }
+        assert!(requests.join().unwrap().is_empty());
     }
 
     fn routing_policy() -> GuildPolicy {
@@ -2059,6 +2302,7 @@ mod tests {
                 session_dir: root.join("sessions"),
                 allowed_root: std::env::temp_dir(),
                 model: None,
+                title_model: None,
                 thinking_level: None,
             },
             runtime: RuntimeConfig {
@@ -2312,10 +2556,13 @@ mod tests {
             .await
             .unwrap();
         DiscordMessenger {
+            title_http: TitleHttp::new(&http).unwrap(),
+            reviewer: Arc::new(TitleReviewer::new(config.omp.clone(), store.clone())),
             http,
             config,
             store,
             approvals: Arc::new(ApprovalBroker::default()),
+            prompts: Arc::new(PromptBroker::default()),
             titles: Mutex::new(HashMap::new()),
         }
     }
@@ -2526,6 +2773,15 @@ mod tests {
         responses: Vec<(&'static str, &'static str, u16, serde_json::Value)>,
         allow_title_updates: bool,
     ) -> (Arc<Http>, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        discord_api_headers(responses.into_iter().map(|(method, path, status, body)| {
+            (method, path, status, body, "")
+        }).collect(), allow_title_updates)
+    }
+
+    fn discord_api_headers(
+        responses: Vec<(&'static str, &'static str, u16, serde_json::Value, &'static str)>,
+        allow_title_updates: bool,
+    ) -> (Arc<Http>, std::thread::JoinHandle<Vec<serde_json::Value>>) {
         use std::io::Read as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2534,7 +2790,7 @@ mod tests {
             let mut bodies = Vec::new();
             let mut responses = responses.into_iter().peekable();
             let mut channel = routing_channel();
-            while let Some((method, path, _, _)) = responses.peek() {
+            while let Some((method, path, _, _, _)) = responses.peek() {
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -2586,15 +2842,15 @@ mod tests {
                 } else {
                     serde_json::from_slice(&body).unwrap()
                 };
-                let (status, response) = if lifecycle {
+                let (status, response, extra_headers) = if lifecycle {
                     if actual_method == "PATCH" {
                         channel.name = body["name"].as_str().unwrap().to_owned();
                     }
-                    (200, serde_json::to_value(&channel).unwrap())
+                    (200, serde_json::to_value(&channel).unwrap(), "")
                 } else {
                     bodies.push(body);
-                    let (_, _, status, response) = responses.next().unwrap();
-                    (status, response)
+                    let (_, _, status, response, headers) = responses.next().unwrap();
+                    (status, response, headers)
                 };
                 let body = if status == 204 {
                     String::new()
@@ -2603,7 +2859,7 @@ mod tests {
                 };
                 write!(
                     stream,
-                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n{body}",
                     body.len(),
                 ).unwrap();
             }
@@ -2620,11 +2876,15 @@ mod tests {
         let config = Arc::new(routing_config(root));
         let store = Store::open(&config.runtime.database_path).await.unwrap();
         let approvals = Arc::new(ApprovalBroker::default());
+        let prompts = Arc::new(PromptBroker::default());
         let messenger = Arc::new(DiscordMessenger {
+            title_http: TitleHttp::new(&http).unwrap(),
+            reviewer: Arc::new(TitleReviewer::new(config.omp.clone(), store.clone())),
             http,
             config: config.clone(),
             store: store.clone(),
             approvals: approvals.clone(),
+            prompts: prompts.clone(),
             titles: Mutex::new(HashMap::new()),
         });
         let transport = Arc::new(OmpTransport::new(
@@ -2640,9 +2900,38 @@ mod tests {
             store,
             runner,
             approvals,
+            prompts,
             bot_user_id: Arc::new(AtomicU64::new(9)),
             presence_target: watch::channel(None).0,
         }
+    }
+
+    #[tokio::test]
+    async fn replies_to_closed_question_cards_do_not_interrupt_or_stop_work() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api_with_title_updates(vec![(
+            "POST", "/channels/3/messages", 200,
+            serde_json::to_value(routing_message(true, "Use the latest question controls.")).unwrap(),
+        )], true);
+        let handler = routing_handler(root.path(), http.clone()).await;
+        handler.store.create_session(&NewSession {
+            thread_id: ThreadId::new(3),
+            guild_id: GuildId::new(1),
+            parent_channel_id: ChannelId::new(2),
+            trigger_message_id: MessageId::new(99),
+            cwd: root.path().to_path_buf(),
+            created_by_user_id: UserId::new(7),
+        }).await.unwrap();
+        let mut card = routing_message(true, "**OMP question**\nCancelled.");
+        card.author.id = serenity::all::UserId::new(9);
+        card.id = serenity::all::MessageId::new(98);
+        let mut reply = routing_message(false, "stop");
+        reply.referenced_message = Some(Box::new(card));
+        handler.handle_message(&http, &reply).await.unwrap();
+        let session = handler.store.session(ThreadId::new(3)).await.unwrap().unwrap();
+        assert_ne!(session.status, SessionStatus::Stopped);
+        assert!(handler.store.claim_next(ThreadId::new(3)).await.unwrap().is_none());
+        assert_eq!(requests.join().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2770,10 +3059,13 @@ mod tests {
         let config = Arc::new(routing_config(root.path()));
         let store = Store::open(&config.runtime.database_path).await.unwrap();
         let messenger = DiscordMessenger {
+            title_http: TitleHttp::new(&http).unwrap(),
+            reviewer: Arc::new(TitleReviewer::new(config.omp.clone(), store.clone())),
             http,
             config,
             store,
             approvals: Arc::new(ApprovalBroker::default()),
+            prompts: Arc::new(PromptBroker::default()),
             titles: Mutex::new(HashMap::new()),
         };
         messenger
@@ -3038,17 +3330,23 @@ mod tests {
         let b = routing_handler(root_b.path(), http_b.clone()).await;
         b.bot_user_id.store(8, Ordering::Release);
         let sender_a = DiscordMessenger {
+            title_http: TitleHttp::new(&http_a).unwrap(),
+            reviewer: Arc::new(TitleReviewer::new(a.config.omp.clone(), a.store.clone())),
             http: http_a.clone(),
             config: a.config.clone(),
             store: a.store.clone(),
             approvals: a.approvals.clone(),
+            prompts: a.prompts.clone(),
             titles: Mutex::new(HashMap::new()),
         };
         let sender_b = DiscordMessenger {
+            title_http: TitleHttp::new(&http_b).unwrap(),
+            reviewer: Arc::new(TitleReviewer::new(b.config.omp.clone(), b.store.clone())),
             http: http_b.clone(),
             config: b.config.clone(),
             store: b.store.clone(),
             approvals: b.approvals.clone(),
+            prompts: b.prompts.clone(),
             titles: Mutex::new(HashMap::new()),
         };
         a.handle_message(&http_a, &human(100, 9)).await.unwrap();

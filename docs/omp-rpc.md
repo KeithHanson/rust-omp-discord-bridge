@@ -18,7 +18,11 @@ omp --mode rpc-ui \
 
 The child inherits the bridge process environment, including `HOME` and provider API-key variables. OMP therefore uses its normal credential database at `~/.omp/agent/agent.db`, its normal `.env` lookup, and the project configuration in `<cwd>/.omp`. `session-dir` relocates conversation files only; it does not create a separate OMP installation. When `omp.model` is omitted, OMP selects its configured default. An explicit model must use an authenticated provider ID: `openai-codex` account access and `openai` API-key access are distinct routes.
 
-`rpc-ui` is required because ordinary headless RPC cannot satisfy approval prompts. OMP 18.20.0 sends tool approvals as `extension_ui_request` `select` frames. The bridge recognizes only the exact one-shot `Approve` and `Deny` choices and presents them as Discord buttons; it deliberately does not expose OMP's persistent “approve for this session” choice. Only users in the guild policy's allowlist can decide them. Unrelated select, input, editor, or URL UI requests are cancelled rather than guessed. UI/history waits remain interruptible; cancelling an approval wait invalidates its Discord buttons rather than leaving an actionable stale request.
+`rpc-ui` is required for interactive requests. OMP 18.20.0 sends tool approvals as `extension_ui_request` `select` frames. The bridge recognizes only the exact one-shot `Approve` and `Deny` choices and presents them as Discord buttons; persistent session-wide approval remains unavailable. Other selections and text/editor requests are routed to Discord prompts rather than silently cancelled. OMP's HTML `ask` tool uses these requests field by field: checkbox groups repeatedly select one toggle until “Done selecting,” and OMP performs form validation and assembles the final typed answer object. The bridge returns exact option strings and text, not display labels truncated to Discord's component limits.
+
+UI waits remain interruptible. An OMP `cancel` request targets the original request ID; dropping its wait invalidates the Discord controls. Responses to a host-side UI timeout include `cancelled: true` and `timedOut: true`, so OMP can distinguish elapsed time from explicit cancellation. Secret-input requests are refused rather than collected in a public thread. Unsupported UI methods produce a visible explanation rather than pretending the user cancelled.
+
+A local OMP 18.20.0 smoke probe exercised the real HTML `ask` tool with a radio field and a defaulted text field. OMP emitted `select` and `editor` requests, accepted the returned option label and text, and produced `{"mode":"safe","note":"round-trip verified"}` before completing the turn. This verifies the upstream RPC form contract; it is not proof of Discord client rendering or a deployed bridge.
 
 The bridge does not pass `--approval-mode` or `--auto-approve`. OMP's project configuration in the session working directory governs `tools.approvalMode`; when the project does not set it, OMP's normal configuration layering and default apply. Read-only calls and approved actions retain their normal OMP capabilities.
 
@@ -134,3 +138,24 @@ On normal completion the bridge requests state, validates that the returned sess
 ```bash
 cargo run -- --config ./config.toml check
 ```
+
+## Background title review
+
+Title review does not prompt or resume the working RPC process. It starts a
+separate ephemeral OMP JSON-print call with tools, extensions, skills, rules,
+context-file discovery, LSP, automatic title generation, and session persistence
+disabled. Input is a bounded projection of recent visible conversation text plus
+queue/session state; it is explicitly untrusted evidence, not executable instructions.
+The reviewer returns a topic and one of `working`, `thinking`, `waiting`, or
+`blocked`. Completion is determined by the bridge's post-delivery queue state.
+
+The reviewer uses `omp.title_model`, falling back to `omp.model` or the OMP
+default. One inference runs at a time per bridge, with a 45-second deadline and
+bounded output. Cancellation kills the review child. It neither owns a turn nor
+changes the source session, and Discord credentials are not forwarded.
+
+Discord title HTTP retries differ from ordinary message delivery: the bridge
+retains server-provided cooldowns and waits before taking fresh context and
+generating a new title. It does not let the HTTP client automatically replay a
+stale title body. Periodic review continues only while work remains; terminal
+idle reconciliation preserves the topic and applies `✅`.

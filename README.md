@@ -13,7 +13,9 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - ordered, durable message admission with immediate interruption of active work and bounded global concurrency;
 - real OMP resume through its native RPC protocol;
 - one-shot Discord approval buttons for OMP writes and executable actions;
+- Discord prompts for OMP `ask` forms, choices, and text input, with answers returned to the waiting call;
 - one rolling activity card per active conversation run, including replacement turns, with assistant messages delivered as they complete;
+- minute-based topic/status title review, rate-limit-aware refresh, and queue-idle completion;
 - `status`, `stop`, and `new` controls inside managed threads;
 - duplicate Discord message rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
@@ -83,6 +85,32 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 `[VERSION] ([short commit])`. Neither value is read from the checkout at runtime.
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
+
+### Deploy release 2026-11-13-3
+
+Use the same release tag on each bot; keep each bot's token, database, OMP
+credentials, and session directory separate.
+
+```bash
+git fetch origin --tags
+git checkout v2026-11-13-3
+cargo test --locked --all-targets
+cargo build --locked --release --bin omp-discord-bridge --target-dir target/candidate
+./target/candidate/release/omp-discord-bridge --version
+```
+
+Existing TOML files remain compatible. `omp.title_model` is optional; title
+inference otherwise uses the normal configured model and consumes its quota.
+OMP 18.20.0 or newer is required. No new database migration is introduced.
+For containers, follow [the Docker upgrade instructions](docs/docker.md#upgrade-to-2026-11-13-3).
+
+Wait for active conversations and delivery to finish, stop the service, make a
+consistent database backup, and atomically replace the executable. Do not build
+over a running executable or restart the bridge from inside its active OMP turn.
+Run the candidate's `check` with the same selected config before starting the
+service. Keep the previous executable/image for rollback. Verify the running
+version, then exercise a choice/text form and a title transition in an authorized
+thread; gateway connectivity alone does not prove either feature.
 
 
 ## Prerequisites
@@ -251,6 +279,15 @@ The default mounts are `./container/config:/config:ro`, `./container/data:/data`
 2. The bot creates a thread and starts the prompt when a concurrency slot is available.
 3. Continue sending messages in that thread without mentioning the bot. A newer message immediately requests interruption with OMP's native `abort_and_prompt`, then runs in the same live process and conversation.
 4. When the OMP project configuration requires approval for a write or executable action, an authorized user chooses **Approve once** or **Deny**. Requests expire after five minutes; interruption also expires the old request immediately.
+5. OMP forms appear field by field in Discord. Answer using the prompt controls rather than a new chat message: ordinary messages still interrupt the current turn. Checkbox forms toggle choices one at a time until **Done selecting**. OMP validates the returned fields and assembles the final form data; tool-approval buttons retain their separate one-shot authorization policy.
+
+Choices use paginated dropdowns (25 options per page). Text fields open a modal;
+use **Submit** to send the draft, or append further chunks for long answers.
+Long context, option text, and initial drafts are attached without truncation.
+Only authorized non-bot users in the request's thread can answer. Cancelled,
+answered, interrupted, and expired controls cannot be reused. Questions default
+to a five-minute wait; OMP may supply its own timeout, subject to the bridge's
+six-minute UI-service deadline. Secret-input requests are refused.
 
 ### Multiple bridge bots in one thread
 
@@ -345,11 +382,11 @@ can indicate that this toggle is disabled or that the bot lacks thread access.
 The tool reports the underlying Discord error; it never substitutes message
 authors for actual thread membership.
 
-Thread renames are lifecycle-only: `🛠️ Session title` when work starts and
-`✅ Session title` when the thread becomes idle after final delivery. New threads
-are created with `🛠️` directly, avoiding an extra thinking-to-working rename.
-The topic stays unchanged. There is no model-callable rename tool and no
-intermediate activity-phase rename.
+Thread titles are reviewed approximately once a minute while the queue is not
+completed. A separate, tool-free OMP call reads bounded recent conversation
+context and infers a concise topic and status: `🛠️` working, `🧠` thinking,
+`⏳` waiting, or `⚠️` blocked. New threads begin with `🛠️` and the opening
+message's topic. There is no model-callable rename tool.
 
 Thread-title change notices are ignored on input, even when attributed to an
 allowed user or mentioning the bot. Renaming a thread does not start or interrupt
@@ -362,15 +399,23 @@ Discord permissions and rename rate limits apply. Update failures are logged
 without blocking turns. The bot must own the thread or have Manage Threads permission.
 
 Titles use only the status emoji and topic; detailed activity stays in the rolling
-card. The earlier `[OMP: <phase>]` prefix is removed on the next title update.
-Automatic lifecycle updates are reconciled independently of message delivery,
-so Discord rate-limit waits do not block turns or discard the desired idle emoji
-after ten seconds. New work supersedes a pending idle update. The displayed emoji
-can lag while Discord limits renames; it is not an instantaneous activity signal.
-Each automatic request may wait up to fifteen minutes; failed requests get at most
-five attempts with exponential backoff. Exhaustion is logged, and a later lifecycle
-change can publish a new desired state. Desired title state is process-local and
-is not replayed after restart.
+card. Completion sets `✅` on the latest topic and stops periodic inference.
+A new turn reopens review. The reviewer cannot override the queue-idle completion
+rule. The earlier `[OMP: <phase>]` prefix is removed on the next title update.
+
+Review and Discord requests run independently of message delivery. Discord
+rate-limit deadlines are honored before rereading the session and generating
+another title; an old generated title is never replayed after a rate-limit wait.
+Unchanged names do not trigger a rename. New work supersedes a pending idle
+update. The visible title can lag while Discord limits renames.
+
+Set optional `omp.title_model` to choose a separate authenticated model for title
+review. Otherwise it uses `omp.model`, or OMP's configured default. Reviews consume
+model quota; they are serialized and bounded. Review calls are ephemeral, have
+no tools, do not resume or write the working session, and do not receive the
+Discord token. Only recent visible user/assistant context is summarized, not
+private thinking or tool payloads. Titles are public Discord metadata: do not
+treat inferred summaries as a secret-storage boundary.
 
 Thread controls must be the complete message:
 

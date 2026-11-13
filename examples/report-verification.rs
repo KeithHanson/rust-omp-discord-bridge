@@ -63,6 +63,9 @@ impl OmpUi for Ui {
         self.approval_started.notify_one();
         std::future::pending().await
     }
+    async fn prompt(&self, request: serde_json::Value) -> serde_json::Value {
+        panic!("Unexpected interactive prompt in report verification: {request}");
+    }
     async fn notify(&self, _: &str) {}
     async fn channel_history(&self, _: u16) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())

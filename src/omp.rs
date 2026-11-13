@@ -70,6 +70,7 @@ pub trait OmpUi: Send + Sync {
     /// Enqueue owned, completed visible text synchronously; never await delivery here.
     fn message(&self, text: &str) -> Result<(), OmpTurnError>;
     async fn confirm(&self, request: ApprovalRequest) -> bool;
+    async fn prompt(&self, request: Value) -> Value;
     async fn notify(&self, message: &str);
     async fn channel_history(&self, days: u16) -> Result<String, String>;
     async fn thread_participants(&self) -> Result<String, String>;
@@ -480,6 +481,11 @@ impl OmpTransport {
                         ui.activity(status);
                     }
                     match kind {
+                        Some("extension_ui_request")
+                            if frame.get("method").and_then(Value::as_str) == Some("cancel") =>
+                        {
+                            cancel_service_request(&frame, &mut requests);
+                        }
                         Some("host_tool_call" | "extension_ui_request") => {
                             let request = ServiceRequest::new(frame, ui, self.discord_history_max_days)?;
                             if abort_deadline.is_some()
@@ -496,11 +502,7 @@ impl OmpTransport {
                             }
                         }
                         Some("host_tool_cancel") => {
-                            if let Some(index) = requests.iter().position(|request| {
-                                frame.get("id").and_then(Value::as_str) == Some(request.id.as_str())
-                            }) {
-                                requests.swap_remove(index);
-                            }
+                            cancel_service_request(&frame, &mut requests);
                         }
                         Some("response") if frame.get("id").and_then(Value::as_str) == Some("stop") => {
                             if frame.get("success").and_then(Value::as_bool) != Some(true) {
@@ -1057,13 +1059,16 @@ impl<'a> ServiceRequest<'a> {
             history_response(&id, Err("Bridge request cancelled".to_owned()))
         } else if matches!(
             frame.get("method").and_then(Value::as_str),
-            Some("notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text")
+            Some("cancel" | "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text")
         ) {
             Value::Null
         } else {
             json!({"type": "extension_ui_response", "id": id, "cancelled": true})
         };
-        let fallback = cancel.clone();
+        let mut fallback = cancel.clone();
+        if fallback.get("cancelled") == Some(&Value::Bool(true)) {
+            fallback["timedOut"] = Value::Bool(true);
+        }
         let response = Box::pin(async move {
             timeout(UI_TIMEOUT, service_response(&frame, ui, max_history_days))
                 .await
@@ -1074,6 +1079,15 @@ impl<'a> ServiceRequest<'a> {
             cancel,
             response,
         })
+    }
+}
+
+fn cancel_service_request(frame: &Value, requests: &mut Vec<ServiceRequest<'_>>) {
+    if let Some(target) = frame.get("targetId").and_then(Value::as_str)
+        && let Some(index) = requests.iter().position(|request| request.id == target)
+    {
+        // OMP already resolved the request. Drop the UI future without replying.
+        requests.swap_remove(index);
     }
 }
 
@@ -1282,10 +1296,13 @@ fn parse_tool_approval_select(frame: &Value) -> Option<ToolApprovalSelection> {
     let (heading, details) = title
         .split_once('\n')
         .unwrap_or((title, "OMP requested approval without details"));
-    if !heading.starts_with("Allow tool: ") {
+    if heading.strip_prefix("Allow tool: ")?.trim().is_empty() {
         return None;
     }
     let options = frame.get("options")?.as_array()?;
+    if options.iter().any(|option| !option.is_string()) {
+        return None;
+    }
     let approve_value = options
         .iter()
         .filter_map(Value::as_str)
@@ -1377,6 +1394,10 @@ fn history_days(frame: &Value, max_history_days: u16) -> Result<u16, String> {
 
 async fn service_ui_request(frame: &Value, ui: &dyn OmpUi) -> Value {
     let id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
+    if frame.get("secret").and_then(Value::as_bool) == Some(true) {
+        ui.notify("OMP requested secret input. Discord prompts are plaintext, so this request was cancelled. Enter secrets through a secure local interface instead.").await;
+        return json!({"type": "extension_ui_response", "id": id, "cancelled": true});
+    }
     match frame.get("method").and_then(Value::as_str) {
         Some("confirm") => {
             let request = ApprovalRequest {
@@ -1394,7 +1415,12 @@ async fn service_ui_request(frame: &Value, ui: &dyn OmpUi) -> Value {
             let confirmed = ui.confirm(request).await;
             json!({"type": "extension_ui_response", "id": id, "confirmed": confirmed})
         }
-        Some("select") => {
+        Some("select")
+            if frame
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|title| title.starts_with("Allow tool:")) =>
+        {
             let Some(selection) = parse_tool_approval_select(frame) else {
                 return json!({"type": "extension_ui_response", "id": id, "cancelled": true});
             };
@@ -1406,13 +1432,14 @@ async fn service_ui_request(frame: &Value, ui: &dyn OmpUi) -> Value {
             };
             json!({"type": "extension_ui_response", "id": id, "value": value})
         }
+        Some("select" | "input" | "editor" | "ask") => ui.prompt(frame.clone()).await,
         Some("notify") => {
             if let Some(message) = frame.get("message").and_then(Value::as_str) {
                 ui.notify(message).await;
             }
             Value::Null
         }
-        Some("setStatus" | "setWidget" | "setTitle" | "set_editor_text") => Value::Null,
+        Some("cancel" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text") => Value::Null,
         _ => json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
     }
 }
@@ -1622,6 +1649,12 @@ mod tests {
             future::pending().await
         }
 
+        async fn prompt(&self, _request: Value) -> Value {
+            let _guard = WaitGuard(&self.dropped);
+            self.waiting.notify_one();
+            future::pending().await
+        }
+
         async fn notify(&self, _message: &str) {
             let _guard = WaitGuard(&self.dropped);
             self.waiting.notify_one();
@@ -1776,6 +1809,7 @@ mod tests {
                 session_dir: directory.path().to_owned(),
                 allowed_root: directory.path().to_owned(),
                 model: None,
+                title_model: None,
                 thinking_level: None,
             },
             Duration::from_secs(60),
@@ -2721,6 +2755,231 @@ mod tests {
         assert_eq!(activity_status(&json!({"type": "unknown"})), None);
     }
 
+    #[derive(Default)]
+    struct PromptUi {
+        requests: Mutex<Vec<Value>>,
+        notices: Mutex<Vec<String>>,
+        confirmations: Mutex<Vec<ApprovalRequest>>,
+        response: Value,
+        approve: bool,
+    }
+
+    #[async_trait]
+    impl OmpUi for PromptUi {
+        fn activity(&self, _status: &'static str) {}
+
+        fn message(&self, _text: &str) -> Result<(), OmpTurnError> {
+            panic!("prompts do not publish assistant messages")
+        }
+
+        async fn confirm(&self, request: ApprovalRequest) -> bool {
+            self.confirmations.lock().unwrap().push(request);
+            self.approve
+        }
+
+        async fn prompt(&self, request: Value) -> Value {
+            self.requests.lock().unwrap().push(request);
+            self.response.clone()
+        }
+
+        async fn notify(&self, message: &str) {
+            self.notices.lock().unwrap().push(message.to_owned());
+        }
+
+        async fn channel_history(&self, _days: u16) -> Result<String, String> {
+            panic!("prompts do not request history")
+        }
+
+        async fn thread_participants(&self) -> Result<String, String> {
+            panic!("prompts do not request participants")
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_prompts_preserve_requests_and_protocol_responses() {
+        for (method, payload) in [
+            ("select", json!({"value": "Exact option"})),
+            ("input", json!({"value": ""})),
+            ("editor", json!({"value": "line one\nline two"})),
+            ("ask", json!({"answers": [{"id": "q1", "selectedOptions": ["Yes"]}]})),
+            ("input", json!({"cancelled": true})),
+            ("ask", json!({"cancelled": true, "timedOut": true})),
+        ] {
+            let frame = json!({
+                "type": "extension_ui_request", "id": "prompt-1", "method": method,
+                "title": "Choose a value", "options": ["Exact option"],
+                "optionDetails": [{"description": "Extra detail"}],
+                "selectionMarker": "checkbox", "checkedIndices": [0], "markableCount": 1,
+                "prefill": "existing text", "placeholder": "Type here", "timeout": 120000,
+                "questions": [{"id": "q1", "question": "Continue?", "options": [{"label": "Yes"}]}],
+            });
+            let mut response = payload;
+            response["type"] = json!("extension_ui_response");
+            response["id"] = json!("prompt-1");
+            let ui = PromptUi {
+                response: response.clone(),
+                ..PromptUi::default()
+            };
+            let (writer, reader) = tokio::io::duplex(4096);
+            let mut input = BufWriter::new(writer);
+            service_frame(&frame, &mut input, &ui, 30).await.unwrap();
+            let mut responses = FramedRead::new(reader, LinesCodec::new());
+            let actual = next_frame(responses.next().await, false).unwrap();
+            assert_eq!(actual, response);
+            assert_eq!(*ui.requests.lock().unwrap(), vec![frame]);
+            assert!(ui.confirmations.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_select_never_exposes_persistent_choices_to_generic_prompts() {
+        for approve in [false, true] {
+            let ui = PromptUi {
+                approve,
+                ..PromptUi::default()
+            };
+            let frame = json!({
+                "type": "extension_ui_request", "id": "approval", "method": "select",
+                "title": "Allow tool: bash\nCommand: true",
+                "options": ["Approve", "Approve bash for this session", "Deny"],
+            });
+            assert_eq!(
+                service_ui_request(&frame, &ui).await,
+                json!({
+                    "type": "extension_ui_response", "id": "approval",
+                    "value": if approve { "Approve" } else { "Deny" },
+                })
+            );
+            assert_eq!(ui.confirmations.lock().unwrap().len(), 1);
+            assert!(ui.requests.lock().unwrap().is_empty());
+        }
+        for title in ["Allow tool: bash", "Allow tool:bash", "Allow tool:"] {
+            for options in [
+                json!(["Approve bash for this session", "Deny"]),
+                json!(["Approve"]),
+                json!([{"label": "Approve"}, "Deny"]),
+                Value::Null,
+            ] {
+                let ui = PromptUi::default();
+                let frame = json!({
+                    "type": "extension_ui_request", "id": "malformed", "method": "select",
+                    "title": title, "options": options,
+                });
+                assert_eq!(
+                    service_ui_request(&frame, &ui).await,
+                    json!({"type": "extension_ui_response", "id": "malformed", "cancelled": true})
+                );
+                assert!(ui.requests.lock().unwrap().is_empty());
+                assert!(ui.confirmations.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_input_is_cancelled_with_a_visible_non_secret_notice() {
+        let ui = PromptUi::default();
+        let frame = json!({
+            "type": "extension_ui_request", "id": "secret", "method": "input",
+            "title": "sensitive-title", "placeholder": "sensitive-default", "secret": true,
+        });
+        assert_eq!(
+            service_ui_request(&frame, &ui).await,
+            json!({"type": "extension_ui_response", "id": "secret", "cancelled": true})
+        );
+        assert!(ui.requests.lock().unwrap().is_empty());
+        let notices = ui.notices.lock().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("plaintext"));
+        assert!(!notices[0].contains("sensitive"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bridge_prompt_deadline_reports_timeout_and_drops_waiter() {
+        let ui = TestUi::default();
+        let mut request = ServiceRequest::new(
+            json!({"type": "extension_ui_request", "id": "slow", "method": "input"}),
+            &ui,
+            30,
+        )
+        .unwrap();
+        assert_eq!(
+            request.response.as_mut().await,
+            json!({
+                "type": "extension_ui_response", "id": "slow",
+                "cancelled": true, "timedOut": true,
+            })
+        );
+        assert!(ui.dropped.load(Ordering::SeqCst));
+        assert!(request.cancel.get("timedOut").is_none());
+    }
+
+    #[tokio::test]
+    async fn omp_cancel_target_drops_prompt_without_any_response() {
+        for method in ["select", "input", "editor", "ask"] {
+            let mut run = driver();
+            run.protocol.command().await;
+            run.protocol.emit(json!({"type": "agent_start"})).await;
+            run.protocol.ack(1).await;
+            run.protocol
+                .emit(json!({
+                    "type": "extension_ui_request", "id": "waiting", "method": method,
+                    "title": "A question", "options": ["Yes"],
+                }))
+                .await;
+            let state = next_frame(run.protocol.commands.next().await, false).unwrap();
+            assert_eq!(state["type"], "get_state");
+            run.protocol.state(&state).await;
+            timeout(Duration::from_secs(2), run.ui.waiting.notified())
+                .await
+                .unwrap();
+            run.protocol
+                .emit(json!({
+                    "type": "extension_ui_request", "id": "cancel-event", "method": "cancel",
+                    "targetId": "waiting",
+                }))
+                .await;
+            run.protocol.settled = true;
+            run.protocol
+                .emit(json!({"type": "agent_end", "yielded": true}))
+                .await;
+            run.protocol.result(1, "completed").await;
+            // Any reply to either waiting or cancel-event fails this drain.
+            run.protocol.finish().await;
+            run.task.await.unwrap().unwrap();
+            assert!(run.ui.dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn cancellation_matches_target_not_event_id_and_preserves_other_requests() {
+        let ui = TestUi::default();
+        let request = |id| {
+            ServiceRequest::new(
+                json!({"type": "extension_ui_request", "id": id, "method": "input"}),
+                &ui,
+                30,
+            )
+            .unwrap()
+        };
+        let mut requests = vec![request("first"), request("second")];
+        cancel_service_request(&json!({"id": "first", "targetId": "missing"}), &mut requests);
+        assert_eq!(requests.len(), 2);
+        cancel_service_request(&json!({"id": "first", "targetId": "second"}), &mut requests);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "first");
+    }
+
+    #[test]
+    fn malformed_approval_titles_and_option_types_fail_closed() {
+        for frame in [
+            json!({"title": "Allow tool: ", "options": ["Approve", "Deny"]}),
+            json!({"title": "Allow tool:bash", "options": ["Approve", "Deny"]}),
+            json!({"title": "Allow tool: bash", "options": ["Approve", "Deny", {}]}),
+        ] {
+            assert!(parse_tool_approval_select(&frame).is_none());
+        }
+    }
+
     struct HistoryUi(bool);
 
     #[async_trait]
@@ -2733,6 +2992,10 @@ mod tests {
 
         async fn confirm(&self, _request: ApprovalRequest) -> bool {
             false
+        }
+
+        async fn prompt(&self, _request: Value) -> Value {
+            panic!("history requests do not prompt")
         }
 
         async fn notify(&self, _message: &str) {}

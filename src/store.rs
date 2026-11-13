@@ -73,6 +73,13 @@ pub struct TurnOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct TitleContextTurn {
+    pub status: TurnStatus,
+    pub prompt: String,
+    pub response: Option<String>,
+}
+
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -488,6 +495,26 @@ impl Store {
         })
     }
 
+    /// Select bounded visible text in SQL, never materializing full historical turns.
+    pub(crate) async fn title_context(&self, thread_id: ThreadId) -> Result<Vec<TitleContextTurn>> {
+        let rows = sqlx::query(
+            "SELECT status, substr(content, 1, 2048) AS prompt, substr(response, 1, 2048) AS response FROM turns WHERE thread_id = ? ORDER BY id DESC LIMIT 8",
+        )
+        .bind(thread_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .rev()
+            .map(|row| {
+                Ok(TitleContextTurn {
+                    status: TurnStatus::from_database(row.try_get("status")?)?,
+                    prompt: row.try_get("prompt")?,
+                    response: row.try_get("response")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn queued_thread_ids(&self) -> Result<Vec<ThreadId>> {
         let rows = sqlx::query(
             "SELECT DISTINCT thread_id FROM turns WHERE status = 'queued' ORDER BY thread_id",
@@ -587,6 +614,33 @@ mod tests {
             trigger_message_id: MessageId::new(trigger),
             cwd: std::env::temp_dir(),
             created_by_user_id: UserId::new(3),
+        }
+    }
+
+    #[tokio::test]
+    async fn title_context_bounds_text_and_selects_only_recent_session_turns() {
+        let (_directory, store) = test_store().await;
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        store.create_session(&new_session(11, 21)).await.unwrap();
+        let huge = "界".repeat(10_000);
+        for index in 0..10 {
+            sqlx::query("INSERT INTO turns (thread_id, discord_message_id, author_id, content, response, status, created_at_ms) VALUES ('10', ?, '3', ?, ?, 'done', 0)")
+                .bind((100 + index).to_string())
+                .bind(format!("{index}:{huge}"))
+                .bind(&huge)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        store.enqueue_turn(ThreadId::new(11), MessageId::new(200), UserId::new(3), "unrelated", TurnSource::Human).await.unwrap();
+        let context = store.title_context(ThreadId::new(10)).await.unwrap();
+        assert_eq!(context.len(), 8);
+        assert!(context[0].prompt.starts_with("2:"));
+        assert!(context[7].prompt.starts_with("9:"));
+        for turn in context {
+            assert_eq!(turn.prompt.chars().count(), 2048);
+            assert_eq!(turn.response.unwrap().chars().count(), 2048);
+            assert_eq!(turn.status, TurnStatus::Done);
         }
     }
 

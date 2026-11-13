@@ -42,6 +42,7 @@ pub struct OmpConfig {
     pub session_dir: PathBuf,
     pub allowed_root: PathBuf,
     pub model: Option<String>,
+    pub title_model: Option<String>,
     pub thinking_level: Option<String>,
 }
 
@@ -95,6 +96,7 @@ struct RawOmpConfig {
     session_dir: PathBuf,
     allowed_root: PathBuf,
     model: Option<String>,
+    title_model: Option<String>,
     thinking_level: Option<String>,
 }
 
@@ -234,6 +236,7 @@ impl AppConfig {
                 session_dir,
                 allowed_root,
                 model: nonempty_optional(raw.omp.model, "omp.model")?,
+                title_model: nonempty_optional(raw.omp.title_model, "omp.title_model")?,
                 thinking_level: nonempty_optional(raw.omp.thinking_level, "omp.thinking_level")?,
             },
             runtime: RuntimeConfig {
@@ -395,6 +398,7 @@ mod tests {
                 session_dir: root.path().join("sessions"),
                 allowed_root: root.path().to_owned(),
                 model: None,
+                title_model: None,
                 thinking_level: None,
             },
             runtime: RawRuntimeConfig::default(),
@@ -428,6 +432,7 @@ mod tests {
                 session_dir: allowed.path().join("sessions"),
                 allowed_root: allowed.path().to_owned(),
                 model: None,
+                title_model: None,
                 thinking_level: None,
             },
             runtime: RawRuntimeConfig::default(),
@@ -456,6 +461,7 @@ mod tests {
                 session_dir: root.path().join("sessions"),
                 allowed_root: root.path().to_owned(),
                 model: None,
+                title_model: None,
                 thinking_level: None,
             },
             runtime: RawRuntimeConfig::default(),
@@ -485,6 +491,7 @@ mod tests {
                 session_dir: root.join("sessions"),
                 allowed_root: root.to_owned(),
                 model: None,
+                title_model: None,
                 thinking_level: None,
             },
             runtime,
@@ -527,6 +534,26 @@ mod tests {
         assert_invalid_history_runtime(path, "timeout_seconds", |runtime| {
             runtime.discord_history_timeout_seconds = 0;
         });
+    }
+
+    #[test]
+    fn title_model_is_optional_and_validated() {
+        let raw: RawOmpConfig = toml::from_str(
+            "session_dir = '/tmp/sessions'\nallowed_root = '/tmp'\nmodel = 'primary'",
+        )
+        .expect("existing configuration remains valid");
+        assert!(raw.title_model.is_none());
+        assert_eq!(raw.model.as_deref(), Some("primary"));
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.omp.title_model = Some("reviewer".to_owned());
+        let config = AppConfig::from_raw(raw).expect("title model");
+        assert_eq!(config.omp.title_model.as_deref(), Some("reviewer"));
+
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.omp.title_model = Some("  ".to_owned());
+        assert!(AppConfig::from_raw(raw).unwrap_err().to_string().contains("omp.title_model"));
     }
     #[cfg(unix)]
     #[test]
