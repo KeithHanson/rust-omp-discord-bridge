@@ -351,6 +351,10 @@ are created with `🛠️` directly, avoiding an extra thinking-to-working renam
 The topic stays unchanged. There is no model-callable rename tool and no
 intermediate activity-phase rename.
 
+Thread-title change notices are ignored on input, even when attributed to an
+allowed user or mentioning the bot. Renaming a thread does not start or interrupt
+a model turn; ordinary messages and replies retain their existing routing.
+
 Completion requires no active run and no running or queued turn. A stopped thread
 with queued work is not idle; failed or aborted turns with no remaining work are
 idle. Thus `✅` means the queue is idle, not that every task succeeded.

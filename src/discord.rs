@@ -1269,7 +1269,11 @@ impl DiscordHandler {
 }
 
 fn message_source(message: &Message, bot_id: u64) -> Option<TurnSource> {
-    if message.webhook_id.is_some() || message.author.id.get() == bot_id {
+    // Discord emits type 4 system messages for thread title changes.
+    if message.kind == serenity::all::MessageType::GroupNameUpdate
+        || message.webhook_id.is_some()
+        || message.author.id.get() == bot_id
+    {
         return None;
     }
     if message.author.bot {
@@ -2012,6 +2016,25 @@ mod tests {
         bridge.bot = true;
         message.mentions.push(bridge);
         message
+    }
+
+    #[test]
+    fn thread_title_notices_never_become_turns() {
+        use serenity::all::MessageType;
+
+        for bot in [false, true] {
+            let mut message = routing_message(bot, "<@9> renamed title");
+            message.kind = MessageType::GroupNameUpdate;
+            assert_eq!(message_source(&message, 9), None);
+
+            for kind in [MessageType::Regular, MessageType::InlineReply] {
+                message.kind = kind;
+                assert_eq!(
+                    message_source(&message, 9),
+                    Some(if bot { TurnSource::Bot } else { TurnSource::Human })
+                );
+            }
+        }
     }
 
     fn routing_channel() -> GuildChannel {
