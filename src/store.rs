@@ -8,6 +8,7 @@ use crate::domain::{
 };
 
 const MAX_PENDING_TURNS_PER_THREAD: i64 = 64;
+pub const MAX_BOT_EXCHANGES: usize = 8;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
@@ -49,6 +50,13 @@ pub struct Store {
 pub enum CreateSessionResult {
     Created(Session),
     Existing(Session),
+}
+
+/// The caller must authorize the author before classifying an admitted turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnSource {
+    Human,
+    Bot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +106,25 @@ impl Store {
             .execute(&mut *transaction)
             .await?;
         }
+        for (column, migration) in [
+            (
+                "bot_exchange_count",
+                "ALTER TABLE sessions ADD COLUMN bot_exchange_count INTEGER NOT NULL DEFAULT 0 CHECK (bot_exchange_count BETWEEN 0 AND 8)",
+            ),
+            (
+                "latest_human_message_id",
+                "ALTER TABLE sessions ADD COLUMN latest_human_message_id TEXT",
+            ),
+        ] {
+            let existing: Option<String> =
+                sqlx::query_scalar("SELECT name FROM pragma_table_info('sessions') WHERE name = ?")
+                    .bind(column)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            if existing.is_none() {
+                sqlx::query(migration).execute(&mut *transaction).await?;
+            }
+        }
         transaction.commit().await?;
         Ok(Self { pool })
     }
@@ -105,7 +132,7 @@ impl Store {
     pub async fn create_session(&self, input: &NewSession) -> Result<CreateSessionResult> {
         let now = now_ms()?;
         let result = sqlx::query(
-            "INSERT INTO sessions (thread_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?) ON CONFLICT(trigger_message_id) DO NOTHING",
+            "INSERT INTO sessions (thread_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?) ON CONFLICT DO NOTHING",
         )
         .bind(input.thread_id.to_string())
         .bind(input.guild_id.to_string())
@@ -126,10 +153,13 @@ impl Store {
             return Ok(CreateSessionResult::Created(session));
         }
 
-        let session = self
-            .session_by_trigger(input.trigger_message_id)
-            .await?
-            .context("conflicting trigger message has no session")?;
+        let session = match self.session_by_trigger(input.trigger_message_id).await? {
+            Some(session) => session,
+            None => self
+                .session(input.thread_id)
+                .await?
+                .context("conflicting thread or trigger message has no session")?,
+        };
         Ok(CreateSessionResult::Existing(session))
     }
 
@@ -208,12 +238,39 @@ impl Store {
         require_one_row(result.rows_affected(), "session status update")
     }
 
+    /// Record an authorized human control or mention that did not enqueue a turn.
+    pub async fn note_human_message(
+        &self,
+        thread_id: ThreadId,
+        message_id: MessageId,
+    ) -> Result<()> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT latest_human_message_id FROM sessions WHERE thread_id = ?")
+            .bind(thread_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .context("cannot record a human message without a session")?;
+        if is_new_human_message(&row, message_id)? {
+            sqlx::query(
+                "UPDATE sessions SET bot_exchange_count = 0, latest_human_message_id = ?, updated_at_ms = ? WHERE thread_id = ?",
+            )
+            .bind(message_id.to_string())
+            .bind(now_ms()?)
+            .bind(thread_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn enqueue_turn(
         &self,
         thread_id: ThreadId,
         message_id: MessageId,
         author_id: UserId,
         content: &str,
+        source: TurnSource,
     ) -> Result<EnqueueResult> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let duplicate: bool =
@@ -225,15 +282,15 @@ impl Store {
             transaction.commit().await?;
             return Ok(EnqueueResult::Duplicate);
         }
-        let status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM sessions WHERE thread_id = ?")
-                .bind(thread_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?;
-        match status.as_deref() {
-            Some("active") => {}
-            Some(_) => bail!("cannot enqueue a turn in a stopped session"),
-            None => bail!("cannot enqueue a turn without a session"),
+        let session = sqlx::query(
+            "SELECT status, bot_exchange_count, latest_human_message_id FROM sessions WHERE thread_id = ?",
+        )
+        .bind(thread_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .context("cannot enqueue a turn without a session")?;
+        if session.try_get::<&str, _>("status")? != "active" {
+            bail!("cannot enqueue a turn in a stopped session");
         }
         let pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM turns WHERE thread_id = ? AND status IN ('queued', 'running')",
@@ -244,6 +301,14 @@ impl Store {
         if pending >= MAX_PENDING_TURNS_PER_THREAD {
             bail!("session pending turn limit ({MAX_PENDING_TURNS_PER_THREAD}) reached");
         }
+        let bot_exchanges: i64 = session.try_get("bot_exchange_count")?;
+        if source == TurnSource::Bot && bot_exchanges >= MAX_BOT_EXCHANGES as i64 {
+            bail!(
+                "session bot exchange limit ({MAX_BOT_EXCHANGES}) reached; a new authorized human message is needed"
+            );
+        }
+        let resets_budget =
+            source == TurnSource::Human && is_new_human_message(&session, message_id)?;
         let result = sqlx::query(
             "INSERT INTO turns (thread_id, discord_message_id, author_id, content, status, created_at_ms) VALUES (?, ?, ?, ?, 'queued', ?) ON CONFLICT(discord_message_id) DO NOTHING",
         )
@@ -254,12 +319,35 @@ impl Store {
         .bind(now_ms()?)
         .execute(&mut *transaction)
         .await?;
-        transaction.commit().await?;
         if result.rows_affected() == 0 {
-            Ok(EnqueueResult::Duplicate)
-        } else {
-            Ok(EnqueueResult::Enqueued(result.last_insert_rowid()))
+            transaction.commit().await?;
+            return Ok(EnqueueResult::Duplicate);
         }
+        match source {
+            TurnSource::Bot => {
+                // Admission order defines the budget: delayed bots also consume the current
+                // allowance, never a previous human-message window.
+                sqlx::query(
+                    "UPDATE sessions SET bot_exchange_count = bot_exchange_count + 1 WHERE thread_id = ?",
+                )
+                .bind(thread_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            }
+            TurnSource::Human if resets_budget => {
+                sqlx::query(
+                    "UPDATE sessions SET bot_exchange_count = 0, latest_human_message_id = ?, updated_at_ms = ? WHERE thread_id = ?",
+                )
+                .bind(message_id.to_string())
+                .bind(now_ms()?)
+                .bind(thread_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            }
+            TurnSource::Human => {}
+        }
+        transaction.commit().await?;
+        Ok(EnqueueResult::Enqueued(result.last_insert_rowid()))
     }
 
     pub async fn claim_next(&self, thread_id: ThreadId) -> Result<Option<Turn>> {
@@ -412,6 +500,18 @@ impl Store {
     }
 }
 
+fn is_new_human_message(row: &sqlx::sqlite::SqliteRow, message_id: MessageId) -> Result<bool> {
+    let latest = row
+        .try_get::<Option<&str>, _>("latest_human_message_id")?
+        .map(|value| {
+            value.parse::<u64>().with_context(|| {
+                format!("database column latest_human_message_id has invalid Discord id `{value}`")
+            })
+        })
+        .transpose()?;
+    Ok(latest.is_none_or(|latest| message_id.get() > latest))
+}
+
 fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Session> {
     Ok(Session {
         thread_id: parse_id(row.try_get("thread_id")?, "thread_id")?,
@@ -504,6 +604,7 @@ mod tests {
                 MessageId::new(30),
                 UserId::new(3),
                 "first",
+                TurnSource::Human,
             )
             .await
             .expect("enqueue first");
@@ -513,6 +614,7 @@ mod tests {
                 MessageId::new(30),
                 UserId::new(3),
                 "duplicate",
+                TurnSource::Human,
             )
             .await
             .expect("enqueue duplicate");
@@ -537,7 +639,13 @@ mod tests {
             .await
             .expect("create session");
         store
-            .enqueue_turn(ThreadId::new(10), MessageId::new(30), UserId::new(3), "run")
+            .enqueue_turn(
+                ThreadId::new(10),
+                MessageId::new(30),
+                UserId::new(3),
+                "run",
+                TurnSource::Human,
+            )
             .await
             .expect("enqueue");
         let claimed = store
@@ -590,6 +698,7 @@ mod tests {
                 MessageId::new(message),
                 UserId::new(3),
                 "prompt",
+                TurnSource::Human,
             )
             .await
             .expect("enqueue")
@@ -734,14 +843,26 @@ mod tests {
             .expect("claim")
             .expect("running turn");
         let overflow = store
-            .enqueue_turn(thread, MessageId::new(164), UserId::new(3), "overflow")
+            .enqueue_turn(
+                thread,
+                MessageId::new(164),
+                UserId::new(3),
+                "overflow",
+                TurnSource::Human,
+            )
             .await
             .expect_err("64 pending turns must reject admission");
         assert!(overflow.to_string().contains("limit (64)"));
         for message in [100, 163] {
             assert_eq!(
                 store
-                    .enqueue_turn(thread, MessageId::new(message), UserId::new(3), "duplicate")
+                    .enqueue_turn(
+                        thread,
+                        MessageId::new(message),
+                        UserId::new(3),
+                        "duplicate",
+                        TurnSource::Human,
+                    )
                     .await
                     .expect("duplicates bypass limit"),
                 EnqueueResult::Duplicate
@@ -794,13 +915,25 @@ mod tests {
         assert_eq!(interruption_link(&store, first).await, None);
         assert_eq!(
             store
-                .enqueue_turn(thread, MessageId::new(31), UserId::new(3), "duplicate")
+                .enqueue_turn(
+                    thread,
+                    MessageId::new(31),
+                    UserId::new(3),
+                    "duplicate",
+                    TurnSource::Human,
+                )
                 .await
                 .expect("duplicate after stop"),
             EnqueueResult::Duplicate
         );
         let error = store
-            .enqueue_turn(thread, MessageId::new(32), UserId::new(3), "stale handler")
+            .enqueue_turn(
+                thread,
+                MessageId::new(32),
+                UserId::new(3),
+                "stale handler",
+                TurnSource::Human,
+            )
             .await
             .expect_err("new admission after stop");
         assert!(error.to_string().contains("stopped"));
@@ -1043,8 +1176,21 @@ mod tests {
             .create_session(&new_session(10, 20))
             .await
             .expect("create original session");
-        let first = enqueue(&original, 10, 30).await;
-        let pending = enqueue(&original, 10, 31).await;
+        let mut ids = Vec::new();
+        for message in [30, 31] {
+            let result = sqlx::query(
+                "INSERT INTO turns (thread_id, discord_message_id, author_id, content, status, created_at_ms) VALUES ('10', ?, '3', 'prompt', 'queued', 0)",
+            )
+            .bind(message.to_string())
+            .execute(&original.pool)
+            .await
+            .expect("insert original turn");
+            ids.push(result.last_insert_rowid());
+        }
+        let [first, pending] = ids.as_slice() else {
+            panic!("expected two original turns");
+        };
+        let (first, pending) = (*first, *pending);
         original
             .claim_next(ThreadId::new(10))
             .await
@@ -1052,6 +1198,7 @@ mod tests {
         original.pool.close().await;
 
         let migrated = Store::open(&database).await.expect("migrate");
+        assert_eq!(budget_state(&migrated, 10).await, (0, None));
         assert_eq!(interruption_link(&migrated, first).await, None);
         assert_eq!(
             migrated
@@ -1075,5 +1222,415 @@ mod tests {
             .await
             .expect("migration is idempotent");
         assert_eq!(interruption_link(&reopened, first).await, Some(pending));
+        assert_eq!(budget_state(&reopened, 10).await, (0, None));
+    }
+
+    async fn admit(
+        store: &Store,
+        thread: u64,
+        message: u64,
+        source: TurnSource,
+    ) -> Result<EnqueueResult> {
+        store
+            .enqueue_turn(
+                ThreadId::new(thread),
+                MessageId::new(message),
+                UserId::new(3),
+                "prompt",
+                source,
+            )
+            .await
+    }
+
+    async fn budget_state(store: &Store, thread: u64) -> (i64, Option<String>) {
+        sqlx::query_as(
+            "SELECT bot_exchange_count, latest_human_message_id FROM sessions WHERE thread_id = ?",
+        )
+        .bind(thread.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .expect("read budget")
+    }
+
+    #[tokio::test]
+    async fn bot_budget_is_per_session_and_duplicates_never_replenish_it() {
+        let (_directory, store) = test_store().await;
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        enqueue(&store, 10, 30).await;
+        for message in 100..108 {
+            assert!(matches!(
+                admit(&store, 10, message, TurnSource::Bot).await.unwrap(),
+                EnqueueResult::Enqueued(_)
+            ));
+        }
+        assert_eq!(MAX_BOT_EXCHANGES, 8);
+        assert_eq!(budget_state(&store, 10).await, (8, Some("30".into())));
+        for source in [TurnSource::Bot, TurnSource::Human] {
+            assert_eq!(
+                admit(&store, 10, 107, source).await.unwrap(),
+                EnqueueResult::Duplicate
+            );
+        }
+        assert_eq!(budget_state(&store, 10).await, (8, Some("30".into())));
+        let error = admit(&store, 10, 108, TurnSource::Bot)
+            .await
+            .expect_err("ninth bot message must be rejected");
+        assert!(error.to_string().contains("limit (8)"));
+        assert!(error.to_string().contains("human message"));
+        assert_eq!(store.counts(ThreadId::new(10)).await.unwrap().queued, 9);
+
+        store.create_session(&new_session(11, 21)).await.unwrap();
+        admit(&store, 11, 200, TurnSource::Bot).await.unwrap();
+        assert_eq!(budget_state(&store, 11).await, (1, None));
+
+        for status in [TurnStatus::Done, TurnStatus::Failed, TurnStatus::Aborted] {
+            let turn = store.claim_next(ThreadId::new(10)).await.unwrap().unwrap();
+            store
+                .finish_turn(turn.id, status, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(budget_state(&store, 10).await, (8, Some("30".into())));
+        assert!(admit(&store, 10, 108, TurnSource::Bot).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_bot_admission_and_human_watermarks_are_serialized() {
+        let (directory, store) = test_store().await;
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        let other = Store::open(&directory.path().join("bridge.sqlite"))
+            .await
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for message in 100..132 {
+            let writer = if message % 2 == 0 {
+                store.clone()
+            } else {
+                other.clone()
+            };
+            tasks.spawn(async move { admit(&writer, 10, message, TurnSource::Bot).await });
+        }
+        let mut accepted = 0;
+        let mut rejected = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(EnqueueResult::Enqueued(_)) => accepted += 1,
+                Ok(EnqueueResult::Duplicate) => panic!("all messages are distinct"),
+                Err(error) => {
+                    assert!(error.to_string().contains("human message"));
+                    rejected += 1;
+                }
+            }
+        }
+        assert_eq!((accepted, rejected), (8, 24));
+        assert_eq!(budget_state(&store, 10).await, (8, None));
+        assert_eq!(store.counts(ThreadId::new(10)).await.unwrap().queued, 8);
+
+        let mut notes = tokio::task::JoinSet::new();
+        for message in (300..332).rev() {
+            let writer = if message % 2 == 0 {
+                store.clone()
+            } else {
+                other.clone()
+            };
+            notes.spawn(async move {
+                writer
+                    .note_human_message(ThreadId::new(10), MessageId::new(message))
+                    .await
+            });
+        }
+        while let Some(result) = notes.join_next().await {
+            result.unwrap().unwrap();
+        }
+        assert_eq!(budget_state(&store, 10).await, (0, Some("331".into())));
+        admit(&store, 10, 400, TurnSource::Bot).await.unwrap();
+        for message in 300..332 {
+            other
+                .note_human_message(ThreadId::new(10), MessageId::new(message))
+                .await
+                .unwrap();
+        }
+        assert_eq!(budget_state(&store, 10).await, (1, Some("331".into())));
+    }
+
+    #[tokio::test]
+    async fn bot_budget_and_human_watermark_survive_reopening() {
+        let (directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        enqueue(&store, 10, 100).await;
+        for message in 101..108 {
+            admit(&store, 10, message, TurnSource::Bot).await.unwrap();
+        }
+        store.pool.close().await;
+        let reopened = Store::open(&directory.path().join("bridge.sqlite"))
+            .await
+            .unwrap();
+        assert_eq!(budget_state(&reopened, 10).await, (7, Some("100".into())));
+        for (message, source) in [(100, TurnSource::Human), (101, TurnSource::Bot)] {
+            assert_eq!(
+                admit(&reopened, 10, message, source).await.unwrap(),
+                EnqueueResult::Duplicate
+            );
+        }
+        reopened
+            .note_human_message(thread, MessageId::new(100))
+            .await
+            .unwrap();
+        assert_eq!(budget_state(&reopened, 10).await, (7, Some("100".into())));
+        admit(&reopened, 10, 108, TurnSource::Bot).await.unwrap();
+        assert!(admit(&reopened, 10, 109, TurnSource::Bot).await.is_err());
+        assert_eq!(budget_state(&reopened, 10).await, (8, Some("100".into())));
+    }
+
+    #[tokio::test]
+    async fn only_newer_human_prompts_and_controls_reset_the_budget() {
+        let (_directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        enqueue(&store, 10, 100).await;
+        for message in 200..208 {
+            admit(&store, 10, message, TurnSource::Bot).await.unwrap();
+        }
+        assert_eq!(
+            admit(&store, 10, 100, TurnSource::Human).await.unwrap(),
+            EnqueueResult::Duplicate
+        );
+        enqueue(&store, 10, 90).await;
+        for message in [99, 100] {
+            store
+                .note_human_message(thread, MessageId::new(message))
+                .await
+                .unwrap();
+        }
+        assert_eq!(budget_state(&store, 10).await, (8, Some("100".into())));
+        enqueue(&store, 10, 300).await;
+        assert_eq!(budget_state(&store, 10).await, (0, Some("300".into())));
+        admit(&store, 10, 301, TurnSource::Bot).await.unwrap();
+        store
+            .note_human_message(thread, MessageId::new(400))
+            .await
+            .unwrap();
+        assert_eq!(budget_state(&store, 10).await, (0, Some("400".into())));
+
+        // Delayed bot messages predate the reset, but consume the current allowance.
+        for message in 150..158 {
+            admit(&store, 10, message, TurnSource::Bot).await.unwrap();
+        }
+        assert!(admit(&store, 10, 158, TurnSource::Bot).await.is_err());
+        assert_eq!(budget_state(&store, 10).await, (8, Some("400".into())));
+        for message in [400, 399] {
+            store
+                .note_human_message(thread, MessageId::new(message))
+                .await
+                .unwrap();
+            store.reset_session(thread).await.unwrap();
+        }
+        assert_eq!(budget_state(&store, 10).await, (8, Some("400".into())));
+        assert!(admit(&store, 10, 401, TurnSource::Bot).await.is_err());
+        store
+            .note_human_message(thread, MessageId::new(500))
+            .await
+            .unwrap();
+        admit(&store, 10, 501, TurnSource::Bot).await.unwrap();
+        enqueue(&store, 10, 350).await;
+        assert_eq!(budget_state(&store, 10).await, (1, Some("500".into())));
+    }
+
+    #[tokio::test]
+    async fn human_watermarks_compare_full_unsigned_snowflakes_numerically() {
+        let (_directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        let messages = [9, 10, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX];
+        for (index, message) in messages.into_iter().enumerate() {
+            store
+                .note_human_message(thread, MessageId::new(message))
+                .await
+                .unwrap();
+            assert_eq!(
+                budget_state(&store, 10).await,
+                (0, Some(message.to_string()))
+            );
+            admit(&store, 10, 100 + index as u64, TurnSource::Bot)
+                .await
+                .unwrap();
+            for replay in [message, message - 1] {
+                store
+                    .note_human_message(thread, MessageId::new(replay))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                budget_state(&store, 10).await,
+                (1, Some(message.to_string()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_full_and_stopped_rejections_do_not_change_budget_or_watermark() {
+        let (_directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        for message in 100..157 {
+            enqueue(&store, 10, message).await;
+        }
+        for message in 200..207 {
+            admit(&store, 10, message, TurnSource::Bot).await.unwrap();
+        }
+        assert_eq!(budget_state(&store, 10).await, (7, Some("156".into())));
+        for (message, source) in [(300, TurnSource::Human), (207, TurnSource::Bot)] {
+            let error = admit(&store, 10, message, source).await.unwrap_err();
+            assert!(error.to_string().contains("limit (64)"));
+        }
+        for (message, source) in [(156, TurnSource::Human), (206, TurnSource::Bot)] {
+            assert_eq!(
+                admit(&store, 10, message, source).await.unwrap(),
+                EnqueueResult::Duplicate
+            );
+        }
+        assert_eq!(budget_state(&store, 10).await, (7, Some("156".into())));
+        store
+            .set_session_status(thread, SessionStatus::Stopped)
+            .await
+            .unwrap();
+        for (message, source) in [(300, TurnSource::Human), (207, TurnSource::Bot)] {
+            let error = admit(&store, 10, message, source).await.unwrap_err();
+            assert!(error.to_string().contains("stopped"));
+        }
+        assert_eq!(budget_state(&store, 10).await, (7, Some("156".into())));
+        assert_eq!(store.reset_session(thread).await.unwrap(), 64);
+        assert_eq!(budget_state(&store, 10).await, (7, Some("156".into())));
+        admit(&store, 10, 207, TurnSource::Bot).await.unwrap();
+        assert_eq!(budget_state(&store, 10).await, (8, Some("156".into())));
+        enqueue(&store, 10, 300).await;
+        assert_eq!(budget_state(&store, 10).await, (0, Some("300".into())));
+    }
+
+    #[tokio::test]
+    async fn budget_update_failure_rolls_back_the_turn_and_all_budget_changes() {
+        let (_directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        enqueue(&store, 10, 100).await;
+        admit(&store, 10, 101, TurnSource::Bot).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TRIGGER reject_budget_change BEFORE UPDATE OF bot_exchange_count ON sessions
+             BEGIN SELECT RAISE(ABORT, 'test budget failure'); END;",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        for (message, source) in [(200, TurnSource::Human), (102, TurnSource::Bot)] {
+            let error = admit(&store, 10, message, source).await.unwrap_err();
+            assert!(error.to_string().contains("test budget failure"));
+            assert_eq!(budget_state(&store, 10).await, (1, Some("100".into())));
+            assert_eq!(store.counts(thread).await.unwrap().queued, 2);
+        }
+        assert!(
+            store
+                .note_human_message(thread, MessageId::new(300))
+                .await
+                .is_err()
+        );
+        assert_eq!(budget_state(&store, 10).await, (1, Some("100".into())));
+        sqlx::query("DROP TRIGGER reject_budget_change")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        enqueue(&store, 10, 200).await;
+        admit(&store, 10, 102, TurnSource::Bot).await.unwrap();
+        assert_eq!(budget_state(&store, 10).await, (1, Some("200".into())));
+    }
+
+    #[tokio::test]
+    async fn concurrent_existing_thread_adoption_keeps_the_winners_metadata() {
+        let (directory, store) = test_store().await;
+        let other = Store::open(&directory.path().join("bridge.sqlite"))
+            .await
+            .unwrap();
+        let thread = ThreadId::new(10);
+        let first = new_session(10, 20);
+        let second = NewSession {
+            guild_id: GuildId::new(4),
+            parent_channel_id: ChannelId::new(5),
+            cwd: directory.path().join("other"),
+            created_by_user_id: UserId::new(6),
+            ..new_session(10, 21)
+        };
+        let (left, right) =
+            tokio::join!(store.create_session(&first), other.create_session(&second),);
+        let (created, existing, winner, loser) = match (left.unwrap(), right.unwrap()) {
+            (CreateSessionResult::Created(created), CreateSessionResult::Existing(existing)) => {
+                (created, existing, &first, &second)
+            }
+            (CreateSessionResult::Existing(existing), CreateSessionResult::Created(created)) => {
+                (created, existing, &second, &first)
+            }
+            results => panic!("expected one winner and one existing session: {results:?}"),
+        };
+        for session in [&created, &existing] {
+            assert_eq!(session.thread_id, thread);
+            assert_eq!(session.trigger_message_id, winner.trigger_message_id);
+            assert_eq!(session.guild_id, winner.guild_id);
+            assert_eq!(session.parent_channel_id, winner.parent_channel_id);
+            assert_eq!(session.cwd, winner.cwd);
+            assert_eq!(session.created_by_user_id, winner.created_by_user_id);
+        }
+        assert!(
+            store
+                .session_by_trigger(loser.trigger_message_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let session_path = directory.path().join("existing-session.jsonl");
+        store.set_session_path(thread, &session_path).await.unwrap();
+        store
+            .note_human_message(thread, MessageId::new(500))
+            .await
+            .unwrap();
+        admit(&store, 10, 501, TurnSource::Bot).await.unwrap();
+        store
+            .set_session_status(thread, SessionStatus::Stopped)
+            .await
+            .unwrap();
+        let CreateSessionResult::Existing(session) = other.create_session(loser).await.unwrap()
+        else {
+            panic!("adopting a known thread must not replace it");
+        };
+        assert_eq!(session.trigger_message_id, winner.trigger_message_id);
+        assert_eq!(session.omp_session_path, Some(session_path));
+        assert_eq!(session.status, SessionStatus::Stopped);
+        assert_eq!(budget_state(&store, 10).await, (1, Some("500".into())));
+    }
+
+    #[tokio::test]
+    async fn duplicate_trigger_takes_precedence_over_an_existing_thread() {
+        let (_directory, store) = test_store().await;
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        store.create_session(&new_session(11, 21)).await.unwrap();
+        for thread in [12, 11] {
+            let CreateSessionResult::Existing(session) = store
+                .create_session(&new_session(thread, 20))
+                .await
+                .unwrap()
+            else {
+                panic!("duplicate trigger must retain the original mapping");
+            };
+            assert_eq!(session.thread_id, ThreadId::new(10));
+            assert_eq!(session.trigger_message_id, MessageId::new(20));
+        }
+        assert!(store.session(ThreadId::new(12)).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .session(ThreadId::new(11))
+                .await
+                .unwrap()
+                .unwrap()
+                .trigger_message_id,
+            MessageId::new(21)
+        );
     }
 }

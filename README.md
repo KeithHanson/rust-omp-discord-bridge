@@ -6,8 +6,9 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 
 ## Current behavior
 
-- mention-to-thread session creation;
-- explicit guild, parent-channel, and user allowlists;
+- mention-to-thread session creation and joining existing threads by mention;
+- explicit guild, parent-channel, and human-user allowlists;
+- directly addressed bot-to-bot collaboration without a peer-bot allowlist, with a durable exchange limit;
 - durable SQLite session and turn state;
 - ordered, durable message admission with immediate interruption of active work and bounded global concurrency;
 - real OMP resume through its native RPC protocol;
@@ -199,6 +200,54 @@ The default mounts are `./container/config:/config:ro`, `./container/data:/data`
 2. The bot creates a thread and starts the prompt when a concurrency slot is available.
 3. Continue sending messages in that thread without mentioning the bot. A newer message immediately requests interruption with OMP's native `abort_and_prompt`, then runs in the same live process and conversation.
 4. When the OMP project configuration requires approval for a write or executable action, an authorized user chooses **Approve once** or **Deny**. Requests expire after five minutes; interruption also expires the old request immediately.
+
+### Multiple bridge bots in one thread
+
+Mention another bridge bot inside an existing thread to have it join and establish
+its own OMP session there. A bare mention joins without starting a model turn.
+The thread must belong to an allowed parent channel in a configured guild, and
+Discord must grant the bot access. Joining does not bypass private-thread
+membership or archived-thread restrictions; see Discord's
+[Join Thread API](https://docs.discord.com/developers/resources/channel#join-thread).
+Joining does not import the thread's previous conversation into OMP.
+
+There is no peer-bot ID configuration. Real bot accounts can initiate work only
+when their message directly addresses this bridge with an explicit `<@BOT_ID>`
+mention. Self-messages, webhooks, implicit reply pings, and unmentioned bot chatter
+are ignored. Peer prompts identify the sending bot and how to address it.
+Humans can also address one bot explicitly; other joined bridges ignore messages
+directed solely at that other bot. Unaddressed authorized human messages are
+handled by each joined bridge.
+Assistant replies can mention other bot accounts, verified through Discord;
+human, role, and everyone notifications remain suppressed. Activity messages,
+acknowledgements, errors, and approval notices never activate another bot.
+
+Each bridge accepts at most **eight bot turns per thread** between new authorized
+human messages handled by that bridge. The counter survives daemon restarts and
+is updated atomically with admission. Duplicate deliveries and replayed older
+human messages do not replenish the budget. At the limit, an authorized human
+must speak again before
+bot exchanges can resume. Bot messages cannot invoke `status`, `stop`, or `new`,
+or approve tool calls, even if a bot ID appears in the human-user allowlist.
+
+Any bot with access to an allowed channel can request OMP work by mentioning this
+bridge. Those requests use the same workspace access and tool approval policy as
+other prompts: this is **not** a sandbox or a guarantee of human approval for every
+action. Restrict channel access accordingly.
+
+Run each bridge with its own Discord bot token, SQLite database, and OMP session
+directory. Both bridges need this version; never point two instances at the same
+database. Their OMP conversations remain separate and communicate through the
+explicitly addressed Discord messages.
+
+Verification includes paired bridge HTTP fixtures for exchange, deduplication,
+the cutoff, and targeted human reset; a live Discord check exercised thread lookup,
+join/adoption with a temporary database, and verified-bot mention delivery.
+Discord's actual response excluded suppressed mentions and included enabled bot
+mentions. A live conversation across two distinct bot accounts still needs checking
+after deploying both instances; only one account was available for these checks.
+
+### Turn delivery and interruption
 
 Interruption is cooperative: a running tool may need time to stop, and completed
 file changes or external actions are not rolled back. Rapid messages are retained

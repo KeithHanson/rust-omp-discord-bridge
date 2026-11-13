@@ -23,17 +23,30 @@ use crate::{
 const MAX_PENDING_MESSAGES: usize = 64;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct QueuedMessage {
+    text: String,
+    assistant: bool,
+}
+
 struct MessageDelivery {
-    sender: mpsc::Sender<String>,
+    sender: mpsc::Sender<QueuedMessage>,
 }
 
 impl MessageDelivery {
-    fn new() -> (Self, mpsc::Receiver<String>) {
+    fn new() -> (Self, mpsc::Receiver<QueuedMessage>) {
         let (sender, receiver) = mpsc::channel(MAX_PENDING_MESSAGES);
         (Self { sender }, receiver)
     }
 
     fn message(&self, text: impl Into<String>) -> Result<(), OmpTurnError> {
+        self.enqueue(text, true)
+    }
+
+    fn notice(&self, text: impl Into<String>) -> Result<(), OmpTurnError> {
+        self.enqueue(text, false)
+    }
+
+    fn enqueue(&self, text: impl Into<String>, assistant: bool) -> Result<(), OmpTurnError> {
         let permit = self.sender.try_reserve().map_err(|error| {
             let reason = match error {
                 mpsc::error::TrySendError::Full(_) => "queue is full",
@@ -43,7 +56,10 @@ impl MessageDelivery {
                 "Discord delivery {reason}; completed message was not queued"
             ))
         })?;
-        permit.send(text.into());
+        permit.send(QueuedMessage {
+            text: text.into(),
+            assistant,
+        });
         Ok(())
     }
 }
@@ -51,16 +67,22 @@ impl MessageDelivery {
 async fn deliver_messages(
     messenger: &dyn ThreadMessenger,
     thread_id: ThreadId,
-    mut receiver: mpsc::Receiver<String>,
+    mut receiver: mpsc::Receiver<QueuedMessage>,
     message_limit: usize,
     send_timeout: Duration,
 ) {
-    while let Some(text) = receiver.recv().await {
-        for chunk in chunk_message(&text, message_limit) {
-            let result = timeout(send_timeout, messenger.send(thread_id, &chunk))
-                .await
-                .context("Discord message send timed out")
-                .and_then(|result| result);
+    while let Some(message) = receiver.recv().await {
+        for chunk in chunk_message(&message.text, message_limit) {
+            let result = timeout(send_timeout, async {
+                if message.assistant {
+                    messenger.send_assistant(thread_id, &chunk).await
+                } else {
+                    messenger.send(thread_id, &chunk).await
+                }
+            })
+            .await
+            .context("Discord message send timed out")
+            .and_then(|result| result);
             if let Err(error) = result {
                 // Discord may have accepted this chunk. Never retry it or send
                 // the rest of this message, but keep later independent messages.
@@ -78,6 +100,7 @@ async fn deliver_messages(
 #[async_trait]
 pub trait ThreadMessenger: Send + Sync {
     async fn send(&self, thread_id: ThreadId, content: &str) -> Result<()>;
+    async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()>;
     async fn create_activity(&self, thread_id: ThreadId, content: &str) -> Result<MessageId>;
     async fn edit_activity(
         &self,
@@ -331,7 +354,10 @@ impl ThreadQueueRunner {
                         // preserves unresolved failure notices even after overflow.
                         delivery
                             .sender
-                            .send(notice)
+                            .send(QueuedMessage {
+                                text: notice,
+                                assistant: false,
+                            })
                             .await
                             .context("delivery worker stopped")?;
                     }
@@ -395,7 +421,7 @@ impl TurnControl for RunnerControl<'_> {
             self.activity.update("Previous turn stopped; continuing");
         }
         if let Some(notice) = outcome_notice(turn_id, status, error)? {
-            self.delivery.message(notice)?;
+            self.delivery.notice(notice)?;
             self.notified.lock().await.insert(turn_id);
         }
         Ok(())
@@ -490,7 +516,7 @@ mod tests {
     use crate::{
         domain::{ChannelId, GuildId, NewSession, UserId},
         omp::OmpTurnResult,
-        store::EnqueueResult,
+        store::{EnqueueResult, TurnSource},
     };
 
     const THREAD: ThreadId = ThreadId::new(10);
@@ -616,6 +642,10 @@ mod tests {
 
     #[async_trait]
     impl ThreadMessenger for FakeMessenger {
+        async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()> {
+            self.send(thread_id, content).await
+        }
+
         async fn send(&self, _thread_id: ThreadId, content: &str) -> Result<()> {
             self.attempts.lock().await.push(content.to_owned());
             if let Some((started, gate)) = &self.send_gate {
@@ -691,6 +721,7 @@ mod tests {
                 MessageId::new(message_id),
                 UserId::new(4),
                 "instruction",
+                TurnSource::Human,
             )
             .await
             .unwrap()
@@ -992,7 +1023,7 @@ mod tests {
         assert!(error.is_uncertain());
         assert!(error.to_string().contains("queue is full"));
         for index in 0..MAX_PENDING_MESSAGES {
-            assert_eq!(receiver.try_recv().unwrap(), index.to_string());
+            assert_eq!(receiver.try_recv().unwrap().text, index.to_string());
         }
         assert!(receiver.try_recv().is_err());
         drop(receiver);
@@ -1073,7 +1104,13 @@ mod tests {
         assert!(sent.iter().all(|text| !text.contains("partial output")));
         assert_eq!(
             store
-                .enqueue_turn(THREAD, MessageId::new(22), UserId::new(4), "duplicate")
+                .enqueue_turn(
+                    THREAD,
+                    MessageId::new(22),
+                    UserId::new(4),
+                    "duplicate",
+                    TurnSource::Human
+                )
                 .await
                 .unwrap(),
             EnqueueResult::Duplicate
@@ -1169,7 +1206,13 @@ mod tests {
         );
         assert!(
             store
-                .enqueue_turn(THREAD, MessageId::new(21), UserId::new(4), "new")
+                .enqueue_turn(
+                    THREAD,
+                    MessageId::new(21),
+                    UserId::new(4),
+                    "new",
+                    TurnSource::Human
+                )
                 .await
                 .is_err()
         );

@@ -126,6 +126,10 @@ mod tests {
 
     #[async_trait]
     impl ThreadMessenger for Messenger {
+        async fn send_assistant(&self, _: ThreadId, _: &str) -> Result<()> {
+            unreachable!("activity must edit, not send assistant messages")
+        }
+
         async fn send(&self, _: ThreadId, _: &str) -> Result<()> {
             unreachable!("activity must edit, not send additional messages")
         }
