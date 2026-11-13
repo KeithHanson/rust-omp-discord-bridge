@@ -295,6 +295,17 @@ can indicate that this toggle is disabled or that the bot lacks thread access.
 The tool reports the underlying Discord error; it never substitutes message
 authors for actual thread membership.
 
+OMP can call `discord_thread_title` with `title` and `status` (`thinking`,
+`working`, or `completed`) to rename its current managed thread. The bridge puts
+exactly one status prefix first: `🧠 Session title`, `🛠️ Session title`, or
+`✅ Session title`. Existing status prefixes are replaced, not stacked; long
+titles are bounded to Discord's limit. New threads start with `🧠`.
+The agent selects meaningful titles and updates status explicitly through the tool;
+these are not automatic lifecycle indicators or a guarantee of task success.
+Use `completed` only after finishing the task, and reuse the title for status-only
+updates. Discord permissions and rename rate limits apply; failures are returned
+to the agent. The bot must own the thread or have Manage Threads permission.
+
 Thread controls must be the complete message:
 
 - `status` — show session, working directory, queue, uncertain-turn state, and OpenAI/Codex provider quota usage with reset times;

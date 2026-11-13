@@ -112,6 +112,7 @@ pub trait ThreadMessenger: Send + Sync {
     async fn notify(&self, thread_id: ThreadId, message: &str);
     async fn channel_history(&self, thread_id: ThreadId, days: u16) -> Result<String>;
     async fn thread_participants(&self, thread_id: ThreadId) -> Result<String>;
+    async fn thread_title(&self, thread_id: ThreadId, title: &str, status: &str) -> Result<String>;
 }
 
 pub struct ThreadQueueRunner {
@@ -477,6 +478,13 @@ impl OmpUi for RunnerUi<'_> {
             .await
             .map_err(|error| format!("{error:#}"))
     }
+
+    async fn thread_title(&self, title: &str, status: &str) -> Result<String, String> {
+        self.messenger
+            .thread_title(self.thread_id, title, status)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
 }
 
 fn outcome_notice(
@@ -704,6 +712,15 @@ mod tests {
 
         async fn thread_participants(&self, _thread_id: ThreadId) -> Result<String> {
             Ok("[]".to_owned())
+        }
+
+        async fn thread_title(
+            &self,
+            _thread_id: ThreadId,
+            _title: &str,
+            _status: &str,
+        ) -> Result<String> {
+            unreachable!("thread titles must only change through an explicit model tool call")
         }
     }
 

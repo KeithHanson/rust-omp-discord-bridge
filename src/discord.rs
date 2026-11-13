@@ -19,7 +19,7 @@ use serenity::{
         Attachment, AutoArchiveDuration, ButtonStyle, Channel, ChannelId as SerenityChannelId,
         ChannelType, Client, Context, CreateAllowedMentions, CreateButton,
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
-        EditMessage, Embed, EventHandler, GatewayIntents, GetMessages, GuildChannel, Http,
+        EditMessage, EditThread, Embed, EventHandler, GatewayIntents, GetMessages, GuildChannel, Http,
         Interaction, Member, Message, Ready, ThreadMember, Timestamp, User,
     },
     builder::Builder,
@@ -333,6 +333,26 @@ impl ThreadMessenger for DiscordMessenger {
                 self.config.runtime.discord_history_timeout_seconds
             )
         })?
+    }
+
+    async fn thread_title(&self, thread_id: ThreadId, title: &str, status: &str) -> Result<String> {
+        let name = session_thread_title(title, status)?;
+        let session = self.store.session(thread_id).await?
+            .context("title requested for an unknown Discord thread")?;
+        let policy = self.config.guild_policy(session.guild_id)
+            .context("title requested for an unconfigured guild")?;
+        if !policy.allowed_channels.contains(&session.parent_channel_id) {
+            bail!("session parent channel is not authorized for title changes");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            SerenityChannelId::new(thread_id.get())
+                .edit_thread(&self.http, EditThread::new().name(&name))
+                .await
+        })
+        .await
+        .context("Discord thread title update timed out; outcome unknown")?
+        .context("failed to update Discord thread title")?;
+        Ok(name)
     }
 }
 
@@ -934,7 +954,7 @@ impl DiscordHandler {
         if prompt.is_empty() {
             return Ok(());
         }
-        let builder = CreateThread::new(thread_name(&prompt))
+        let builder = CreateThread::new(format!("🧠 {}", thread_name(&prompt)))
             .auto_archive_duration(AutoArchiveDuration::from(
                 self.config.discord.thread_auto_archive_minutes,
             ))
@@ -1319,6 +1339,28 @@ async fn send_without_mentions(http: &Http, thread_id: ThreadId, content: &str) 
     Ok(())
 }
 
+fn session_thread_title(title: &str, status: &str) -> Result<String> {
+    let emoji = match status {
+        "completed" => "✅",
+        "working" => "🛠️",
+        "thinking" => "🧠",
+        _ => bail!("status must be completed, working, or thinking"),
+    };
+    let mut title = title.trim();
+    // Accept a previously returned title without accumulating status prefixes.
+    while let Some(rest) = title.strip_prefix("✅")
+        .or_else(|| title.strip_prefix("🛠️"))
+        .or_else(|| title.strip_prefix("🛠"))
+        .or_else(|| title.strip_prefix("🧠"))
+    {
+        title = rest.trim_start();
+    }
+    if title.is_empty() {
+        bail!("thread title must not be empty");
+    }
+    Ok(format!("{emoji} {}", thread_name(title)))
+}
+
 fn render_approval(request: &ApprovalRequest) -> String {
     let mut literal = String::with_capacity(request.title.len() + request.details.len() + 1);
     literal.push_str(&request.title);
@@ -1344,6 +1386,38 @@ fn parse_approval_custom_id(custom_id: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_status_is_first_and_replaces_previous_prefixes() {
+        for (status, emoji) in [("completed", "✅"), ("working", "🛠️"), ("thinking", "🧠")] {
+            assert_eq!(session_thread_title(" 🧠 🛠️ ✅ Repair bridge ", status).unwrap(),
+                format!("{emoji} Repair bridge"));
+            let name = session_thread_title(&"🦀".repeat(100), status).unwrap();
+            assert!(name.starts_with(emoji));
+            assert!(name.encode_utf16().count() <= 100);
+        }
+        assert!(session_thread_title("🧠 ", "working").is_err());
+        assert!(session_thread_title("Repair bridge", "failed").is_err());
+    }
+
+    #[tokio::test]
+    async fn thread_title_updates_only_authorized_current_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![(
+            "PATCH", "/channels/3", 200,
+            serde_json::to_value(routing_channel()).unwrap(),
+        )]);
+        let mut messenger = participants_messenger(root.path(), http).await;
+        assert!(messenger.thread_title(ThreadId::new(4), "Repair bridge", "working")
+            .await.unwrap_err().to_string().contains("unknown Discord thread"));
+        let name = messenger.thread_title(ThreadId::new(3), "🧠 Repair bridge", "working")
+            .await.unwrap();
+        assert_eq!(name, "🛠️ Repair bridge");
+        assert_eq!(requests.join().unwrap(), vec![serde_json::json!({"name": name})]);
+        Arc::get_mut(&mut messenger.config).unwrap().discord.guilds[0].allowed_channels.clear();
+        assert!(messenger.thread_title(ThreadId::new(3), "Repair bridge", "completed")
+            .await.unwrap_err().to_string().contains("not authorized"));
+    }
 
     fn routing_policy() -> GuildPolicy {
         GuildPolicy {

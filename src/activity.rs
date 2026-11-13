@@ -168,6 +168,10 @@ mod tests {
         async fn thread_participants(&self, _: ThreadId) -> Result<String> {
             unreachable!()
         }
+
+        async fn thread_title(&self, _: ThreadId, _: &str, _: &str) -> Result<String> {
+            unreachable!("activity must not change thread titles")
+        }
     }
 
     #[tokio::test(start_paused = true)]
