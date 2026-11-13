@@ -48,6 +48,7 @@ Install and authenticate OMP **18.20.0 or newer**, then verify `omp --version` s
 Create a Discord application and bot with:
 
 - Message Content Intent enabled;
+- Server Members Intent enabled in Developer Portal → Bot → Privileged Gateway Intents for `discord_thread_participants` (the REST endpoint requires application-level approval even though the bridge does not subscribe to member gateway events);
 - OAuth scopes `bot` and `applications.commands`;
 - permissions to view channels, read message history, send messages, create public threads, send messages in threads, and use external emoji only if desired.
 
@@ -288,6 +289,11 @@ on API or resource-limit errors rather than silently returning a partial roster.
 Participant lookup shares `discord_history_timeout_seconds` and
 `discord_history_max_bytes`; `discord_history_max_messages` also caps the member
 count.
+Discord's [List Thread Members endpoint](https://docs.discord.com/developers/resources/channel#list-thread-members)
+requires the application's Server Members privileged intent. A `403 Missing Access`
+can indicate that this toggle is disabled or that the bot lacks thread access.
+The tool reports the underlying Discord error; it never substitutes message
+authors for actual thread membership.
 
 Thread controls must be the complete message:
 

@@ -475,7 +475,7 @@ impl OmpUi for RunnerUi<'_> {
         self.messenger
             .thread_participants(self.thread_id)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| format!("{error:#}"))
     }
 }
 

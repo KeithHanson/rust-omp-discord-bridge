@@ -504,7 +504,11 @@ impl DiscordMessenger {
                 )
                 .await
                 .with_context(|| {
-                    format!("failed to read Discord participants for thread {thread_id}")
+                    format!(
+                        "failed to read Discord participants for thread {thread_id}; \
+                         this endpoint requires Server Members Intent enabled in the \
+                         Discord Developer Portal and access to the thread"
+                    )
                 })?;
             let page_len = page.len();
             for entry in page {
