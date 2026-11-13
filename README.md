@@ -38,6 +38,39 @@ Create a Discord application and bot with:
 
 ## Configuration
 
+### Local `.env` setup (Linux/Unix)
+
+For a single server, channel, and user, use the local launcher:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+# Edit .env: token, server/channel/user IDs, and OMP working directory.
+cargo build --release --bins
+./target/release/bridge-local check
+./target/release/bridge-local run
+```
+
+If `.env` already exists, edit it rather than copying over it. Enable Discord
+Developer Mode under User Settings → Advanced, then right-click the server,
+parent text channel, and your profile to copy their respective IDs. Obtain the
+bot token from the application's Bot page in the Discord Developer Portal.
+
+The launcher parses `.env` without executing shell commands or exporting its
+token to OMP. It rejects group/world-readable environment files and writes
+generated configuration and a mode-600 token file beneath
+`~/.config/omp-discord-bridge/local-env/`. Edit `.env`, not these generated files.
+Use `--env-file /absolute/path/to/.env` when launching from another directory.
+Blank required fields fail before starting the bridge. `OMP_MODEL` may remain
+blank to retain OMP's configured default.
+
+`check` performs a real OMP startup probe but does not authenticate to Discord.
+Use `run` and mention the bot in the allowed channel to verify Discord access.
+The working-directory allowlist is not a sandbox; OMP retains your user's access
+and the project's approval policy. The launcher stays in the foreground.
+
+### Direct TOML setup
+
 ```bash
 mkdir -p ~/.config/omp-discord-bridge
 cp config.example.toml ~/.config/omp-discord-bridge/config.toml
@@ -80,6 +113,27 @@ RUST_LOG=info cargo run --release -- \
 ```
 
 `run` is the default subcommand and may be omitted. Use a service manager for unattended operation.
+
+### Boot service on this workstation
+
+`omp-discord-bridge.service` is configured for user `hephaestus` and this checkout.
+Its installed copy is `/etc/systemd/system/omp-discord-bridge.service`, enabled
+for boot without requiring a login. It runs as the regular user, reads
+`~/.config/omp-discord-bridge/config.toml`, and restarts after failures.
+It uses the release binary in this checkout; keep that path in place.
+The service does not read the repository's `.env` launcher configuration.
+
+```bash
+systemctl status omp-discord-bridge
+journalctl -u omp-discord-bridge -f
+sudo systemctl restart omp-discord-bridge
+sudo systemctl disable --now omp-discord-bridge
+```
+
+After editing TOML or rebuilding the binary, restart the service. After editing
+the unit, reinstall it with `sudo install -m 644 omp-discord-bridge.service
+/etc/systemd/system/omp-discord-bridge.service`, run `sudo systemctl daemon-reload`,
+then restart. Do not launch a second bridge manually against the same database.
 
 ## Docker
 

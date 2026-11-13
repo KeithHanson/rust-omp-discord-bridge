@@ -1,0 +1,22 @@
+[Unit]
+Description=OMP Discord Bridge
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hephaestus
+Group=hephaestus
+WorkingDirectory=/home/hephaestus
+Environment=HOME=/home/hephaestus
+Environment=PATH=/home/hephaestus/.local/share/mise/installs/oh-my-pi/latest:/home/hephaestus/.local/share/mise/shims:/home/hephaestus/.cargo/bin:/home/hephaestus/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
+Environment=RUST_LOG=info
+ExecStart=/home/hephaestus/src/personal/rust-omp-discord-bridge/target/release/omp-discord-bridge --config /home/hephaestus/.config/omp-discord-bridge/config.toml run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
