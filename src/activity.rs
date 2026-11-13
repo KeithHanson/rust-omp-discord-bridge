@@ -186,10 +186,6 @@ mod tests {
             unreachable!()
         }
 
-        async fn thread_title(&self, _: ThreadId, _: &str, _: &str) -> Result<String> {
-            unreachable!("activity must not replace the underlying thread title")
-        }
-
         async fn thread_status(&self, _: ThreadId, _: &str) -> Result<()> {
             unreachable!("activity must not change thread status")
         }

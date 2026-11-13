@@ -359,22 +359,6 @@ impl ThreadMessenger for DiscordMessenger {
         })?
     }
 
-    async fn thread_title(&self, thread_id: ThreadId, title: &str, status: &str) -> Result<String> {
-        let name = session_thread_title(title, status)?;
-        self.authorize_thread_title(thread_id).await?;
-        let lock = self.title_lock(thread_id);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let _guard = lock.lock().await;
-            SerenityChannelId::new(thread_id.get())
-                .edit_thread(&self.http, EditThread::new().name(&name))
-                .await
-        })
-        .await
-        .context("Discord thread title update timed out; outcome unknown")?
-        .context("failed to update Discord thread title")?;
-        Ok(name)
-    }
-
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()> {
         let emoji = thread_status_emoji(status)?;
         let session = self.authorize_thread_title(thread_id).await?;
@@ -1020,7 +1004,7 @@ impl DiscordHandler {
         if prompt.is_empty() {
             return Ok(());
         }
-        let builder = CreateThread::new(format!("🧠 {}", thread_name(&prompt)))
+        let builder = CreateThread::new(format!("🛠️ {}", thread_name(&prompt)))
             .auto_archive_duration(AutoArchiveDuration::from(
                 self.config.discord.thread_auto_archive_minutes,
             ))
@@ -1433,8 +1417,7 @@ fn thread_status_emoji(status: &str) -> Result<&'static str> {
     match status {
         "completed" => Ok("✅"),
         "working" => Ok("🛠️"),
-        "thinking" => Ok("🧠"),
-        _ => bail!("status must be completed, working, or thinking"),
+        _ => bail!("status must be completed or working"),
     }
 }
 
@@ -1458,23 +1441,6 @@ fn thread_status_name(title: &str, emoji: &str) -> String {
         remaining -= ch.len_utf16();
     }
     name
-}
-
-fn session_thread_title(title: &str, status: &str) -> Result<String> {
-    let emoji = thread_status_emoji(status)?;
-    let mut title = strip_activity_phase(title.trim());
-    // Accept a previously returned title without accumulating status prefixes.
-    while let Some(rest) = title.strip_prefix("✅")
-        .or_else(|| title.strip_prefix("🛠️"))
-        .or_else(|| title.strip_prefix("🛠"))
-        .or_else(|| title.strip_prefix("🧠"))
-    {
-        title = rest.trim_start();
-    }
-    if title.is_empty() {
-        bail!("thread title must not be empty");
-    }
-    Ok(format!("{emoji} {}", thread_name(title)))
 }
 
 fn render_approval(request: &ApprovalRequest) -> String {
@@ -1600,7 +1566,6 @@ mod tests {
         let legacy = format!("[OMP: Working] 🛠️ {topic}");
         let working = format!("🛠️ {topic}");
         let completed = format!("✅ {topic}");
-        let tool_name = "🛠️ Renamed by title tool";
         let response = |name: &str| {
             let mut channel = routing_channel();
             channel.name = name.to_owned();
@@ -1610,25 +1575,24 @@ mod tests {
             ("GET", "/channels/3", 200, response(&legacy)),
             ("PATCH", "/channels/3", 200, response(&working)),
             ("GET", "/channels/3", 200, response(&working)),
+            ("GET", "/channels/3", 200, response(&working)),
             ("PATCH", "/channels/3", 200, response(&completed)),
             ("GET", "/channels/3", 200, response(&completed)),
-            ("PATCH", "/channels/3", 200, response(tool_name)),
-            ("GET", "/channels/3", 200, response(tool_name)),
-            ("PATCH", "/channels/3", 200, response("✅ Renamed by title tool")),
         ]);
         let messenger = participants_messenger(root.path(), http).await;
         messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
+        messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
         messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
-        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
-        assert_eq!(messenger.thread_title(
-            ThreadId::new(3), "[OMP: Thinking] Renamed by title tool", "working",
-        ).await.unwrap(), tool_name);
         messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
         let bodies = requests.join().unwrap();
-        assert_eq!(bodies[1]["name"], working);
-        assert_eq!(bodies[3]["name"], completed);
-        assert_eq!(bodies[5]["name"], tool_name);
-        assert_eq!(bodies[7]["name"], "✅ Renamed by title tool");
+        assert_eq!(bodies, vec![
+            serde_json::Value::Null,
+            serde_json::json!({"name": working}),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::json!({"name": completed}),
+            serde_json::Value::Null,
+        ]);
     }
 
     #[tokio::test]
@@ -1672,9 +1636,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_activity_prefix_is_removed_from_explicit_title_input() {
+    fn legacy_activity_prefix_is_removed_from_lifecycle_title() {
         assert_eq!(
-            session_thread_title("[OMP: Thinking] 🛠️ Meaningful title", "completed").unwrap(),
+            thread_status_name("[OMP: Thinking] 🧠 Meaningful title", "✅"),
             "✅ Meaningful title",
         );
     }
@@ -1777,48 +1741,11 @@ mod tests {
     }
 
     #[test]
-    fn title_status_is_first_and_replaces_previous_prefixes() {
-        for (status, emoji) in [("completed", "✅"), ("working", "🛠️"), ("thinking", "🧠")] {
-            assert_eq!(session_thread_title(" 🧠 🛠️ ✅ Repair bridge ", status).unwrap(),
-                format!("{emoji} Repair bridge"));
-            let name = session_thread_title(&"🦀".repeat(100), status).unwrap();
-            assert!(name.starts_with(emoji));
-            assert!(name.encode_utf16().count() <= 100);
-        }
-        assert!(session_thread_title("🧠 ", "working").is_err());
-        assert!(session_thread_title("Repair bridge", "failed").is_err());
-    }
-
-    #[tokio::test]
-    async fn explicit_title_deadline_includes_pending_lifecycle_rename() {
-        let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api(vec![]);
-        let messenger = participants_messenger(root.path(), http).await;
-        let lock = messenger.title_lock(ThreadId::new(3));
-        let _pending_lifecycle = lock.lock().await;
-        tokio::time::pause();
-        let result = messenger.thread_title(ThreadId::new(3), "Repair bridge", "working").await;
-        assert!(result.unwrap_err().to_string().contains("timed out"));
-        assert!(requests.join().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn thread_title_updates_only_authorized_current_thread() {
-        let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api(vec![(
-            "PATCH", "/channels/3", 200,
-            serde_json::to_value(routing_channel()).unwrap(),
-        )]);
-        let mut messenger = participants_messenger(root.path(), http).await;
-        assert!(messenger.thread_title(ThreadId::new(4), "Repair bridge", "working")
-            .await.unwrap_err().to_string().contains("unknown Discord thread"));
-        let name = messenger.thread_title(ThreadId::new(3), "🧠 Repair bridge", "working")
-            .await.unwrap();
-        assert_eq!(name, "🛠️ Repair bridge");
-        assert_eq!(requests.join().unwrap(), vec![serde_json::json!({"name": name})]);
-        Arc::get_mut(&mut messenger.config).unwrap().discord.guilds[0].allowed_channels.clear();
-        assert!(messenger.thread_title(ThreadId::new(3), "Repair bridge", "completed")
-            .await.unwrap_err().to_string().contains("not authorized"));
+    fn title_status_only_accepts_lifecycle_boundaries() {
+        assert_eq!(thread_status_emoji("working").unwrap(), "🛠️");
+        assert_eq!(thread_status_emoji("completed").unwrap(), "✅");
+        assert!(thread_status_emoji("thinking").is_err());
+        assert!(thread_status_emoji("failed").is_err());
     }
 
     fn routing_policy() -> GuildPolicy {

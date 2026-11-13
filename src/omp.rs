@@ -31,7 +31,6 @@ const MAX_RPC_LINE_BYTES: usize = 1_048_576;
 const ABORT_GRACE: Duration = Duration::from_secs(15);
 const DISCORD_HISTORY_TOOL: &str = "discord_channel_history";
 const DISCORD_PARTICIPANTS_TOOL: &str = "discord_thread_participants";
-const DISCORD_THREAD_TITLE_TOOL: &str = "discord_thread_title";
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 // Preserve Discord's five-minute approval window plus bounded HTTP overhead.
@@ -74,7 +73,6 @@ pub trait OmpUi: Send + Sync {
     async fn notify(&self, message: &str);
     async fn channel_history(&self, days: u16) -> Result<String, String>;
     async fn thread_participants(&self) -> Result<String, String>;
-    async fn thread_title(&self, title: &str, status: &str) -> Result<String, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +129,6 @@ fn activity_status(frame: &Value) -> Option<&'static str> {
             Some("wait") => "Waiting for background work",
             Some("discord_channel_history") => "Reading channel history",
             Some("discord_thread_participants") => "Reading thread membership",
-            Some("discord_thread_title") => "Updating thread title",
             _ => "Running a tool",
         }),
         "tool_execution_end" => Some("Tool finished; working"),
@@ -1238,20 +1235,6 @@ where
                     "properties": {},
                     "additionalProperties": false
                 }
-            }, {
-                "name": DISCORD_THREAD_TITLE_TOOL,
-                "label": "Discord Thread Title",
-                "description": "Rename this session's current Discord thread with a concise, meaningful session title. The bridge manages the single leading status emoji; supply the title without a status emoji. Use thinking while planning, working while executing, and completed only when the task is finished. When only changing status, preserve the title by supplying the same title. The bridge also sets working when a run starts and completed when no active or queued turns remain; the automatic checkmark denotes an idle queue, not guaranteed task success.",
-                "loadMode": "essential",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string", "minLength": 1},
-                        "status": {"type": "string", "enum": ["completed", "working", "thinking"]}
-                    },
-                    "required": ["title", "status"],
-                    "additionalProperties": false
-                }
             }]
         }),
     )
@@ -1274,11 +1257,7 @@ where
                 .pointer("/data/toolNames")
                 .and_then(Value::as_array)
                 .is_some_and(|names| {
-                    [
-                        DISCORD_HISTORY_TOOL,
-                        DISCORD_PARTICIPANTS_TOOL,
-                        DISCORD_THREAD_TITLE_TOOL,
-                    ]
+                    [DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL]
                         .iter()
                         .all(|required| names.iter().any(|name| name.as_str() == Some(*required)))
                 });
@@ -1364,10 +1343,6 @@ async fn service_response(frame: &Value, ui: &dyn OmpUi, max_history_days: u16) 
             }
             _ => Err("`discord_thread_participants` accepts no arguments".to_owned()),
         },
-        Some(DISCORD_THREAD_TITLE_TOOL) => match thread_title_arguments(frame) {
-            Ok((title, status)) => ui.thread_title(title, status).await,
-            Err(error) => Err(error),
-        },
         _ => Err("OMP requested an unknown bridge-owned tool".to_owned()),
     };
     history_response(id, result)
@@ -1398,25 +1373,6 @@ fn history_days(frame: &Value, max_history_days: u16) -> Result<u16, String> {
         return Err(format!("`days` must be between 1 and {max_history_days}"));
     }
     u16::try_from(days).map_err(|_| format!("`days` must be between 1 and {max_history_days}"))
-}
-
-fn thread_title_arguments(frame: &Value) -> Result<(&str, &str), String> {
-    let arguments = frame
-        .get("arguments")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "`discord_thread_title` requires title and status arguments".to_owned())?;
-    if arguments.len() != 2 || !arguments.contains_key("title") || !arguments.contains_key("status") {
-        return Err("`discord_thread_title` accepts only title and status arguments".to_owned());
-    }
-    let title = arguments["title"]
-        .as_str()
-        .filter(|title| !title.trim().is_empty() && !title.chars().any(char::is_control))
-        .ok_or_else(|| "`title` must be a nonblank string without control characters".to_owned())?;
-    let status = arguments["status"]
-        .as_str()
-        .filter(|status| matches!(*status, "completed" | "working" | "thinking"))
-        .ok_or_else(|| "`status` must be completed, working, or thinking".to_owned())?;
-    Ok((title, status))
 }
 
 async fn service_ui_request(frame: &Value, ui: &dyn OmpUi) -> Value {
@@ -1679,10 +1635,6 @@ mod tests {
         }
 
         async fn thread_participants(&self) -> Result<String, String> {
-            self.channel_history(1).await
-        }
-
-        async fn thread_title(&self, _title: &str, _status: &str) -> Result<String, String> {
             self.channel_history(1).await
         }
     }
@@ -2796,14 +2748,6 @@ mod tests {
                 Ok("thread members: <@42> (untrusted label: Peer)".to_owned())
             }
         }
-
-        async fn thread_title(&self, title: &str, status: &str) -> Result<String, String> {
-            if self.0 {
-                Err("Discord title update unavailable".to_owned())
-            } else {
-                Ok(format!("{status}: {title}"))
-            }
-        }
     }
 
     #[test]
@@ -2919,105 +2863,32 @@ mod tests {
         }
     }
 
-    async fn title_rpc(arguments: Value, fail: bool) -> Value {
+    #[tokio::test]
+    async fn removed_title_host_tool_is_rejected() {
         let (writer, reader) = tokio::io::duplex(1_024);
         let mut input = BufWriter::new(writer);
         service_frame(
             &json!({
                 "type": "host_tool_call",
-                "id": "title-1",
-                "toolName": DISCORD_THREAD_TITLE_TOOL,
-                "arguments": arguments
+                "id": "removed-title",
+                "toolName": "discord_thread_title",
+                "arguments": {"title": "Repair session recovery", "status": "working"}
             }),
             &mut input,
-            &HistoryUi(fail),
+            &HistoryUi(false),
             30,
         )
         .await
-        .expect("service title tool");
+        .expect("reject removed title tool");
         let mut responses = FramedRead::new(reader, LinesCodec::new());
-        serde_json::from_str(&responses.next().await.unwrap().unwrap()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn title_host_tool_dispatches_each_status_with_unchanged_title() {
-        for status in ["thinking", "working", "completed"] {
-            let response = title_rpc(
-                json!({"title": "Repair session recovery", "status": status}),
-                false,
-            )
-            .await;
-            assert_eq!(response["type"], "host_tool_result");
-            assert_eq!(response["id"], "title-1");
-            assert!(response.get("isError").is_none());
-            assert_eq!(
-                response["result"]["content"][0]["text"],
-                format!("{status}: Repair session recovery")
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn title_host_tool_serializes_discord_errors() {
-        let response = title_rpc(
-            json!({"title": "Repair session recovery", "status": "working"}),
-            true,
-        )
-        .await;
+        let response: Value =
+            serde_json::from_str(&responses.next().await.unwrap().unwrap()).unwrap();
         assert_eq!(response["type"], "host_tool_result");
-        assert_eq!(response["id"], "title-1");
+        assert_eq!(response["id"], "removed-title");
         assert_eq!(response["isError"], true);
         assert_eq!(
             response["result"]["content"][0]["text"],
-            "Discord title update unavailable"
-        );
-    }
-
-    #[tokio::test]
-    async fn title_host_tool_rejects_invalid_arguments_before_dispatch() {
-        for arguments in [
-            json!(null),
-            json!([]),
-            json!("bad"),
-            json!({}),
-            json!({"title": "Repair"}),
-            json!({"status": "working"}),
-            json!({"title": "Repair", "status": "working", "thread_id": "42"}),
-            json!({"title": null, "status": "working"}),
-            json!({"title": 42, "status": "working"}),
-            json!({"title": "", "status": "working"}),
-            json!({"title": " \t ", "status": "working"}),
-            json!({"title": "Repair\nsession", "status": "working"}),
-            json!({"title": "Repair\u{0000}", "status": "working"}),
-            json!({"title": "Repair", "status": null}),
-            json!({"title": "Repair", "status": 42}),
-            json!({"title": "Repair", "status": "done"}),
-            json!({"title": "Repair", "status": "Working"}),
-            json!({"title": "Repair", "status": "working "}),
-        ] {
-            let response = title_rpc(arguments, true).await;
-            assert_eq!(response["type"], "host_tool_result");
-            assert_eq!(response["id"], "title-1");
-            assert_eq!(response["isError"], true);
-            assert_ne!(
-                response["result"]["content"][0]["text"],
-                "Discord title update unavailable"
-            );
-        }
-        let response = service_response(
-            &json!({
-                "type": "host_tool_call",
-                "id": "title-missing",
-                "toolName": DISCORD_THREAD_TITLE_TOOL
-            }),
-            &HistoryUi(true),
-            30,
-        )
-        .await;
-        assert_eq!(response["isError"], true);
-        assert_eq!(
-            response["result"]["content"][0]["text"],
-            "`discord_thread_title` requires title and status arguments"
+            "OMP requested an unknown bridge-owned tool"
         );
     }
 
@@ -3027,9 +2898,6 @@ mod tests {
             json!([DISCORD_HISTORY_TOOL]),
             json!([DISCORD_PARTICIPANTS_TOOL]),
             json!([DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL]),
-            json!([DISCORD_HISTORY_TOOL, DISCORD_THREAD_TITLE_TOOL]),
-            json!([DISCORD_PARTICIPANTS_TOOL, DISCORD_THREAD_TITLE_TOOL]),
-            json!([DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL, DISCORD_THREAD_TITLE_TOOL]),
         ] {
             let (writer, reader) = tokio::io::duplex(8_192);
             let (response_writer, response_reader) = tokio::io::duplex(1_024);
@@ -3046,7 +2914,7 @@ mod tests {
             .unwrap();
             let mut frames = FramedRead::new(response_reader, LinesCodec::new());
             let result = register_host_tools(&mut input, &mut frames, &HistoryUi(false), 30).await;
-            assert_eq!(result.is_ok(), names.as_array().unwrap().len() == 3);
+            assert_eq!(result.is_ok(), names.as_array().unwrap().len() == 2);
             let mut commands = FramedRead::new(reader, LinesCodec::new());
             let command: Value =
                 serde_json::from_str(&commands.next().await.unwrap().unwrap()).unwrap();
@@ -3057,20 +2925,7 @@ mod tests {
                 command["tools"][1]["parameters"]["additionalProperties"],
                 false
             );
-            assert_eq!(command["tools"][2]["name"], DISCORD_THREAD_TITLE_TOOL);
-            assert_eq!(command["tools"][2]["loadMode"], "essential");
-            assert_eq!(
-                command["tools"][2]["parameters"]["required"],
-                json!(["title", "status"])
-            );
-            assert_eq!(
-                command["tools"][2]["parameters"]["properties"]["status"]["enum"],
-                json!(["completed", "working", "thinking"])
-            );
-            assert_eq!(
-                command["tools"][2]["parameters"]["additionalProperties"],
-                false
-            );
+            assert_eq!(command["tools"].as_array().unwrap().len(), 2);
         }
     }
 }

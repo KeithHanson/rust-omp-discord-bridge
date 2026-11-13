@@ -303,21 +303,17 @@ can indicate that this toggle is disabled or that the bot lacks thread access.
 The tool reports the underlying Discord error; it never substitutes message
 authors for actual thread membership.
 
-OMP can call `discord_thread_title` with `title` and `status` (`thinking`,
-`working`, or `completed`) to rename its current managed thread. The bridge puts
-exactly one status prefix first: `🧠 Session title`, `🛠️ Session title`, or
-`✅ Session title`. Existing status prefixes are replaced, not stacked; long
-titles are bounded to Discord's limit. New threads start with `🧠`.
-The agent selects meaningful titles and can update status explicitly through the
-tool. The bridge also restores `🛠️` when work starts and sets `✅` once there is
-no active run and no running or queued turn, after final message delivery. These
-automatic updates preserve the existing title. A stopped thread with queued work
-is not idle; failed or aborted turns with no remaining work are idle. Thus `✅`
-means the queue is idle, not that every task succeeded.
-Use `completed` only after finishing the task, and reuse the title for status-only
-updates. Discord permissions and rename rate limits apply. Tool failures are
-returned to the agent; automatic-update failures are logged without blocking
-turn processing. The bot must own the thread or have Manage Threads permission.
+Thread renames are lifecycle-only: `🛠️ Session title` when work starts and
+`✅ Session title` when the thread becomes idle after final delivery. New threads
+are created with `🛠️` directly, avoiding an extra thinking-to-working rename.
+The topic stays unchanged. There is no model-callable rename tool and no
+intermediate activity-phase rename.
+
+Completion requires no active run and no running or queued turn. A stopped thread
+with queued work is not idle; failed or aborted turns with no remaining work are
+idle. Thus `✅` means the queue is idle, not that every task succeeded.
+Discord permissions and rename rate limits apply. Update failures are logged
+without blocking turns. The bot must own the thread or have Manage Threads permission.
 
 Titles use only the status emoji and topic; detailed activity stays in the rolling
 card. The earlier `[OMP: <phase>]` prefix is removed on the next title update.
@@ -328,8 +324,7 @@ can lag while Discord limits renames; it is not an instantaneous activity signal
 Each automatic request may wait up to fifteen minutes; failed requests get at most
 five attempts with exponential backoff. Exhaustion is logged, and a later lifecycle
 change can publish a new desired state. Desired title state is process-local and
-is not replayed after restart. Explicit title-tool calls retain a ten-second limit,
-including waiting behind another rename.
+is not replayed after restart.
 
 Thread controls must be the complete message:
 

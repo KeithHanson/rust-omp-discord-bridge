@@ -70,9 +70,6 @@ impl OmpUi for Ui {
     async fn thread_participants(&self) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
-    async fn thread_title(&self, _: &str, _: &str) -> Result<String, String> {
-        Err("Discord is deliberately unavailable in this local smoke test".into())
-    }
 }
 
 fn turn(id: i64, content: &str) -> Turn {
