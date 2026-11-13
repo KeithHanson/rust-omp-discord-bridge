@@ -1,6 +1,14 @@
 # Rust build output
 target/
 
+# Python bytecode and local tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Local secrets
 .env
 .env.*
