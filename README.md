@@ -46,7 +46,7 @@ Activity message IDs are not persisted.
 
 The bot's custom presence summarizes all managed conversations:
 
-- `Ready` when no threads are engaged.
+- `Idle · abc1234` when no threads are engaged, using the running binary's commit.
 - `Working in 1 thread` or `Working in N threads` when work is underway.
 - `N awaiting approval` when all engaged threads are waiting for authorization.
 - `N working · M awaiting approval` when both states are present.
@@ -59,9 +59,17 @@ approval, when it shows idle.
 
 Presence updates are deduplicated and coalesced to at most one every five seconds,
 including reconnect refreshes. The latest aggregate state is sent after connection.
-Only counts are exposed: no thread names, prompts, tool arguments, or task details.
+Only counts and the idle build revision are exposed: no thread names, prompts,
+tool arguments, or task details.
 This is bot-wide profile/member-list activity, not a thread footer or an instant
 status guarantee. It does not rename threads or replace their activity cards.
+
+The seven-character revision is embedded at compile time, also shown by
+`omp-discord-bridge --version`; moving the checkout to another commit cannot change
+a running binary's identity. Native builds derive it from Git, marking modified
+build inputs with `-dirty`. Source archives/container builds must supply
+`BRIDGE_BUILD_REVISION` with the source commit hash (optionally `-dirty`).
+Builds fail rather than inventing a revision when no metadata is available.
 
 ## Prerequisites
 

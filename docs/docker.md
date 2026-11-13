@@ -50,11 +50,17 @@ Provider API-key environment variables may instead be added to the Compose servi
 Build the pinned Rust and OMP versions, then exercise configuration, SQLite, the protected token, and real OMP RPC startup:
 
 ```bash
-docker compose build bridge
+BRIDGE_BUILD_REVISION="$(git rev-parse HEAD)" docker compose build bridge
 docker compose run --rm bridge check
 docker compose up -d bridge
 docker compose logs -f bridge
 ```
+
+Build from a clean checkout. `.git` is excluded from the image context, so the
+build requires `BRIDGE_BUILD_REVISION`: the source commit hash, optionally suffixed
+with `-dirty` for modified sources. Source archives must supply their known commit.
+This value is embedded in the binary's idle presence and `--version`; it is not
+read from the mounted workspace at runtime.
 
 Stop cleanly with:
 
@@ -71,7 +77,7 @@ Back up `BRIDGE_DATA_DIR` together with the workspace. The data directory contai
 To change pinned build versions for a deliberate upgrade:
 
 ```bash
-RUST_VERSION=1.99.1 OMP_VERSION=18.20.0 docker compose build --pull bridge
+BRIDGE_BUILD_REVISION="$(git rev-parse HEAD)" RUST_VERSION=1.99.1 OMP_VERSION=18.20.0 docker compose build --pull bridge
 ```
 
 Run `docker compose run --rm bridge check` after every image, configuration, credential, or mount change before restarting the gateway.

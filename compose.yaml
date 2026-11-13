@@ -7,6 +7,7 @@ services:
       args:
         RUST_VERSION: "${RUST_VERSION:-1.99.1}"
         OMP_VERSION: "${OMP_VERSION:-18.20.0}"
+        BRIDGE_BUILD_REVISION: "${BRIDGE_BUILD_REVISION:-}"
     image: omp-discord-bridge:local
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:

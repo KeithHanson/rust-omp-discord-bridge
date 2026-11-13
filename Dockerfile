@@ -4,9 +4,10 @@ ARG RUST_VERSION=1.99.1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+ARG BRIDGE_BUILD_REVISION
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
-RUN cargo build --locked --release --bin omp-discord-bridge
+RUN BRIDGE_BUILD_REVISION="${BRIDGE_BUILD_REVISION}" cargo build --locked --release --bin omp-discord-bridge
 
 FROM debian:bookworm-slim AS omp-installer
 

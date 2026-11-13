@@ -6,7 +6,7 @@ use omp_discord_bridge::{config::AppConfig, discord, omp::OmpTransport, store::S
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version = env!("BRIDGE_BUILD_VERSION"), about)]
 struct Cli {
     #[arg(
         long,

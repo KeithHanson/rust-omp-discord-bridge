@@ -1968,7 +1968,7 @@ mod tests {
         messenger.wait_status("working").await;
         gate.add_permits(1);
         assert_eq!(received(&mut incoming).await, second);
-        assert!(!snapshots.has_changed().unwrap(), "continuing the drain must not publish Ready");
+        assert!(!snapshots.has_changed().unwrap(), "continuing the drain must not publish idle presence");
         assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
         transport.finish.add_permits(1);
         received(&mut edits).await;
