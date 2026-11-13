@@ -20,23 +20,30 @@ use serenity::{
         ChannelType, Client, Context, CreateAllowedMentions, CreateButton, CreateEmbed,
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
         EditMessage, EditThread, Embed, EventHandler, GatewayIntents, GetMessages, GuildChannel, Http,
-        Interaction, Member, Message, MessageFlags, Ready, ThreadMember, Timestamp, User,
+        Interaction, Member, Message, MessageFlags, OnlineStatus, Ready, ResumedEvent, ThreadMember,
+        Timestamp, User,
     },
     builder::Builder,
+    gateway::{ActivityData, ShardMessenger},
     http::{LightMethod, Request, Route},
 };
-use tokio::sync::oneshot;
+use tokio::{
+    sync::{oneshot, watch},
+    time::Instant,
+};
 
 use crate::{
     config::{AppConfig, GuildPolicy},
     domain::{ChannelId, GuildId, MessageId, NewSession, SessionStatus, ThreadId, UserId},
     omp::{ApprovalRequest, OmpTransport},
+    presence::PresenceSnapshot,
     render::{chunk_message, thread_name},
     runner::{ThreadMessenger, ThreadQueueRunner},
     store::{CreateSessionResult, EnqueueResult, Store, TurnSource},
 };
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn run(config: AppConfig, store: Store) -> Result<()> {
     let token = config.discord.load_token()?;
@@ -64,12 +71,15 @@ pub async fn run(config: AppConfig, store: Store) -> Result<()> {
         config.runtime.max_concurrency,
     );
     let bot_user_id = Arc::new(AtomicU64::new(0));
+    let presence = runner.subscribe_presence();
+    let (presence_target, presence_targets) = watch::channel(None);
     let handler = DiscordHandler {
         config: Arc::clone(&config),
         store: store.clone(),
         runner: Arc::clone(&runner),
         approvals,
         bot_user_id,
+        presence_target,
     };
     let intents =
         GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
@@ -84,11 +94,83 @@ pub async fn run(config: AppConfig, store: Store) -> Result<()> {
 
     let shard_manager = Arc::clone(&client.shard_manager);
     tokio::select! {
+        _ = gateway_presence(presence, presence_targets, send_gateway_presence) => {
+            bail!("Discord presence worker stopped unexpectedly")
+        }
         result = client.start() => result.context("Discord client stopped"),
         signal = shutdown_signal() => {
             signal?;
             shard_manager.shutdown_all().await;
             Ok(())
+        }
+    }
+}
+
+fn presence_text(snapshot: PresenceSnapshot) -> String {
+    match (snapshot.working, snapshot.awaiting_approval) {
+        (0, 0) => "Ready".to_owned(),
+        (1, 0) => "Working in 1 thread".to_owned(),
+        (working, 0) => format!("Working in {working} threads"),
+        (0, awaiting) => format!("{awaiting} awaiting approval"),
+        (working, awaiting) => format!("{working} working · {awaiting} awaiting approval"),
+    }
+}
+
+fn presence_status(snapshot: PresenceSnapshot) -> OnlineStatus {
+    if snapshot.working == 0 && snapshot.awaiting_approval > 0 {
+        OnlineStatus::Idle
+    } else {
+        OnlineStatus::Online
+    }
+}
+
+fn send_gateway_presence(shard: &ShardMessenger, snapshot: PresenceSnapshot) {
+    // Serenity queues this update; it does not acknowledge remote display.
+    shard.set_presence(
+        Some(ActivityData::custom(presence_text(snapshot))),
+        presence_status(snapshot),
+    );
+}
+
+// This future is owned and cancelled by run(), not by a Ready callback.
+// Only shard messengers are retained, never a Context or the handler/runner.
+async fn gateway_presence<T>(
+    mut snapshots: watch::Receiver<PresenceSnapshot>,
+    mut targets: watch::Receiver<Option<T>>,
+    mut send: impl FnMut(&T, PresenceSnapshot),
+) {
+    let mut last_sent = None;
+    let mut next_send = Instant::now();
+    let mut refresh = true;
+    loop {
+        let pending = {
+            let snapshot = *snapshots.borrow_and_update();
+            let target = targets.borrow_and_update();
+            refresh |= target.has_changed();
+            let pending = target.is_some() && (refresh || last_sent != Some(snapshot));
+            if pending && Instant::now() >= next_send {
+                send(target.as_ref().expect("presence target is available"), snapshot);
+                last_sent = Some(snapshot);
+                next_send = Instant::now() + PRESENCE_INTERVAL;
+                refresh = false;
+                false
+            } else {
+                pending
+            }
+        };
+        tokio::select! {
+            result = snapshots.changed() => {
+                if result.is_err() {
+                    return;
+                }
+            }
+            result = targets.changed() => {
+                if result.is_err() {
+                    return;
+                }
+                refresh = true;
+            }
+            _ = tokio::time::sleep_until(next_send), if pending => {}
         }
     }
 }
@@ -828,14 +910,20 @@ struct DiscordHandler {
     runner: Arc<ThreadQueueRunner>,
     approvals: Arc<ApprovalBroker>,
     bot_user_id: Arc<AtomicU64>,
+    presence_target: watch::Sender<Option<ShardMessenger>>,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
-    async fn ready(&self, _context: Context, ready: Ready) {
+    async fn ready(&self, context: Context, ready: Ready) {
         self.bot_user_id
             .store(ready.user.id.get(), Ordering::Release);
+        self.presence_target.send_replace(Some(context.shard));
         tracing::info!(user = %ready.user.name, "Discord bridge connected");
+    }
+
+    async fn resume(&self, context: Context, _event: ResumedEvent) {
+        self.presence_target.send_replace(Some(context.shard));
     }
 
     async fn message(&self, context: Context, message: Message) {
@@ -1468,6 +1556,162 @@ fn parse_approval_custom_id(custom_id: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PresenceHarness {
+        snapshots: watch::Sender<PresenceSnapshot>,
+        targets: watch::Sender<Option<u64>>,
+        updates: tokio::sync::mpsc::UnboundedReceiver<(Instant, u64, PresenceSnapshot)>,
+        worker: tokio::task::JoinHandle<()>,
+    }
+
+    impl PresenceHarness {
+        fn new() -> Self {
+            let (snapshots, snapshot_rx) = watch::channel(PresenceSnapshot::default());
+            let (targets, target_rx) = watch::channel(None);
+            let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
+            let worker = tokio::spawn(gateway_presence(
+                snapshot_rx,
+                target_rx,
+                move |target, snapshot| {
+                    updates_tx.send((Instant::now(), *target, snapshot)).unwrap();
+                },
+            ));
+            Self { snapshots, targets, updates, worker }
+        }
+
+        async fn quiet(&mut self) {
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                self.updates.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        async fn next(&mut self) -> (Instant, u64, PresenceSnapshot) {
+            self.updates.recv().await.expect("presence worker stopped")
+        }
+    }
+
+    impl Drop for PresenceHarness {
+        fn drop(&mut self) {
+            self.worker.abort();
+        }
+    }
+
+    #[test]
+    fn presence_text_and_dot_only_describe_counts() {
+        for (working, awaiting_approval, text, status) in [
+            (0, 0, "Ready", OnlineStatus::Online),
+            (1, 0, "Working in 1 thread", OnlineStatus::Online),
+            (8, 0, "Working in 8 threads", OnlineStatus::Online),
+            (0, 1, "1 awaiting approval", OnlineStatus::Idle),
+            (0, 4, "4 awaiting approval", OnlineStatus::Idle),
+            (2, 3, "2 working · 3 awaiting approval", OnlineStatus::Online),
+        ] {
+            let snapshot = PresenceSnapshot { working, awaiting_approval };
+            assert_eq!(presence_text(snapshot), text);
+            assert_eq!(presence_status(snapshot), status);
+        }
+    }
+
+    // These tests observe sender invocations, not Discord's remote display.
+    #[tokio::test(start_paused = true)]
+    async fn presence_waits_for_ready_and_uses_latest_snapshot() {
+        let mut harness = PresenceHarness::new();
+        harness.snapshots.send_replace(PresenceSnapshot {
+            working: 1,
+            awaiting_approval: 0,
+        });
+        harness.quiet().await;
+        let latest = PresenceSnapshot { working: 3, awaiting_approval: 2 };
+        harness.snapshots.send_replace(latest);
+        harness.quiet().await;
+        harness.targets.send_replace(Some(7));
+        let (sent_at, target, snapshot) = harness.next().await;
+        assert_eq!((target, snapshot), (7, latest));
+        assert_eq!(sent_at, Instant::now());
+        harness.quiet().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presence_coalesces_deduplicates_and_cancels_reverted_updates() {
+        let mut harness = PresenceHarness::new();
+        harness.targets.send_replace(Some(1));
+        let (first_at, _, first) = harness.next().await;
+        assert_eq!(first, PresenceSnapshot::default());
+
+        harness.snapshots.send_replace(PresenceSnapshot {
+            working: 1,
+            awaiting_approval: 0,
+        });
+        harness.quiet().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let latest = PresenceSnapshot { working: 0, awaiting_approval: 2 };
+        harness.snapshots.send_replace(latest);
+        harness.quiet().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(harness.next().await, (first_at + PRESENCE_INTERVAL, 1, latest));
+
+        // A transient state that returns to the sent value needs no update.
+        harness.snapshots.send_replace(PresenceSnapshot::default());
+        harness.quiet().await;
+        harness.snapshots.send_replace(latest);
+        harness.quiet().await;
+        tokio::time::advance(PRESENCE_INTERVAL).await;
+        harness.quiet().await;
+        harness.snapshots.send_replace(latest);
+        harness.quiet().await;
+
+        harness.snapshots.send_replace(PresenceSnapshot::default());
+        assert_eq!(
+            harness.next().await,
+            (first_at + PRESENCE_INTERVAL * 2, 1, PresenceSnapshot::default())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presence_reconnect_refreshes_share_the_rate_limit_and_latest_target() {
+        let mut harness = PresenceHarness::new();
+        harness.targets.send_replace(Some(1));
+        let (first_at, _, _) = harness.next().await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        harness.targets.send_replace(Some(2));
+        harness.quiet().await;
+        let latest = PresenceSnapshot { working: 2, awaiting_approval: 1 };
+        harness.snapshots.send_replace(latest);
+        harness.quiet().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        harness.targets.send_replace(Some(3));
+        harness.quiet().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(harness.next().await, (first_at + PRESENCE_INTERVAL, 3, latest));
+
+        // A resumed connection can retain the same messenger and snapshot.
+        harness.targets.send_replace(Some(3));
+        harness.quiet().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        harness.quiet().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            harness.next().await,
+            (first_at + PRESENCE_INTERVAL * 2, 3, latest)
+        );
+        tokio::time::advance(PRESENCE_INTERVAL).await;
+        harness.quiet().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_presence_worker_releases_both_subscriptions() {
+        let mut harness = PresenceHarness::new();
+        harness.targets.send_replace(Some(1));
+        harness.next().await;
+        harness.worker.abort();
+        assert!((&mut harness.worker).await.unwrap_err().is_cancelled());
+        harness.snapshots.closed().await;
+        harness.targets.closed().await;
+        assert!(harness.updates.recv().await.is_none());
+    }
 
     #[tokio::test]
     async fn activity_refresh_edits_only_when_card_is_newest() {
@@ -2374,6 +2618,7 @@ mod tests {
             runner,
             approvals,
             bot_user_id: Arc::new(AtomicU64::new(9)),
+            presence_target: watch::channel(None).0,
         }
     }
 

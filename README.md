@@ -44,6 +44,25 @@ card behind. Assistant text is delivered in separate messages. After a process
 crash, an old card can remain stale; use `status` to inspect durable turn state.
 Activity message IDs are not persisted.
 
+The bot's custom presence summarizes all managed conversations:
+
+- `Ready` when no threads are engaged.
+- `Working in 1 thread` or `Working in N threads` when work is underway.
+- `N awaiting approval` when all engaged threads are waiting for authorization.
+- `N working · M awaiting approval` when both states are present.
+
+Each thread counts once. Runnable work waiting for an execution slot and final
+message delivery count as working; stopped queues do not. Approval waits move a
+thread out of the working count until they end. Cancellation and failures release
+their counts. The presence dot stays online except when all engaged threads await
+approval, when it shows idle.
+
+Presence updates are deduplicated and coalesced to at most one every five seconds,
+including reconnect refreshes. The latest aggregate state is sent after connection.
+Only counts are exposed: no thread names, prompts, tool arguments, or task details.
+This is bot-wide profile/member-list activity, not a thread footer or an instant
+status guarantee. It does not rename threads or replace their activity cards.
+
 ## Prerequisites
 
 Install Rust with `rustup`:

@@ -16,6 +16,7 @@ use crate::{
     activity::ActivityReporter,
     domain::{MessageId, SessionStatus, ThreadId, Turn, TurnStatus},
     omp::{AgentTransport, ApprovalRequest, OmpTurnError, OmpUi, TurnControl, TurnInput},
+    presence::{PresenceSnapshot, PresenceTracker, WorkingPresence},
     render::chunk_message,
     store::Store,
 };
@@ -247,8 +248,9 @@ pub struct ThreadQueueRunner {
     messenger: Arc<dyn ThreadMessenger>,
     message_limit: usize,
     permits: Arc<Semaphore>,
-    draining: Mutex<HashSet<ThreadId>>,
-    active: Mutex<HashMap<ThreadId, ActiveRun>>,
+    draining: Mutex<HashMap<ThreadId, CancellationToken>>,
+    active: StdMutex<HashMap<ThreadId, ActiveRun>>,
+    presence: Arc<PresenceTracker>,
     statuses: ThreadStatusReconciler,
     idle: Notify,
 }
@@ -257,6 +259,19 @@ pub struct ThreadQueueRunner {
 struct ActiveRun {
     cancellation: CancellationToken,
     interrupts: Arc<Notify>,
+}
+
+struct ActiveRunGuard<'a> {
+    runner: &'a ThreadQueueRunner,
+    thread_id: ThreadId,
+}
+
+impl Drop for ActiveRunGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(active) = self.runner.active.lock().unwrap().remove(&self.thread_id) {
+            active.cancellation.cancel();
+        }
+    }
 }
 
 impl ThreadQueueRunner {
@@ -277,23 +292,38 @@ impl ThreadQueueRunner {
             messenger,
             message_limit,
             permits: Arc::new(Semaphore::new(max_concurrency)),
-            draining: Mutex::new(HashSet::new()),
-            active: Mutex::new(HashMap::new()),
+            draining: Mutex::new(HashMap::new()),
+            active: StdMutex::new(HashMap::new()),
+            presence: Arc::new(PresenceTracker::default()),
             idle: Notify::new(),
         })
     }
 
+    pub(crate) fn subscribe_presence(&self) -> watch::Receiver<PresenceSnapshot> {
+        self.presence.subscribe()
+    }
+
     pub async fn poke(self: &Arc<Self>, thread_id: ThreadId) {
-        if let Some(active) = self.active.lock().await.get(&thread_id) {
+        if let Some(active) = self.active.lock().unwrap().get(&thread_id) {
             active.interrupts.notify_one();
         }
-        if !self.draining.lock().await.insert(thread_id) {
-            return;
-        }
+        let cancellation = {
+            let mut draining = self.draining.lock().await;
+            if draining.contains_key(&thread_id) {
+                return;
+            }
+            let cancellation = CancellationToken::new();
+            draining.insert(thread_id, cancellation.clone());
+            cancellation
+        };
         let runner = Arc::clone(self);
         tokio::spawn(async move {
+            // One engagement spans permit waits, replacement turns, delivery,
+            // final activity edits, and the last queue recheck.
+            let mut presence = None;
+            let mut cancellation = cancellation;
             'drain: loop {
-                if let Err(error) = runner.drain(thread_id).await {
+                if let Err(error) = runner.drain(thread_id, &cancellation, &mut presence).await {
                     tracing::error!(thread_id = %thread_id, error = %error, "thread queue drain failed");
                     let _ = timeout(
                         DELIVERY_TIMEOUT,
@@ -309,7 +339,7 @@ impl ThreadQueueRunner {
                     let counts = runner.store.counts(thread_id).await?;
                     let idle = counts.queued == 0
                         && counts.running == 0
-                        && !runner.active.lock().await.contains_key(&thread_id);
+                        && !runner.active.lock().unwrap().contains_key(&thread_id);
                     Ok::<_, anyhow::Error>((
                         session.is_some_and(|session| session.status == SessionStatus::Active)
                             && counts.queued > 0,
@@ -318,7 +348,14 @@ impl ThreadQueueRunner {
                 }
                 .await;
                 match remaining {
-                    Ok((true, _)) => continue 'drain,
+                    Ok((true, _)) => {
+                        // Reset may make new work runnable before a stopped drain settles.
+                        if cancellation.is_cancelled() {
+                            cancellation = CancellationToken::new();
+                            draining.insert(thread_id, cancellation.clone());
+                        }
+                        continue 'drain;
+                    }
                     Ok((false, idle)) => runner.statuses.set(
                         thread_id,
                         if idle {
@@ -332,6 +369,7 @@ impl ThreadQueueRunner {
                     }
                 }
                 draining.remove(&thread_id);
+                drop(presence);
                 runner.idle.notify_waiters();
                 break;
             }
@@ -342,7 +380,10 @@ impl ThreadQueueRunner {
         self.store
             .set_session_status(thread_id, SessionStatus::Stopped)
             .await?;
-        let active = self.active.lock().await.get(&thread_id).cloned();
+        if let Some(cancellation) = self.draining.lock().await.get(&thread_id) {
+            cancellation.cancel();
+        }
+        let active = self.active.lock().unwrap().get(&thread_id).cloned();
         if let Some(active) = active {
             active.cancellation.cancel();
             Ok(true)
@@ -352,7 +393,7 @@ impl ThreadQueueRunner {
     }
 
     pub async fn new_session(self: &Arc<Self>, thread_id: ThreadId) -> Result<u64> {
-        if self.active.lock().await.contains_key(&thread_id) {
+        if self.active.lock().unwrap().contains_key(&thread_id) {
             bail!(
                 "stop the active OMP turn and wait for it to finish before starting a new session"
             );
@@ -393,14 +434,19 @@ impl ThreadQueueRunner {
     pub async fn wait_idle(&self, thread_id: ThreadId) {
         loop {
             let notified = self.idle.notified();
-            if !self.draining.lock().await.contains(&thread_id) {
+            if !self.draining.lock().await.contains_key(&thread_id) {
                 return;
             }
             notified.await;
         }
     }
 
-    async fn drain(self: &Arc<Self>, thread_id: ThreadId) -> Result<()> {
+    async fn drain(
+        self: &Arc<Self>,
+        thread_id: ThreadId,
+        cancellation: &CancellationToken,
+        presence: &mut Option<WorkingPresence>,
+    ) -> Result<()> {
         loop {
             let session = self
                 .store
@@ -415,11 +461,14 @@ impl ThreadQueueRunner {
                 return Ok(());
             }
             self.statuses.set(thread_id, ThreadStatus::Working);
+            let presence = presence.get_or_insert_with(|| self.presence.engage(thread_id));
 
-            let _permit = Arc::clone(&self.permits)
-                .acquire_owned()
-                .await
-                .context("global turn semaphore closed")?;
+            let _permit = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(()),
+                permit = Arc::clone(&self.permits).acquire_owned() =>
+                    permit.context("global turn semaphore closed")?,
+            };
             let Some(turn) = self.store.claim_next(thread_id).await? else {
                 return Ok(());
             };
@@ -427,9 +476,10 @@ impl ThreadQueueRunner {
                 cancellation: CancellationToken::new(),
                 interrupts: Arc::new(Notify::new()),
             };
-            self.active.lock().await.insert(thread_id, active.clone());
-            let result = self.process_turn(&turn, &active).await;
-            self.active.lock().await.remove(&thread_id);
+            self.active.lock().unwrap().insert(thread_id, active.clone());
+            let active_guard = ActiveRunGuard { runner: self, thread_id };
+            let result = self.process_turn(&turn, &active, presence).await;
+            drop(active_guard);
             if let Err(error) = result {
                 tracing::error!(thread_id = %thread_id, turn_id = turn.id, error = %error, "turn processing failed");
                 self.store
@@ -439,7 +489,12 @@ impl ThreadQueueRunner {
         }
     }
 
-    async fn process_turn(&self, turn: &Turn, active: &ActiveRun) -> Result<()> {
+    async fn process_turn(
+        &self,
+        turn: &Turn,
+        active: &ActiveRun,
+        presence: &WorkingPresence,
+    ) -> Result<()> {
         let session = self
             .store
             .session(turn.thread_id)
@@ -456,6 +511,7 @@ impl ThreadQueueRunner {
                 thread_id: turn.thread_id,
                 activity: &activity,
                 delivery: &delivery,
+                presence,
             };
             let control = RunnerControl {
                 runner: self,
@@ -595,6 +651,7 @@ struct RunnerUi<'a> {
     thread_id: ThreadId,
     activity: &'a ActivityReporter,
     delivery: &'a MessageDelivery,
+    presence: &'a WorkingPresence,
 }
 
 #[async_trait]
@@ -608,6 +665,7 @@ impl OmpUi for RunnerUi<'_> {
     }
 
     async fn confirm(&self, request: ApprovalRequest) -> bool {
+        let _approval = self.presence.awaiting_approval();
         self.activity.update("Waiting for your approval");
         let approved = self.messenger.confirm(self.thread_id, request).await;
         self.activity.update("Working");
@@ -803,6 +861,7 @@ mod tests {
         attempts: Mutex<Vec<String>>,
         delivered: Option<mpsc::UnboundedSender<String>>,
         send_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
+        approval_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
         edit_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
         fail_after: Mutex<Option<usize>>,
         statuses: Mutex<Vec<String>>,
@@ -920,6 +979,10 @@ mod tests {
         }
 
         async fn confirm(&self, _thread_id: ThreadId, _request: ApprovalRequest) -> bool {
+            if let Some((started, gate)) = &self.approval_gate {
+                started.send(()).unwrap();
+                gate.acquire().await.unwrap().forget();
+            }
             false
         }
 
@@ -1002,6 +1065,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approvals_count_once_and_restore_working_on_return_and_drop() {
+        let tracker = Arc::new(PresenceTracker::default());
+        let snapshots = tracker.subscribe();
+        let working = tracker.engage(THREAD);
+        let other = tracker.engage(ThreadId::new(11));
+        let (started, mut requests) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let messenger = Arc::new(FakeMessenger {
+            approval_gate: Some((started, gate.clone())),
+            ..FakeMessenger::default()
+        });
+        let activity = ActivityReporter::start(messenger.clone(), THREAD);
+        let (delivery, _receiver) = MessageDelivery::new();
+        let ui = RunnerUi {
+            messenger,
+            thread_id: THREAD,
+            activity: &activity,
+            delivery: &delivery,
+            presence: &working,
+        };
+        let request = ApprovalRequest { title: "Allow?".into(), details: "test".into() };
+        let mut first = Box::pin(ui.confirm(request.clone()));
+        let mut second = Box::pin(ui.confirm(request));
+        tokio::select! {
+            biased;
+            _ = &mut first => panic!("approval unexpectedly completed"),
+            _ = &mut second => panic!("approval unexpectedly completed"),
+            _ = std::future::ready(()) => {}
+        }
+        received(&mut requests).await;
+        received(&mut requests).await;
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 1 });
+        drop(first);
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 1 });
+        gate.add_permits(1);
+        assert!(!second.await);
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
+        let mut cancelled = Box::pin(ui.confirm(ApprovalRequest {
+            title: "Cancel?".into(),
+            details: String::new(),
+        }));
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => panic!("approval unexpectedly completed"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(snapshots.borrow().awaiting_approval, 1);
+        drop(cancelled);
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
+        drop(working);
+        drop(other);
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
+        activity.finish("Finished").await;
+    }
+
+    #[tokio::test]
+    async fn aborting_a_drain_cleans_up_active_run_presence_and_capacity() {
+        let (_directory, store) = fixture().await;
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        let turn = enqueue(&store, 20).await;
+        let snapshots = runner.subscribe_presence();
+        let task_runner = runner.clone();
+        let task = tokio::spawn(async move {
+            let mut presence = None;
+            task_runner.drain(THREAD, &CancellationToken::new(), &mut presence).await
+        });
+        assert_eq!(received(&mut incoming).await, turn);
+        assert_eq!(snapshots.borrow().working, 1);
+        let cancellation = runner.active.lock().unwrap().get(&THREAD).unwrap().cancellation.clone();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
+        assert!(runner.active.lock().unwrap().is_empty());
+        assert!(cancellation.is_cancelled());
+        assert_eq!(runner.permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_threads_settle_independently() {
+        let (directory, store) = fixture().await;
+        let other = ThreadId::new(11);
+        store.create_session(&NewSession {
+            thread_id: other,
+            guild_id: GuildId::new(1),
+            parent_channel_id: ChannelId::new(2),
+            trigger_message_id: MessageId::new(30),
+            cwd: directory.path().to_owned(),
+            created_by_user_id: UserId::new(4),
+        }).await.unwrap();
+        enqueue(&store, 20).await;
+        store.enqueue_turn(other, MessageId::new(21), UserId::new(4), "other", TurnSource::Human)
+            .await.unwrap();
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store,
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            2,
+        );
+        let snapshots = runner.subscribe_presence();
+        runner.poke(THREAD).await;
+        runner.poke(other).await;
+        received(&mut incoming).await;
+        received(&mut incoming).await;
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
+        assert!(runner.stop(THREAD).await.unwrap());
+        idle(&runner).await;
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+        assert!(runner.stop(other).await.unwrap());
+        timeout(Duration::from_secs(3), runner.wait_idle(other)).await.unwrap();
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
+    }
+
+    #[tokio::test]
     async fn idle_status_waits_for_messages_and_activity_and_new_work_restores_working() {
         let (_directory, store) = fixture().await;
         let (observed, mut incoming) = mpsc::unbounded_channel();
@@ -1025,25 +1210,30 @@ mod tests {
             1_900,
             1,
         );
+        let snapshots = runner.subscribe_presence();
         for message_id in [20, 21] {
             let turn = enqueue(&store, message_id).await;
             runner.poke(THREAD).await;
             assert_eq!(received(&mut incoming).await, turn);
             messenger.wait_status("working").await;
+            assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
             transport.finish.add_permits(1);
             received(&mut sends).await;
             assert_eq!(received(&mut outcomes).await, turn);
             let counts = store.counts(THREAD).await.unwrap();
             assert_eq!((counts.running, counts.queued), (0, 0));
             assert_eq!(messenger.statuses.lock().await.last().unwrap(), "working");
+            assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
             send_gate.add_permits(1);
             received(&mut edits).await;
             let counts = store.counts(THREAD).await.unwrap();
             assert_eq!((counts.running, counts.queued), (0, 0));
-            assert!(runner.active.lock().await.contains_key(&THREAD));
+            assert!(runner.active.lock().unwrap().contains_key(&THREAD));
             assert_eq!(messenger.statuses.lock().await.last().unwrap(), "working");
+            assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
             edit_gate.add_permits(1);
             idle(&runner).await;
+            assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
             messenger.wait_status("completed").await;
         }
         assert_eq!(
@@ -1070,7 +1260,7 @@ mod tests {
         runner.poke(THREAD).await;
         idle(&runner).await;
         assert_eq!(store.counts(THREAD).await.unwrap().running, 1);
-        assert!(!runner.active.lock().await.contains_key(&THREAD));
+        assert!(!runner.active.lock().unwrap().contains_key(&THREAD));
         messenger.wait_status("working").await;
         assert!(incoming.try_recv().is_err());
     }
@@ -1673,11 +1863,14 @@ mod tests {
         let first = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, first);
+        let mut snapshots = runner.subscribe_presence();
+        assert_eq!(snapshots.borrow_and_update().working, 1);
         let second = enqueue(&store, 21).await;
         let third = enqueue(&store, 22).await;
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, second);
         assert_eq!(received(&mut incoming).await, third);
+        assert!(!snapshots.has_changed().unwrap(), "interrupt replacements must not change presence");
         assert_eq!(
             store.next_outcome(THREAD, 0).await.unwrap().unwrap().status,
             TurnStatus::Aborted
@@ -1728,6 +1921,7 @@ mod tests {
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, second);
         idle(&runner).await;
+        assert_eq!(*runner.subscribe_presence().borrow(), PresenceSnapshot::default());
         let counts = store.counts(THREAD).await.unwrap();
         assert_eq!((counts.running, counts.queued, counts.uncertain), (0, 0, 2));
         messenger.wait_status("completed").await;
@@ -1764,6 +1958,8 @@ mod tests {
         let first = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, first);
+        let mut snapshots = runner.subscribe_presence();
+        assert_eq!(snapshots.borrow_and_update().working, 1);
         transport.finish.add_permits(1);
         received(&mut edits).await;
         let second = enqueue(&store, 21).await;
@@ -1772,11 +1968,13 @@ mod tests {
         messenger.wait_status("working").await;
         gate.add_permits(1);
         assert_eq!(received(&mut incoming).await, second);
+        assert!(!snapshots.has_changed().unwrap(), "continuing the drain must not publish Ready");
         assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
         transport.finish.add_permits(1);
         received(&mut edits).await;
         gate.add_permits(1);
         idle(&runner).await;
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
         messenger.wait_status("completed").await;
         assert_eq!(store.counts(THREAD).await.unwrap().running, 0);
         assert_eq!(
@@ -1936,12 +2134,16 @@ mod tests {
             1_900,
             1,
         );
+        let mut snapshots = runner.subscribe_presence();
         let permit = runner.permits.acquire().await.unwrap();
         enqueue(&store, 20).await;
         runner.poke(THREAD).await;
+        timeout(Duration::from_secs(3), snapshots.changed()).await.unwrap().unwrap();
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
         assert!(!runner.stop(THREAD).await.unwrap());
-        drop(permit);
         idle(&runner).await;
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
+        drop(permit);
         runner.poke(THREAD).await;
         idle(&runner).await;
         assert!(incoming.try_recv().is_err());
