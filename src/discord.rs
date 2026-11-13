@@ -108,7 +108,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<()> {
 
 fn presence_text(snapshot: PresenceSnapshot) -> String {
     match (snapshot.working, snapshot.awaiting_approval) {
-        (0, 0) => concat!("Idle · ", env!("BRIDGE_BUILD_REVISION")).to_owned(),
+        (0, 0) => concat!("Idle · v", env!("BRIDGE_RELEASE_VERSION"), " · ", env!("BRIDGE_BUILD_REVISION")).to_owned(),
         (1, 0) => "Working in 1 thread".to_owned(),
         (working, 0) => format!("Working in {working} threads"),
         (0, awaiting) => format!("{awaiting} awaiting approval"),
@@ -1601,7 +1601,7 @@ mod tests {
     #[test]
     fn presence_includes_build_identity_only_when_idle() {
         for (working, awaiting_approval, text, status) in [
-            (0, 0, concat!("Idle · ", env!("BRIDGE_BUILD_REVISION")), OnlineStatus::Online),
+            (0, 0, concat!("Idle · v", env!("BRIDGE_RELEASE_VERSION"), " · ", env!("BRIDGE_BUILD_REVISION")), OnlineStatus::Online),
             (1, 0, "Working in 1 thread", OnlineStatus::Online),
             (8, 0, "Working in 8 threads", OnlineStatus::Online),
             (0, 1, "1 awaiting approval", OnlineStatus::Idle),

@@ -5,7 +5,7 @@ FROM rust:${RUST_VERSION}-bookworm AS builder
 
 WORKDIR /build
 ARG BRIDGE_BUILD_REVISION
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock build.rs VERSION ./
 COPY src ./src
 RUN BRIDGE_BUILD_REVISION="${BRIDGE_BUILD_REVISION}" cargo build --locked --release --bin omp-discord-bridge
 

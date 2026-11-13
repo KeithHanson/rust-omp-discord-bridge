@@ -46,7 +46,7 @@ Activity message IDs are not persisted.
 
 The bot's custom presence summarizes all managed conversations:
 
-- `Idle · abc1234` when no threads are engaged, using the running binary's commit.
+- `Idle · v2026-11-13-1 · abc1234` when no threads are engaged, using the running binary's release version and commit.
 - `Working in 1 thread` or `Working in N threads` when work is underway.
 - `N awaiting approval` when all engaged threads are waiting for authorization.
 - `N working · M awaiting approval` when both states are present.
@@ -59,7 +59,7 @@ approval, when it shows idle.
 
 Presence updates are deduplicated and coalesced to at most one every five seconds,
 including reconnect refreshes. The latest aggregate state is sent after connection.
-Only counts and the idle build revision are exposed: no thread names, prompts,
+Only counts and the idle build identity are exposed: no thread names, prompts,
 tool arguments, or task details.
 This is bot-wide profile/member-list activity, not a thread footer or an instant
 status guarantee. It does not rename threads or replace their activity cards.
@@ -70,6 +70,20 @@ a running binary's identity. Native builds derive it from Git, marking modified
 build inputs with `-dirty`. Source archives/container builds must supply
 `BRIDGE_BUILD_REVISION` with the source commit hash (optionally `-dirty`).
 Builds fail rather than inventing a revision when no metadata is available.
+
+## Release versions
+
+`VERSION` is the source of truth for the public release version: `YYYY-MM-DD-#`.
+Use the UTC release date and start its counter at `1`; increment the counter for
+each later release that day, resetting it to `1` on a new date. Update and commit
+`VERSION` before building a release. Rebuilding the same release does not bump it.
+
+The build validates and embeds this version alongside the Git revision. Idle
+presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
+`[VERSION] ([short commit])`. Neither value is read from the checkout at runtime.
+Cargo's SemVer package field is internal Rust metadata, not the public release
+version. Container builds copy the same tracked `VERSION` file.
+
 
 ## Prerequisites
 
