@@ -1,13 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::{
-    sync::{Mutex, Notify, Semaphore, mpsc},
+    sync::{Mutex, Notify, Semaphore, mpsc, watch},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -22,6 +22,9 @@ use crate::{
 
 const MAX_PENDING_MESSAGES: usize = 64;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const STATUS_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_STATUS_ATTEMPTS: u32 = 5;
 
 struct QueuedMessage {
     text: String,
@@ -114,8 +117,6 @@ pub trait ThreadMessenger: Send + Sync {
         content: &str,
         finished: bool,
     ) -> Result<MessageId>;
-    /// Change the activity phase without replacing the current thread title.
-    async fn activity_phase(&self, thread_id: ThreadId, label: &str) -> Result<()>;
     async fn confirm(&self, thread_id: ThreadId, request: ApprovalRequest) -> bool;
     async fn notify(&self, thread_id: ThreadId, message: &str);
     async fn channel_history(&self, thread_id: ThreadId, days: u16) -> Result<String>;
@@ -123,6 +124,122 @@ pub trait ThreadMessenger: Send + Sync {
     async fn thread_title(&self, thread_id: ThreadId, title: &str, status: &str) -> Result<String>;
     /// Change the status prefix without replacing the current thread title.
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThreadStatus {
+    Working,
+    Completed,
+}
+
+impl ThreadStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+type StatusSenders = StdMutex<HashMap<ThreadId, watch::Sender<ThreadStatus>>>;
+
+struct ThreadStatusReconciler {
+    messenger: Arc<dyn ThreadMessenger>,
+    senders: Arc<StatusSenders>,
+}
+
+impl ThreadStatusReconciler {
+    fn set(&self, thread_id: ThreadId, status: ThreadStatus) {
+        let mut senders = self.senders.lock().expect("thread status registry poisoned");
+        if let Some(sender) = senders.get(&thread_id) {
+            sender.send_if_modified(|desired| {
+                if *desired == status {
+                    return false;
+                }
+                *desired = status;
+                true
+            });
+            return;
+        }
+        let (sender, receiver) = watch::channel(status);
+        senders.insert(thread_id, sender);
+        tokio::spawn(reconcile_thread_status(
+            Arc::clone(&self.messenger),
+            Arc::downgrade(&self.senders),
+            thread_id,
+            receiver,
+        ));
+    }
+}
+
+async fn reconcile_thread_status(
+    messenger: Arc<dyn ThreadMessenger>,
+    senders: Weak<StatusSenders>,
+    thread_id: ThreadId,
+    mut desired: watch::Receiver<ThreadStatus>,
+) {
+    'latest: loop {
+        let status = *desired.borrow_and_update();
+        for attempt in 1..=MAX_STATUS_ATTEMPTS {
+            let result = tokio::select! {
+                biased;
+                changed = desired.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    // Drop obsolete HTTP/rate-limit waits before applying the latest state.
+                    continue 'latest;
+                }
+                result = timeout(
+                    STATUS_REQUEST_TIMEOUT,
+                    messenger.thread_status(thread_id, status.as_str()),
+                ) => result.context("thread status update timed out").and_then(|result| result),
+            };
+            match result {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        %thread_id, status = status.as_str(), attempt, %error,
+                        "thread status update failed"
+                    );
+                    if attempt == MAX_STATUS_ATTEMPTS {
+                        tracing::error!(
+                            %thread_id, status = status.as_str(),
+                            "thread status retries exhausted; awaiting a new desired state"
+                        );
+                        break;
+                    }
+                }
+            }
+            tokio::select! {
+                biased;
+                changed = desired.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue 'latest;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1 << attempt)) => {}
+            }
+        }
+        match timeout(STATUS_WORKER_IDLE_TIMEOUT, desired.changed()).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(_)) => return,
+            Err(_) => {
+                let Some(senders) = senders.upgrade() else {
+                    return;
+                };
+                let mut senders = senders.lock().expect("thread status registry poisoned");
+                // Removal and publication share this lock, so a concurrent arrival
+                // either keeps this worker alive or starts its replacement.
+                if desired.has_changed().unwrap_or(false) {
+                    continue;
+                }
+                senders.remove(&thread_id);
+                return;
+            }
+        }
+    }
 }
 
 pub struct ThreadQueueRunner {
@@ -133,6 +250,7 @@ pub struct ThreadQueueRunner {
     permits: Arc<Semaphore>,
     draining: Mutex<HashSet<ThreadId>>,
     active: Mutex<HashMap<ThreadId, ActiveRun>>,
+    statuses: ThreadStatusReconciler,
     idle: Notify,
 }
 
@@ -153,6 +271,10 @@ impl ThreadQueueRunner {
         Arc::new(Self {
             store,
             transport,
+            statuses: ThreadStatusReconciler {
+                messenger: Arc::clone(&messenger),
+                senders: Arc::new(StdMutex::new(HashMap::new())),
+            },
             messenger,
             message_limit,
             permits: Arc::new(Semaphore::new(max_concurrency)),
@@ -182,47 +304,37 @@ impl ThreadQueueRunner {
                     )
                     .await;
                 }
-                let mut completed = false;
-                loop {
-                    let mut draining = runner.draining.lock().await;
-                    let remaining = async {
-                        let session = runner.store.session(thread_id).await?;
-                        let counts = runner.store.counts(thread_id).await?;
-                        let idle = counts.queued == 0
-                            && counts.running == 0
-                            && !runner.active.lock().await.contains_key(&thread_id);
-                        Ok::<_, anyhow::Error>((
-                            session.is_some_and(|session| session.status == SessionStatus::Active)
-                                && counts.queued > 0,
-                            idle,
-                        ))
-                    }
-                    .await;
-                    match remaining {
-                        Ok((true, _)) => continue 'drain,
-                        Ok((false, idle)) if idle != completed => {
-                            // Keep ownership, but never hold the global lock over HTTP.
-                            // Recheck afterward: an arrival may have been poked while
-                            // this drain still owned the thread.
-                            drop(draining);
-                            runner
-                                .update_thread_status(
-                                    thread_id,
-                                    if idle { "completed" } else { "working" },
-                                )
-                                .await;
-                            completed = idle;
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::error!(thread_id = %thread_id, error = %error, "failed to inspect remaining queue");
-                        }
-                    }
-                    draining.remove(&thread_id);
-                    runner.idle.notify_waiters();
-                    break 'drain;
+                let mut draining = runner.draining.lock().await;
+                let remaining = async {
+                    let session = runner.store.session(thread_id).await?;
+                    let counts = runner.store.counts(thread_id).await?;
+                    let idle = counts.queued == 0
+                        && counts.running == 0
+                        && !runner.active.lock().await.contains_key(&thread_id);
+                    Ok::<_, anyhow::Error>((
+                        session.is_some_and(|session| session.status == SessionStatus::Active)
+                            && counts.queued > 0,
+                        idle,
+                    ))
                 }
+                .await;
+                match remaining {
+                    Ok((true, _)) => continue 'drain,
+                    Ok((false, idle)) => runner.statuses.set(
+                        thread_id,
+                        if idle {
+                            ThreadStatus::Completed
+                        } else {
+                            ThreadStatus::Working
+                        },
+                    ),
+                    Err(error) => {
+                        tracing::error!(thread_id = %thread_id, error = %error, "failed to inspect remaining queue");
+                    }
+                }
+                draining.remove(&thread_id);
+                runner.idle.notify_waiters();
+                break;
             }
         });
     }
@@ -278,6 +390,7 @@ impl ThreadQueueRunner {
         ))
     }
 
+    /// Wait for turn execution and message/activity delivery, not title reconciliation.
     pub async fn wait_idle(&self, thread_id: ThreadId) {
         loop {
             let notified = self.idle.notified();
@@ -285,19 +398,6 @@ impl ThreadQueueRunner {
                 return;
             }
             notified.await;
-        }
-    }
-
-    async fn update_thread_status(&self, thread_id: ThreadId, status: &str) {
-        let result = timeout(
-            DELIVERY_TIMEOUT,
-            self.messenger.thread_status(thread_id, status),
-        )
-        .await
-        .context("thread status update timed out")
-        .and_then(|result| result);
-        if let Err(error) = result {
-            tracing::warn!(%thread_id, %status, %error, "thread status update failed");
         }
     }
 
@@ -315,6 +415,7 @@ impl ThreadQueueRunner {
             if self.store.counts(thread_id).await?.queued == 0 {
                 return Ok(());
             }
+            self.statuses.set(thread_id, ThreadStatus::Working);
 
             let _permit = Arc::clone(&self.permits)
                 .acquire_owned()
@@ -328,7 +429,6 @@ impl ThreadQueueRunner {
                 interrupts: Arc::new(Notify::new()),
             };
             self.active.lock().await.insert(thread_id, active.clone());
-            self.update_thread_status(thread_id, "working").await;
             let result = self.process_turn(&turn, &active).await;
             self.active.lock().await.remove(&thread_id);
             if let Err(error) = result {
@@ -453,18 +553,11 @@ impl TurnControl for RunnerControl<'_> {
         if self.cancellation.is_cancelled() {
             return Ok(None);
         }
-        let turn = self
-            .runner
+        self.runner
             .store
             .claim_next_interrupting(self.thread_id)
             .await
-            .map_err(|error| OmpTurnError::Uncertain(error.to_string()))?;
-        if turn.is_some() {
-            self.runner
-                .update_thread_status(self.thread_id, "working")
-                .await;
-        }
-        Ok(turn)
+            .map_err(|error| OmpTurnError::Uncertain(error.to_string()))
     }
 
     async fn record_result(
@@ -722,8 +815,66 @@ mod tests {
         fail_after: Mutex<Option<usize>>,
         statuses: Mutex<Vec<String>>,
         status_attempts: Mutex<Vec<String>>,
+        status_changed: Notify,
+        status_attempted: Notify,
         status_gate: Option<(&'static str, mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
-        fail_status: bool,
+        fail_status: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeMessenger {
+        async fn wait_status(&self, expected: &str) {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let changed = self.status_changed.notified();
+                    if self
+                        .statuses
+                        .lock()
+                        .await
+                        .last()
+                        .is_some_and(|status| status == expected)
+                    {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("thread status was not applied");
+        }
+
+        async fn wait_status_attempts(&self, count: usize) {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let attempted = self.status_attempted.notified();
+                    if self.status_attempts.lock().await.len() >= count {
+                        return;
+                    }
+                    attempted.await;
+                }
+            })
+            .await
+            .expect("thread status was not attempted");
+        }
+
+        async fn wait_status_attempt(&self, expected: &str) {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let attempted = self.status_attempted.notified();
+                    if self
+                        .status_attempts
+                        .lock()
+                        .await
+                        .last()
+                        .is_some_and(|status| status == expected)
+                    {
+                        return;
+                    }
+                    attempted.await;
+                }
+            })
+            .await
+            .expect("desired thread status was not attempted");
+        }
     }
 
     #[async_trait]
@@ -776,10 +927,6 @@ mod tests {
             Ok(message_id)
         }
 
-        async fn activity_phase(&self, _thread_id: ThreadId, _label: &str) -> Result<()> {
-            Ok(())
-        }
-
         async fn confirm(&self, _thread_id: ThreadId, _request: ApprovalRequest) -> bool {
             false
         }
@@ -805,14 +952,19 @@ mod tests {
 
         async fn thread_status(&self, _thread_id: ThreadId, status: &str) -> Result<()> {
             self.status_attempts.lock().await.push(status.to_owned());
+            self.status_attempted.notify_waiters();
             if let Some((blocked_status, started, gate)) = &self.status_gate
                 && status == *blocked_status
             {
                 started.send(())?;
                 gate.acquire().await?.forget();
             }
-            anyhow::ensure!(!self.fail_status, "injected Discord thread-status failure");
+            anyhow::ensure!(
+                !self.fail_status.load(std::sync::atomic::Ordering::Relaxed),
+                "injected Discord thread-status failure"
+            );
             self.statuses.lock().await.push(status.to_owned());
+            self.status_changed.notify_waiters();
             Ok(())
         }
     }
@@ -894,7 +1046,7 @@ mod tests {
             let turn = enqueue(&store, message_id).await;
             runner.poke(THREAD).await;
             assert_eq!(received(&mut incoming).await, turn);
-            assert_eq!(messenger.statuses.lock().await.last().unwrap(), "working");
+            messenger.wait_status("working").await;
             transport.finish.add_permits(1);
             received(&mut sends).await;
             assert_eq!(received(&mut outcomes).await, turn);
@@ -909,7 +1061,7 @@ mod tests {
             assert_eq!(messenger.statuses.lock().await.last().unwrap(), "working");
             edit_gate.add_permits(1);
             idle(&runner).await;
-            assert_eq!(messenger.statuses.lock().await.last().unwrap(), "completed");
+            messenger.wait_status("completed").await;
         }
         assert_eq!(
             *messenger.statuses.lock().await,
@@ -936,12 +1088,12 @@ mod tests {
         idle(&runner).await;
         assert_eq!(store.counts(THREAD).await.unwrap().running, 1);
         assert!(!runner.active.lock().await.contains_key(&THREAD));
-        assert!(messenger.status_attempts.lock().await.is_empty());
+        messenger.wait_status("working").await;
         assert!(incoming.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn arrival_during_idle_update_is_drained_and_restores_working() {
+    async fn pending_completion_is_superseded_by_new_work_without_blocking_turns() {
         let (_directory, store) = fixture().await;
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let transport = Arc::new(ControlledTransport::new(observed, false));
@@ -961,27 +1113,27 @@ mod tests {
         let first = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, first);
+        messenger.wait_status("working").await;
         transport.finish.add_permits(1);
         received(&mut updates).await;
-        assert!(!runner.active.lock().await.contains_key(&THREAD));
+        idle(&runner).await;
         let second = enqueue(&store, 21).await;
         timeout(Duration::from_secs(3), runner.poke(THREAD))
             .await
             .expect("status HTTP held the draining mutex");
-        assert_eq!(store.counts(THREAD).await.unwrap().queued, 1);
-        gate.add_permits(1);
         assert_eq!(received(&mut incoming).await, second);
-        assert_eq!(
-            *messenger.statuses.lock().await,
-            vec!["working", "completed", "working"]
-        );
+        messenger.wait_status_attempts(3).await;
+        messenger.wait_status("working").await;
+        // Making the obsolete request ready cannot let completed win again.
+        gate.add_permits(1);
+        assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
         transport.finish.add_permits(1);
         received(&mut updates).await;
-        gate.add_permits(1);
         idle(&runner).await;
+        messenger.wait_status("completed").await;
         assert_eq!(
-            *messenger.statuses.lock().await,
-            vec!["working", "completed", "working", "completed"]
+            messenger.statuses.lock().await.iter().filter(|status| *status == "completed").count(),
+            1
         );
         let counts = store.counts(THREAD).await.unwrap();
         assert_eq!((counts.running, counts.queued), (0, 0));
@@ -1008,17 +1160,16 @@ mod tests {
         let first = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, first);
+        messenger.wait_status("working").await;
         transport.finish.add_permits(1);
         received(&mut updates).await;
         enqueue(&store, 21).await;
         assert!(!runner.stop(THREAD).await.unwrap());
         runner.poke(THREAD).await;
-        gate.add_permits(1);
         idle(&runner).await;
-        assert_eq!(
-            *messenger.statuses.lock().await,
-            vec!["working", "completed", "working"]
-        );
+        messenger.wait_status_attempts(3).await;
+        messenger.wait_status("working").await;
+        assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
         assert_eq!(store.counts(THREAD).await.unwrap().queued, 1);
         assert!(incoming.try_recv().is_err());
 
@@ -1028,18 +1179,18 @@ mod tests {
         gate.add_permits(1);
         idle(&runner).await;
         drop(permit);
-        assert_eq!(messenger.statuses.lock().await.last().unwrap(), "completed");
+        messenger.wait_status("completed").await;
         assert_eq!(store.counts(THREAD).await.unwrap().queued, 0);
         assert!(incoming.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn failed_thread_status_updates_never_fail_or_wedge_turns() {
+    async fn title_failures_do_not_block_turns_or_lose_later_completion() {
         let (_directory, store) = fixture().await;
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let transport = Arc::new(ControlledTransport::new(observed, false));
         let messenger = Arc::new(FakeMessenger {
-            fail_status: true,
+            fail_status: true.into(),
             ..FakeMessenger::default()
         });
         let runner = ThreadQueueRunner::new(
@@ -1049,22 +1200,31 @@ mod tests {
             1_900,
             1,
         );
-        for message_id in [20, 21] {
-            let turn = enqueue(&store, message_id).await;
-            runner.poke(THREAD).await;
-            assert_eq!(received(&mut incoming).await, turn);
-            transport.finish.add_permits(1);
-            idle(&runner).await;
+        let first = enqueue(&store, 20).await;
+        runner.poke(THREAD).await;
+        assert_eq!(received(&mut incoming).await, first);
+        messenger.wait_status_attempt("working").await;
+        transport.finish.add_permits(1);
+        idle(&runner).await;
+        messenger.wait_status_attempt("completed").await;
+        assert!(messenger.statuses.lock().await.is_empty());
+
+        let second = enqueue(&store, 21).await;
+        runner.poke(THREAD).await;
+        assert_eq!(received(&mut incoming).await, second);
+        messenger.wait_status_attempt("working").await;
+        messenger
+            .fail_status
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        transport.finish.add_permits(1);
+        idle(&runner).await;
+        messenger.wait_status("completed").await;
+        for turn in [first, second] {
             assert_eq!(
                 store.next_outcome(THREAD, turn - 1).await.unwrap().unwrap().status,
                 TurnStatus::Done
             );
         }
-        assert_eq!(
-            *messenger.status_attempts.lock().await,
-            vec!["working", "completed", "working", "completed"]
-        );
-        assert!(messenger.statuses.lock().await.is_empty());
         assert_eq!(
             *messenger.sent.lock().await,
             vec!["finished answer", "finished answer"]
@@ -1072,55 +1232,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_thread_status_updates_release_the_queue_without_retries() {
-        for blocked_status in ["working", "completed"] {
-            let (_directory, store) = fixture().await;
-            let (observed, mut incoming) = mpsc::unbounded_channel();
-            let transport = Arc::new(ControlledTransport::new(observed, false));
-            let (updating, mut updates) = mpsc::unbounded_channel();
-            let messenger = Arc::new(FakeMessenger {
-                status_gate: Some((blocked_status, updating, Arc::new(Semaphore::new(0)))),
-                ..FakeMessenger::default()
-            });
-            let runner = ThreadQueueRunner::new(
-                store.clone(),
-                transport.clone(),
-                messenger.clone(),
-                1_900,
-                1,
-            );
-            for message_id in [20, 21] {
-                let turn = enqueue(&store, message_id).await;
-                runner.poke(THREAD).await;
-                if blocked_status == "working" {
-                    received(&mut updates).await;
-                    tokio::time::pause();
-                    tokio::time::advance(DELIVERY_TIMEOUT).await;
-                    tokio::time::resume();
-                }
-                assert_eq!(received(&mut incoming).await, turn);
-                transport.finish.add_permits(1);
-                if blocked_status == "completed" {
-                    received(&mut updates).await;
-                    tokio::time::pause();
-                    tokio::time::advance(DELIVERY_TIMEOUT).await;
-                    tokio::time::resume();
-                }
-                idle(&runner).await;
-                assert_eq!(
-                    store.next_outcome(THREAD, turn - 1).await.unwrap().unwrap().status,
-                    TurnStatus::Done
-                );
-            }
-            assert_eq!(
-                *messenger.status_attempts.lock().await,
-                vec!["working", "completed", "working", "completed"]
-            );
-            assert_eq!(
-                *messenger.sent.lock().await,
-                vec!["finished answer", "finished answer"]
-            );
+    async fn slow_completion_survives_the_old_ten_second_timeout() {
+        let (_directory, store) = fixture().await;
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let transport = Arc::new(ControlledTransport::new(observed, false));
+        let (updating, mut updates) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let messenger = Arc::new(FakeMessenger {
+            status_gate: Some(("completed", updating, gate.clone())),
+            ..FakeMessenger::default()
+        });
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            transport.clone(),
+            messenger.clone(),
+            1_900,
+            1,
+        );
+        let turn = enqueue(&store, 20).await;
+        runner.poke(THREAD).await;
+        assert_eq!(received(&mut incoming).await, turn);
+        messenger.wait_status("working").await;
+        transport.finish.add_permits(1);
+        received(&mut updates).await;
+        idle(&runner).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::resume();
+        assert_eq!(*messenger.statuses.lock().await, vec!["working"]);
+        gate.add_permits(1);
+        messenger.wait_status("completed").await;
+        assert_eq!(
+            *messenger.status_attempts.lock().await,
+            vec!["working", "completed"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_completion_retries_without_a_new_turn() {
+        let messenger = Arc::new(FakeMessenger {
+            fail_status: true.into(),
+            ..FakeMessenger::default()
+        });
+        let statuses = ThreadStatusReconciler {
+            messenger: messenger.clone(),
+            senders: Arc::new(StdMutex::new(HashMap::new())),
+        };
+        statuses.set(THREAD, ThreadStatus::Completed);
+        messenger.wait_status_attempts(1).await;
+        messenger
+            .fail_status
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        messenger.wait_status("completed").await;
+        assert_eq!(
+            *messenger.status_attempts.lock().await,
+            vec!["completed", "completed"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_requests_have_a_long_bound_and_retry_exhaustion_is_finite() {
+        let (updating, mut updates) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let messenger = Arc::new(FakeMessenger {
+            status_gate: Some(("completed", updating, gate)),
+            ..FakeMessenger::default()
+        });
+        let statuses = ThreadStatusReconciler {
+            messenger: messenger.clone(),
+            senders: Arc::new(StdMutex::new(HashMap::new())),
+        };
+        statuses.set(THREAD, ThreadStatus::Completed);
+        let sender = statuses.senders.lock().unwrap()[&THREAD].clone();
+        for _ in 1..=MAX_STATUS_ATTEMPTS {
+            // The paused clock advances through backoff while waiting for the
+            // observable start of each request, never through its long timeout.
+            timeout(STATUS_WORKER_IDLE_TIMEOUT, updates.recv())
+                .await
+                .expect("thread status retry stalled")
+                .expect("thread status worker stopped");
+            tokio::time::advance(STATUS_REQUEST_TIMEOUT).await;
         }
+        timeout(STATUS_WORKER_IDLE_TIMEOUT + Duration::from_secs(1), sender.closed())
+            .await
+            .expect("exhausted title worker did not retire");
+        assert!(statuses.senders.lock().unwrap().is_empty());
+        assert_eq!(
+            messenger.status_attempts.lock().await.len(),
+            MAX_STATUS_ATTEMPTS as usize
+        );
+        assert!(messenger.statuses.lock().await.is_empty());
+        statuses.set(THREAD, ThreadStatus::Working);
+        messenger.wait_status("working").await;
+    }
+
+    #[tokio::test]
+    async fn dropping_an_idle_runner_cancels_pending_title_work() {
+        let (_directory, store) = fixture().await;
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let transport = Arc::new(ControlledTransport::new(observed, false));
+        let (updating, mut updates) = mpsc::unbounded_channel();
+        let messenger = Arc::new(FakeMessenger {
+            status_gate: Some(("completed", updating, Arc::new(Semaphore::new(0)))),
+            ..FakeMessenger::default()
+        });
+        let runner = ThreadQueueRunner::new(store.clone(), transport.clone(), messenger, 1_900, 1);
+        let turn = enqueue(&store, 20).await;
+        runner.poke(THREAD).await;
+        assert_eq!(received(&mut incoming).await, turn);
+        transport.finish.add_permits(1);
+        received(&mut updates).await;
+        idle(&runner).await;
+        let weak = Arc::downgrade(&runner);
+        drop(runner);
+        assert!(
+            timeout(Duration::from_secs(3), updates.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(weak.upgrade().is_none());
     }
 
     #[tokio::test]
@@ -1468,16 +1700,11 @@ mod tests {
             TurnStatus::Aborted
         );
         assert_eq!(store.counts(THREAD).await.unwrap().running, 1);
-        assert_eq!(
-            *messenger.statuses.lock().await,
-            vec!["working", "working", "working"]
-        );
+        messenger.wait_status("working").await;
+        assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
         transport.finish.add_permits(1);
         idle(&runner).await;
-        assert_eq!(
-            *messenger.statuses.lock().await,
-            vec!["working", "working", "working", "completed"]
-        );
+        messenger.wait_status("completed").await;
         let final_outcome = store.next_outcome(THREAD, second).await.unwrap().unwrap();
         assert_eq!(final_outcome.id, third);
         assert_eq!(final_outcome.status, TurnStatus::Done);
@@ -1520,10 +1747,7 @@ mod tests {
         idle(&runner).await;
         let counts = store.counts(THREAD).await.unwrap();
         assert_eq!((counts.running, counts.queued, counts.uncertain), (0, 0, 2));
-        assert_eq!(
-            *messenger.statuses.lock().await,
-            vec!["working", "working", "completed"]
-        );
+        messenger.wait_status("completed").await;
         let sent = messenger.sent.lock().await.clone();
         assert_eq!(sent.len(), 2);
         assert!(
@@ -1562,18 +1786,15 @@ mod tests {
         let second = enqueue(&store, 21).await;
         runner.poke(THREAD).await;
         assert_eq!(store.counts(THREAD).await.unwrap().queued, 1);
-        assert_eq!(*messenger.statuses.lock().await, vec!["working"]);
+        messenger.wait_status("working").await;
         gate.add_permits(1);
         assert_eq!(received(&mut incoming).await, second);
-        assert_eq!(*messenger.statuses.lock().await, vec!["working", "working"]);
+        assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
         transport.finish.add_permits(1);
         received(&mut edits).await;
         gate.add_permits(1);
         idle(&runner).await;
-        assert_eq!(
-            *messenger.statuses.lock().await,
-            vec!["working", "working", "completed"]
-        );
+        messenger.wait_status("completed").await;
         assert_eq!(store.counts(THREAD).await.unwrap().running, 0);
         assert_eq!(
             *messenger.sent.lock().await,
@@ -1599,10 +1820,7 @@ mod tests {
         assert_eq!(received(&mut incoming).await, first);
         assert!(runner.stop(THREAD).await.unwrap());
         idle(&runner).await;
-        assert_eq!(
-            *messenger.statuses.lock().await,
-            vec!["working", "completed"]
-        );
+        messenger.wait_status("completed").await;
         assert_eq!(
             store.next_outcome(THREAD, 0).await.unwrap().unwrap().status,
             TurnStatus::Aborted
@@ -1747,7 +1965,7 @@ mod tests {
         let counts = store.counts(THREAD).await.unwrap();
         assert_eq!((counts.queued, counts.running, counts.uncertain), (1, 0, 0));
         assert!(store.next_outcome(THREAD, 0).await.unwrap().is_none());
-        assert!(messenger.status_attempts.lock().await.is_empty());
+        messenger.wait_status("working").await;
     }
 
     #[tokio::test]

@@ -65,16 +65,12 @@ async fn report(
     mut receiver: watch::Receiver<Activity>,
 ) -> Result<()> {
     let started = Instant::now();
-    let initial_label = "Starting OMP";
-    let (created, ()) = tokio::join!(
-        timeout(
-            REQUEST_TIMEOUT,
-            messenger.create_activity(thread_id, "OMP: Starting OMP — 0s elapsed", false),
-        ),
-        report_phase(messenger, thread_id, initial_label),
-    );
-    let mut message_id = created.context("activity creation timed out")??;
-    let mut last_label = initial_label;
+    let mut message_id = timeout(
+        REQUEST_TIMEOUT,
+        messenger.create_activity(thread_id, "OMP: Starting OMP — 0s elapsed", false),
+    )
+    .await
+    .context("activity creation timed out")??;
     let mut ticks = interval_at(Instant::now() + UPDATE_INTERVAL, UPDATE_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -102,32 +98,15 @@ async fn report(
             state.label,
             started.elapsed().as_secs()
         );
-        let (edited, ()) = tokio::join!(
-            timeout(
-                REQUEST_TIMEOUT,
-                messenger.edit_activity(thread_id, message_id, &content, state.finished),
-            ),
-            async {
-                if state.label != last_label {
-                    report_phase(messenger, thread_id, state.label).await;
-                }
-            },
-        );
-        message_id = edited.context("activity edit timed out")??;
-        last_label = state.label;
+        message_id = timeout(
+            REQUEST_TIMEOUT,
+            messenger.edit_activity(thread_id, message_id, &content, state.finished),
+        )
+        .await
+        .context("activity edit timed out")??;
         if state.finished {
             return Ok(());
         }
-    }
-}
-
-async fn report_phase(messenger: &dyn ThreadMessenger, thread_id: ThreadId, label: &str) {
-    let result = timeout(REQUEST_TIMEOUT, messenger.activity_phase(thread_id, label))
-        .await
-        .context("activity phase update timed out")
-        .and_then(|result| result);
-    if let Err(error) = result {
-        tracing::warn!(%thread_id, %error, "activity phase update failed");
     }
 }
 
@@ -141,22 +120,16 @@ mod tests {
 
     struct Messenger {
         events: mpsc::UnboundedSender<(Option<MessageId>, String, bool)>,
-        phases: Option<mpsc::UnboundedSender<String>>,
         fail_edit: bool,
         hang_create: bool,
-        fail_phase: bool,
-        hang_phase: bool,
     }
 
     impl Messenger {
         fn new(events: mpsc::UnboundedSender<(Option<MessageId>, String, bool)>) -> Self {
             Self {
                 events,
-                phases: None,
                 fail_edit: false,
                 hang_create: false,
-                fail_phase: false,
-                hang_phase: false,
             }
         }
     }
@@ -197,17 +170,6 @@ mod tests {
             Ok(MessageId::new(message_id.get() + 1))
         }
 
-        async fn activity_phase(&self, _: ThreadId, label: &str) -> Result<()> {
-            if let Some(phases) = &self.phases {
-                phases.send(label.to_owned())?;
-            }
-            if self.hang_phase {
-                std::future::pending::<()>().await;
-            }
-            anyhow::ensure!(!self.fail_phase, "thread rename denied");
-            Ok(())
-        }
-
         async fn confirm(&self, _: ThreadId, _: ApprovalRequest) -> bool {
             unreachable!()
         }
@@ -234,39 +196,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn coalesces_phases_and_carries_replacement_ids_through_completion() {
+    async fn coalesces_updates_and_carries_replacement_ids_through_completion() {
         let (events, mut received) = mpsc::unbounded_channel();
-        let (phases, mut renamed) = mpsc::unbounded_channel();
         let reporter = ActivityReporter::start(
-            Arc::new(Messenger {
-                phases: Some(phases),
-                ..Messenger::new(events)
-            }),
+            Arc::new(Messenger::new(events)),
             ThreadId::new(1),
         );
         let (id, _, finished) = received.recv().await.unwrap();
         assert_eq!(id, None);
         assert!(!finished);
-        assert_eq!(renamed.recv().await.unwrap(), "Starting OMP");
         reporter.update("Thinking");
         reporter.update("Inspecting files");
         tokio::task::yield_now().await;
         assert!(received.try_recv().is_err());
-        assert!(renamed.try_recv().is_err());
         tokio::time::advance(UPDATE_INTERVAL).await;
         let (id, content, finished) = received.recv().await.unwrap();
         assert_eq!(id, Some(MessageId::new(42)));
         assert!(content.contains("Inspecting files"));
         assert!(content.contains("5s elapsed"));
         assert!(!finished);
-        assert_eq!(renamed.recv().await.unwrap(), "Inspecting files");
         reporter.update("Inspecting files");
         tokio::time::advance(UPDATE_INTERVAL).await;
         let (id, content, finished) = received.recv().await.unwrap();
         assert_eq!(id, Some(MessageId::new(43)));
         assert!(content.contains("10s elapsed"));
         assert!(!finished);
-        assert!(renamed.try_recv().is_err(), "heartbeats must not rename");
         reporter.update("Writing a response");
         let finished_at = Instant::now();
         reporter.finish("OMP completed").await;
@@ -275,9 +229,7 @@ mod tests {
         assert_eq!(id, Some(MessageId::new(44)));
         assert!(content.contains("OMP completed"));
         assert!(finished);
-        assert_eq!(renamed.recv().await.unwrap(), "OMP completed");
         assert!(received.recv().await.is_none(), "no edits after completion");
-        assert!(renamed.recv().await.is_none(), "no renames after completion");
     }
 
     #[tokio::test(start_paused = true)]
@@ -314,62 +266,4 @@ mod tests {
         assert!(received.recv().await.is_none());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn title_failures_preserve_heartbeats_and_terminal_activity() {
-        let (events, mut received) = mpsc::unbounded_channel();
-        let (phases, mut renamed) = mpsc::unbounded_channel();
-        let reporter = ActivityReporter::start(
-            Arc::new(Messenger {
-                phases: Some(phases),
-                fail_phase: true,
-                ..Messenger::new(events)
-            }),
-            ThreadId::new(1),
-        );
-        assert_eq!(received.recv().await.unwrap().0, None);
-        assert_eq!(renamed.recv().await.unwrap(), "Starting OMP");
-        reporter.update("Thinking");
-        tokio::time::advance(UPDATE_INTERVAL).await;
-        let (id, content, finished) = received.recv().await.unwrap();
-        assert_eq!(id, Some(MessageId::new(42)));
-        assert!(content.contains("Thinking"));
-        assert!(!finished);
-        assert_eq!(renamed.recv().await.unwrap(), "Thinking");
-        tokio::time::advance(UPDATE_INTERVAL).await;
-        assert_eq!(received.recv().await.unwrap().0, Some(MessageId::new(43)));
-        assert!(renamed.try_recv().is_err(), "failed phases are not retried");
-        reporter.finish("Failed").await;
-        let (id, content, finished) = received.recv().await.unwrap();
-        assert_eq!(id, Some(MessageId::new(44)));
-        assert!(content.contains("Failed"));
-        assert!(finished);
-        assert_eq!(renamed.recv().await.unwrap(), "Failed");
-        assert!(received.recv().await.is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stalled_titles_do_not_block_card_requests_and_have_bounded_completion() {
-        let (events, mut received) = mpsc::unbounded_channel();
-        let started = Instant::now();
-        let reporter = ActivityReporter::start(
-            Arc::new(Messenger {
-                hang_phase: true,
-                ..Messenger::new(events)
-            }),
-            ThreadId::new(1),
-        );
-        assert_eq!(received.recv().await.unwrap().0, None);
-        assert_eq!(started.elapsed(), Duration::ZERO);
-        let completion = tokio::spawn(reporter.finish("Stopped"));
-        tokio::task::yield_now().await;
-        tokio::time::advance(REQUEST_TIMEOUT).await;
-        let (id, content, finished) = received.recv().await.unwrap();
-        assert_eq!(id, Some(MessageId::new(42)));
-        assert!(content.contains("Stopped"));
-        assert!(finished);
-        assert_eq!(started.elapsed(), REQUEST_TIMEOUT);
-        completion.await.unwrap();
-        assert_eq!(started.elapsed(), REQUEST_TIMEOUT * 2);
-        assert!(received.recv().await.is_none());
-    }
 }

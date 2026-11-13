@@ -233,29 +233,7 @@ struct DiscordMessenger {
     config: Arc<AppConfig>,
     store: Store,
     approvals: Arc<ApprovalBroker>,
-    titles: Mutex<HashMap<ThreadId, Arc<tokio::sync::Mutex<ThreadTitle>>>>,
-}
-
-#[derive(Default)]
-struct ThreadTitle {
-    base: String,
-    rendered: String,
-    phase: Option<String>,
-}
-
-impl ThreadTitle {
-    fn observe(&mut self, current: &str) {
-        if self.rendered != current {
-            self.base = strip_activity_phase(current).to_owned();
-        }
-    }
-
-    fn name(&self) -> String {
-        match &self.phase {
-            Some(phase) => activity_thread_name(&self.base, phase),
-            None => self.base.clone(),
-        }
-    }
+    titles: Mutex<HashMap<ThreadId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[async_trait]
@@ -337,27 +315,6 @@ impl ThreadMessenger for DiscordMessenger {
         Ok(message_id)
     }
 
-    async fn activity_phase(&self, thread_id: ThreadId, label: &str) -> Result<()> {
-        let session = self.authorize_thread_title(thread_id).await?;
-        let title = self.title_state(thread_id);
-        let mut title = title.lock().await;
-        if title.phase.as_deref() == Some(label) {
-            return Ok(());
-        }
-        let channel = self.title_channel(&session).await?;
-        title.observe(&channel.name);
-        let name = activity_thread_name(&title.base, label);
-        if name != channel.name {
-            SerenityChannelId::new(thread_id.get())
-                .edit_thread(&self.http, EditThread::new().name(&name))
-                .await
-                .context("failed to update Discord activity phase")?;
-        }
-        title.rendered = name;
-        title.phase = Some(label.to_owned());
-        Ok(())
-    }
-
     async fn confirm(&self, thread_id: ThreadId, request: ApprovalRequest) -> bool {
         match self.confirm_inner(thread_id, request).await {
             Ok(approved) => approved,
@@ -403,16 +360,11 @@ impl ThreadMessenger for DiscordMessenger {
     }
 
     async fn thread_title(&self, thread_id: ThreadId, title: &str, status: &str) -> Result<String> {
-        let base = session_thread_title(title, status)?;
+        let name = session_thread_title(title, status)?;
         self.authorize_thread_title(thread_id).await?;
-        let state = self.title_state(thread_id);
-        let mut state = state.lock().await;
-        state.base = base;
-        if status == "completed" {
-            state.phase = None;
-        }
-        let name = state.name();
+        let lock = self.title_lock(thread_id);
         tokio::time::timeout(Duration::from_secs(10), async {
+            let _guard = lock.lock().await;
             SerenityChannelId::new(thread_id.get())
                 .edit_thread(&self.http, EditThread::new().name(&name))
                 .await
@@ -420,37 +372,26 @@ impl ThreadMessenger for DiscordMessenger {
         .await
         .context("Discord thread title update timed out; outcome unknown")?
         .context("failed to update Discord thread title")?;
-        state.rendered = name.clone();
         Ok(name)
     }
 
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()> {
         let emoji = thread_status_emoji(status)?;
         let session = self.authorize_thread_title(thread_id).await?;
-        let title = self.title_state(thread_id);
-        let mut title = title.lock().await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let channel = self.title_channel(&session).await?;
-            title.observe(&channel.name);
-            title.base = thread_status_name(&title.base, emoji);
-            if status == "completed" {
-                title.phase = None;
-            }
-            let name = title.name();
-            if name != channel.name {
-                channel.id.edit_thread(&self.http, EditThread::new().name(&name)).await
-                    .context("failed to update Discord thread status")?;
-            }
-            title.rendered = name;
-            Ok(())
-        })
-        .await
-        .context("Discord thread status update timed out; outcome unknown")?
+        let lock = self.title_lock(thread_id);
+        let _guard = lock.lock().await;
+        let channel = self.title_channel(&session).await?;
+        let name = thread_status_name(&channel.name, emoji);
+        if name != channel.name {
+            channel.id.edit_thread(&self.http, EditThread::new().name(&name)).await
+                .context("failed to update Discord thread status")?;
+        }
+        Ok(())
     }
 }
 
 impl DiscordMessenger {
-    fn title_state(&self, thread_id: ThreadId) -> Arc<tokio::sync::Mutex<ThreadTitle>> {
+    fn title_lock(&self, thread_id: ThreadId) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(self.titles.lock().expect("thread title lock poisoned")
             .entry(thread_id).or_default())
     }
@@ -1478,22 +1419,6 @@ fn strip_activity_phase(title: &str) -> &str {
         .unwrap_or(title)
 }
 
-fn activity_thread_name(base: &str, label: &str) -> String {
-    let phase: String = label.chars().take(32)
-        .map(|ch| if ch == ']' { ')' } else if ch.is_whitespace() { ' ' } else { ch })
-        .collect();
-    let mut name = format!("[OMP: {phase}] ");
-    let mut remaining = 100 - name.encode_utf16().count();
-    for ch in strip_activity_phase(base).chars() {
-        if ch.len_utf16() > remaining {
-            break;
-        }
-        name.push(ch);
-        remaining -= ch.len_utf16();
-    }
-    name
-}
-
 async fn send_without_mentions(http: &Http, thread_id: ThreadId, content: &str) -> Result<()> {
     let builder = CreateMessage::new()
         .content(operational_content(content))
@@ -1669,52 +1594,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activity_phase_preserves_full_title_and_title_status_hooks() {
+    async fn lifecycle_titles_preserve_full_topic_without_activity_labels() {
         let root = tempfile::tempdir().unwrap();
-        let base = format!("🛠️ {}  ", "Detailed title ".repeat(6));
-        let first = activity_thread_name(&base, "Thinking");
-        let second = activity_thread_name(&base, "Inspecting files");
-        let completed = thread_status_name(&base, "✅");
-        let tool_base = session_thread_title("Renamed by title tool", "working").unwrap();
-        let tool_name = activity_thread_name(&tool_base, "Thinking");
+        let topic = format!("{}  ", "Detailed title ".repeat(6));
+        let legacy = format!("[OMP: Working] 🛠️ {topic}");
+        let working = format!("🛠️ {topic}");
+        let completed = format!("✅ {topic}");
+        let tool_name = "🛠️ Renamed by title tool";
         let response = |name: &str| {
             let mut channel = routing_channel();
             channel.name = name.to_owned();
             serde_json::to_value(channel).unwrap()
         };
         let (http, requests) = discord_api(vec![
-            ("GET", "/channels/3", 200, response(&base)),
-            ("PATCH", "/channels/3", 200, response(&first)),
-            ("GET", "/channels/3", 200, response(&first)),
-            ("PATCH", "/channels/3", 200, response(&second)),
-            ("GET", "/channels/3", 200, response(&second)),
+            ("GET", "/channels/3", 200, response(&legacy)),
+            ("PATCH", "/channels/3", 200, response(&working)),
+            ("GET", "/channels/3", 200, response(&working)),
             ("PATCH", "/channels/3", 200, response(&completed)),
             ("GET", "/channels/3", 200, response(&completed)),
-            ("PATCH", "/channels/3", 200, response(&activity_thread_name(&completed, "Thinking"))),
-            ("PATCH", "/channels/3", 200, response(&tool_name)),
-            ("GET", "/channels/3", 200, response(&tool_name)),
+            ("PATCH", "/channels/3", 200, response(tool_name)),
+            ("GET", "/channels/3", 200, response(tool_name)),
             ("PATCH", "/channels/3", 200, response("✅ Renamed by title tool")),
         ]);
         let messenger = participants_messenger(root.path(), http).await;
-        messenger.activity_phase(ThreadId::new(3), "Thinking").await.unwrap();
-        messenger.activity_phase(ThreadId::new(3), "Thinking").await.unwrap();
-        messenger.activity_phase(ThreadId::new(3), "Inspecting files").await.unwrap();
+        messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
         messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
-        messenger.activity_phase(ThreadId::new(3), "Thinking").await.unwrap();
+        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
         assert_eq!(messenger.thread_title(
-            ThreadId::new(3), "Renamed by title tool", "working",
+            ThreadId::new(3), "[OMP: Thinking] Renamed by title tool", "working",
         ).await.unwrap(), tool_name);
         messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
         let bodies = requests.join().unwrap();
-        assert_eq!(bodies[1]["name"], first);
-        assert_eq!(bodies[3]["name"], second);
-        assert_eq!(bodies[5]["name"], completed);
-        assert_eq!(bodies[8]["name"], tool_name);
-        assert_eq!(bodies[10]["name"], "✅ Renamed by title tool");
+        assert_eq!(bodies[1]["name"], working);
+        assert_eq!(bodies[3]["name"], completed);
+        assert_eq!(bodies[5]["name"], tool_name);
+        assert_eq!(bodies[7]["name"], "✅ Renamed by title tool");
     }
 
     #[tokio::test]
-    async fn activity_phase_authorizes_and_checks_thread_identity() {
+    async fn failed_status_update_leaves_live_title_authoritative() {
+        let root = tempfile::tempdir().unwrap();
+        let response = |name: &str| {
+            let mut channel = routing_channel();
+            channel.name = name.to_owned();
+            serde_json::to_value(channel).unwrap()
+        };
+        let (http, requests) = discord_api(vec![
+            ("GET", "/channels/3", 200, response("🛠️ Original topic")),
+            ("PATCH", "/channels/3", 403, serde_json::json!({
+                "code": 50013, "message": "Missing Permissions",
+            })),
+            ("GET", "/channels/3", 200, response("🛠️ Externally updated topic")),
+            ("PATCH", "/channels/3", 200, response("✅ Externally updated topic")),
+        ]);
+        let messenger = participants_messenger(root.path(), http).await;
+        assert!(messenger.thread_status(ThreadId::new(3), "completed").await.is_err());
+        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
+        let bodies = requests.join().unwrap();
+        assert_eq!(bodies[1]["name"], "✅ Original topic");
+        assert_eq!(bodies[3]["name"], "✅ Externally updated topic");
+    }
+
+    #[tokio::test]
+    async fn thread_status_authorizes_and_checks_thread_identity() {
         let root = tempfile::tempdir().unwrap();
         let mut channel = routing_channel();
         channel.parent_id = Some(SerenityChannelId::new(9));
@@ -1722,17 +1664,15 @@ mod tests {
             ("GET", "/channels/3", 200, serde_json::to_value(channel).unwrap()),
         ]);
         let messenger = participants_messenger(root.path(), http).await;
-        assert!(messenger.activity_phase(ThreadId::new(4), "Thinking").await
+        assert!(messenger.thread_status(ThreadId::new(4), "working").await
             .unwrap_err().to_string().contains("unknown Discord thread"));
-        assert!(messenger.activity_phase(ThreadId::new(3), "Thinking").await
+        assert!(messenger.thread_status(ThreadId::new(3), "working").await
             .unwrap_err().to_string().contains("inconsistent thread identity"));
         assert_eq!(requests.join().unwrap(), vec![serde_json::Value::Null]);
     }
 
     #[test]
-    fn activity_prefix_is_bounded_and_removed_from_explicit_title_input() {
-        let name = activity_thread_name(&"🦀".repeat(100), &"🦀".repeat(50));
-        assert!(name.encode_utf16().count() <= 100);
+    fn legacy_activity_prefix_is_removed_from_explicit_title_input() {
         assert_eq!(
             session_thread_title("[OMP: Thinking] 🛠️ Meaningful title", "completed").unwrap(),
             "✅ Meaningful title",
@@ -1847,6 +1787,19 @@ mod tests {
         }
         assert!(session_thread_title("🧠 ", "working").is_err());
         assert!(session_thread_title("Repair bridge", "failed").is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_title_deadline_includes_pending_lifecycle_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![]);
+        let messenger = participants_messenger(root.path(), http).await;
+        let lock = messenger.title_lock(ThreadId::new(3));
+        let _pending_lifecycle = lock.lock().await;
+        tokio::time::pause();
+        let result = messenger.thread_title(ThreadId::new(3), "Repair bridge", "working").await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(requests.join().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2371,13 +2324,22 @@ mod tests {
     fn discord_api(
         responses: Vec<(&'static str, &'static str, u16, serde_json::Value)>,
     ) -> (Arc<Http>, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        discord_api_with_title_updates(responses, false)
+    }
+
+    fn discord_api_with_title_updates(
+        responses: Vec<(&'static str, &'static str, u16, serde_json::Value)>,
+        allow_title_updates: bool,
+    ) -> (Arc<Http>, std::thread::JoinHandle<Vec<serde_json::Value>>) {
         use std::io::Read as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let worker = std::thread::spawn(move || {
             let mut bodies = Vec::new();
-            for (method, path, status, response) in responses {
+            let mut responses = responses.into_iter().peekable();
+            let mut channel = routing_channel();
+            while let Some((method, path, _, _)) = responses.peek() {
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -2407,8 +2369,13 @@ mod tests {
                 let headers = String::from_utf8(request).unwrap();
                 let first = headers.lines().next().unwrap();
                 let mut parts = first.split_whitespace();
-                assert_eq!(parts.next(), Some(method));
-                assert!(parts.next().unwrap().ends_with(path), "{first}");
+                let actual_method = parts.next().unwrap();
+                let actual_path = parts.next().unwrap();
+                let expected = actual_method == *method && actual_path.ends_with(path);
+                let lifecycle = !expected && allow_title_updates
+                    && actual_path.ends_with("/channels/3")
+                    && matches!(actual_method, "GET" | "PATCH");
+                assert!(expected || lifecycle, "unexpected request: {first}; expected {method} {path}");
                 let length = headers
                     .lines()
                     .find_map(|line| {
@@ -2419,11 +2386,21 @@ mod tests {
                     .unwrap_or(0);
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).unwrap();
-                bodies.push(if body.is_empty() {
+                let body = if body.is_empty() {
                     serde_json::Value::Null
                 } else {
                     serde_json::from_slice(&body).unwrap()
-                });
+                };
+                let (status, response) = if lifecycle {
+                    if actual_method == "PATCH" {
+                        channel.name = body["name"].as_str().unwrap().to_owned();
+                    }
+                    (200, serde_json::to_value(&channel).unwrap())
+                } else {
+                    bodies.push(body);
+                    let (_, _, status, response) = responses.next().unwrap();
+                    (status, response)
+                };
                 let body = if status == 204 {
                     String::new()
                 } else {
@@ -2477,7 +2454,7 @@ mod tests {
         for bot in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let channel = serde_json::to_value(routing_channel()).unwrap();
-            let (http, requests) = discord_api(vec![
+            let (http, requests) = discord_api_with_title_updates(vec![
                 ("GET", "/channels/3", 200, channel),
                 (
                     "PUT",
@@ -2485,7 +2462,7 @@ mod tests {
                     204,
                     serde_json::Value::Null,
                 ),
-            ]);
+            ], true);
             let handler = routing_handler(root.path(), http.clone()).await;
             let mut message = routing_message(bot, "<@9>");
             if bot {
@@ -2516,7 +2493,7 @@ mod tests {
     #[tokio::test]
     async fn handler_adoption_feeds_peer_message_once() {
         let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api(vec![
+        let (http, requests) = discord_api_with_title_updates(vec![
             (
                 "GET",
                 "/channels/3",
@@ -2535,7 +2512,7 @@ mod tests {
                 200,
                 serde_json::to_value(routing_message(true, "accepted")).unwrap(),
             ),
-        ]);
+        ], true);
         let handler = routing_handler(root.path(), http.clone()).await;
         let message = routing_message(true, "<@9> review this");
         handler.handle_message(&http, &message).await.unwrap();
@@ -2832,7 +2809,7 @@ mod tests {
                 requests.push(get_user);
             }
             requests.push(post);
-            discord_api(requests)
+            discord_api_with_title_updates(requests, true)
         }
         async fn finish_peer(handler: &DiscordHandler, author: u64) {
             let turn = handler

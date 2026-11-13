@@ -319,12 +319,17 @@ updates. Discord permissions and rename rate limits apply. Tool failures are
 returned to the agent; automatic-update failures are logged without blocking
 turn processing. The bot must own the thread or have Manage Threads permission.
 
-During a run, `[OMP: <phase>]` appears before the meaningful thread title,
-so the current phase remains discoverable while reading older messages. Phase
-updates follow the activity reporter's coalescing, rather than renaming for every
-tool event. An unchanged phase does not trigger another rename. Title-update
-failures are logged independently and do not stop activity cards or model work.
-The idle status hook removes the transient phase when the queue settles.
+Titles use only the status emoji and topic; detailed activity stays in the rolling
+card. The earlier `[OMP: <phase>]` prefix is removed on the next title update.
+Automatic lifecycle updates are reconciled independently of message delivery,
+so Discord rate-limit waits do not block turns or discard the desired idle emoji
+after ten seconds. New work supersedes a pending idle update. The displayed emoji
+can lag while Discord limits renames; it is not an instantaneous activity signal.
+Each automatic request may wait up to fifteen minutes; failed requests get at most
+five attempts with exponential backoff. Exhaustion is logged, and a later lifecycle
+change can publish a new desired state. Desired title state is process-local and
+is not replayed after restart. Explicit title-tool calls retain a ten-second limit,
+including waiting behind another rename.
 
 Thread controls must be the complete message:
 
