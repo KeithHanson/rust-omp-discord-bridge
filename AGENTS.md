@@ -2,7 +2,7 @@
 
 ## Product invariant
 
-A permitted Discord user mentions the bot in an allowed parent channel and receives one managed Discord thread backed by one OMP session. Messages accepted in that thread execute against the same OMP conversation, in order, until the user explicitly starts a new session or stops it.
+A permitted Discord user mentions the bot in an allowed parent channel and receives one managed Discord thread backed by one OMP session. Messages accepted in that thread are durably admitted in order. A newer ordinary message interrupts active work through OMP's native `abort_and_prompt`, preserving the conversation until the user explicitly starts a new session or stops it.
 
 Do not claim session persistence merely because a Discord thread mapping survives. Persistence means a daemon restart resumes the same OMP conversation with its prior context. A Discord message must never execute twice because of gateway redelivery, reconnect, or restart recovery.
 
@@ -15,7 +15,7 @@ This repository is the Rust implementation. The JavaScript `CarterMcAlister/omp-
 - it buffers agent text rather than streaming live updates;
 - it automatically accepts OMP permission requests.
 
-No OMP transport has been selected here yet. Do not silently make ACP, terminal scraping, session-file mutation, or the collaboration protocol the permanent boundary. Select a transport from current OMP capabilities, record the contract, and prove new-session, resume, cancel, steering, compaction, tool events, and approval behavior with the real OMP process before building higher layers on it.
+The transport is OMP's `rpc-ui` JSONL protocol, verified against OMP 18.20.0. Preserve the correlation, interruption, persistence, cancellation, tool-event, and approval contracts documented in `docs/omp-rpc.md`; do not replace this boundary with ACP, terminal scraping, session-file mutation, or the collaboration protocol without proving the equivalent behavior.
 
 ## Required behavior
 
@@ -24,7 +24,7 @@ Preserve these invariants as the implementation grows:
 - A mention in an allowed parent channel creates exactly one thread and one durable session record.
 - Only configured guilds, parent channels, and users may create or control sessions.
 - Every accepted Discord message is keyed by its Discord message ID and processed at most once.
-- Turns for one OMP session are serialized in acceptance order.
+- Prompt admission for one OMP session is ordered; newer prompts request cancellation of active work before replacing it in the same process. Do not wait for natural turn completion, silently discard rapid messages, or mistake an old turn's terminal event for the replacement's completion.
 - Independent sessions may run concurrently up to one explicit global limit.
 - Queue, session, and delivery state survive clean and unclean daemon restarts.
 - Recovery distinguishes work known not to have started from work with an uncertain outcome. Never blindly replay an uncertain coding-agent turn.
@@ -35,7 +35,7 @@ Preserve these invariants as the implementation grows:
 
 ## Security gates
 
-- Read the Discord token from an environment variable or secret provider. Never accept it in a checked-in config file or command-line argument.
+- Read the Discord token from the protected regular file referenced by `discord.token_file`. On Unix it must grant no group/other access; reject empty files, files over 4096 bytes, and tokens containing whitespace after trimming trailing CR/LF. Keep the file outside the repository; never put the token itself in TOML, command-line arguments, logs, or OMP's environment. The local `.env` launcher must materialize the same protected-file contract rather than add a second runtime token source.
 - Resolve and validate configured working directories before starting OMP. Prevent path traversal and symlink escape from an allowed root.
 - Treat Discord message text, embeds, filenames, attachment metadata, URLs, slash-command values, and OMP output as untrusted input.
 - Do not log tokens, authorization headers, message bodies, attachment URLs with access signatures, or OMP secrets. Diagnostic content logging must be explicit and off by default.

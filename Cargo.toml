@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tempfile = "3.23"
+tokio = { version = "1.54", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

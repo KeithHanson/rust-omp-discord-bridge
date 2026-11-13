@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -18,12 +18,12 @@ use serenity::{
     all::{
         Attachment, AutoArchiveDuration, ButtonStyle, ChannelId as SerenityChannelId, Client,
         Context, CreateAllowedMentions, CreateButton, CreateInteractionResponse,
-        CreateInteractionResponseMessage, CreateMessage, CreateThread, Embed, EventHandler,
-        GatewayIntents, GetMessages, Http, Interaction, Message, Ready, Timestamp,
+        CreateInteractionResponseMessage, CreateMessage, CreateThread, EditMessage, Embed,
+        EventHandler, GatewayIntents, GetMessages, Http, Interaction, Message, Ready, Timestamp,
     },
     builder::Builder,
 };
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 
 use crate::{
     config::{AppConfig, GuildPolicy},
@@ -122,7 +122,38 @@ struct ApprovalBroker {
 
 struct PendingApproval {
     thread_id: ThreadId,
+    message_id: Option<MessageId>,
     sender: oneshot::Sender<bool>,
+}
+
+struct ApprovalRegistration<'a> {
+    broker: &'a ApprovalBroker,
+    id: String,
+    receiver: oneshot::Receiver<bool>,
+}
+
+impl ApprovalRegistration<'_> {
+    fn bind_message(&self, message_id: MessageId) {
+        if let Some(request) = self
+            .broker
+            .pending
+            .lock()
+            .expect("approval broker poisoned")
+            .get_mut(&self.id)
+        {
+            request.message_id = Some(message_id);
+        }
+    }
+}
+
+impl Drop for ApprovalRegistration<'_> {
+    fn drop(&mut self) {
+        self.broker
+            .pending
+            .lock()
+            .expect("approval broker poisoned")
+            .remove(&self.id);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,20 +166,32 @@ enum ApprovalResolution {
 }
 
 impl ApprovalBroker {
-    async fn register(&self, thread_id: ThreadId) -> (String, oneshot::Receiver<bool>) {
+    fn register(&self, thread_id: ThreadId) -> ApprovalRegistration<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let (sender, receiver) = oneshot::channel();
         self.pending
             .lock()
-            .await
-            .insert(id.clone(), PendingApproval { thread_id, sender });
-        (id, receiver)
+            .expect("approval broker poisoned")
+            .insert(
+                id.clone(),
+                PendingApproval {
+                    thread_id,
+                    message_id: None,
+                    sender,
+                },
+            );
+        ApprovalRegistration {
+            broker: self,
+            id,
+            receiver,
+        }
     }
 
-    async fn resolve(
+    fn resolve(
         &self,
         custom_id: &str,
         interaction_thread: ThreadId,
+        interaction_message: MessageId,
         authorized: bool,
     ) -> ApprovalResolution {
         let Some((id, decision)) = parse_approval_custom_id(custom_id) else {
@@ -157,25 +200,28 @@ impl ApprovalBroker {
         if !authorized {
             return ApprovalResolution::Unauthorized;
         }
-        let mut pending = self.pending.lock().await;
+        let mut pending = self.pending.lock().expect("approval broker poisoned");
         let Some(request) = pending.get(id) else {
             return ApprovalResolution::Expired;
         };
         if request.thread_id != interaction_thread {
             return ApprovalResolution::Unauthorized;
         }
+        // The counter restarts with the daemon. Old Discord buttons must not
+        // authorize a new request that happens to reuse the same custom ID.
+        if request.message_id != Some(interaction_message) {
+            return ApprovalResolution::Expired;
+        }
         let request = pending.remove(id).expect("pending approval disappeared");
         let approved = decision == "approve";
-        let _ = request.sender.send(approved);
+        if request.sender.send(approved).is_err() {
+            return ApprovalResolution::Expired;
+        }
         if approved {
             ApprovalResolution::Approved
         } else {
             ApprovalResolution::Denied
         }
-    }
-
-    async fn expire(&self, id: &str) {
-        self.pending.lock().await.remove(id);
     }
 }
 
@@ -193,9 +239,32 @@ impl ThreadMessenger for DiscordMessenger {
         Ok(())
     }
 
-    async fn typing(&self, thread_id: ThreadId) -> Result<()> {
+    async fn create_activity(&self, thread_id: ThreadId, content: &str) -> Result<MessageId> {
+        let message = SerenityChannelId::new(thread_id.get())
+            .send_message(
+                &self.http,
+                CreateMessage::new()
+                    .content(content)
+                    .allowed_mentions(CreateAllowedMentions::new()),
+            )
+            .await?;
+        Ok(MessageId::new(message.id.get()))
+    }
+
+    async fn edit_activity(
+        &self,
+        thread_id: ThreadId,
+        message_id: MessageId,
+        content: &str,
+    ) -> Result<()> {
         SerenityChannelId::new(thread_id.get())
-            .broadcast_typing(&self.http)
+            .edit_message(
+                &self.http,
+                serenity::all::MessageId::new(message_id.get()),
+                EditMessage::new()
+                    .content(content)
+                    .allowed_mentions(CreateAllowedMentions::new()),
+            )
             .await?;
         Ok(())
     }
@@ -246,7 +315,8 @@ impl DiscordMessenger {
             return Ok(false);
         }
 
-        let (id, receiver) = self.approvals.register(thread_id).await;
+        let mut registration = self.approvals.register(thread_id);
+        let id = &registration.id;
         let heading = render_approval(&request);
         let chunks = chunk_message(&heading, self.config.runtime.discord_message_limit);
         for chunk in chunks.iter().take(chunks.len().saturating_sub(1)) {
@@ -268,12 +338,12 @@ impl DiscordMessenger {
                     .label("Deny")
                     .style(ButtonStyle::Danger),
             );
-        SerenityChannelId::new(thread_id.get())
+        let sent = SerenityChannelId::new(thread_id.get())
             .send_message(&self.http, message)
             .await?;
+        registration.bind_message(MessageId::new(sent.id.get()));
 
-        let decision = tokio::time::timeout(APPROVAL_TIMEOUT, receiver).await;
-        self.approvals.expire(&id).await;
+        let decision = tokio::time::timeout(APPROVAL_TIMEOUT, &mut registration.receiver).await;
         Ok(matches!(decision, Ok(Ok(true))))
     }
 
@@ -552,10 +622,12 @@ impl EventHandler for DiscordHandler {
                 false
             }
         };
-        let resolution = self
-            .approvals
-            .resolve(&component.data.custom_id, thread_id, authorized)
-            .await;
+        let resolution = self.approvals.resolve(
+            &component.data.custom_id,
+            thread_id,
+            MessageId::new(component.message.id.get()),
+            authorized,
+        );
         let (content, ephemeral) = match resolution {
             ApprovalResolution::Approved => ("OMP action approved once.", false),
             ApprovalResolution::Denied => ("OMP action denied.", false),
@@ -718,7 +790,9 @@ impl DiscordHandler {
         match parse_control(&message.content) {
             Some(Control::Status) => {
                 let status = self.runner.status(session.thread_id).await?;
-                send_without_mentions(&context.http, session.thread_id, &status).await?;
+                for chunk in chunk_message(&status, self.config.runtime.discord_message_limit) {
+                    send_without_mentions(&context.http, session.thread_id, &chunk).await?;
+                }
                 return Ok(());
             }
             Some(Control::Stop) => {
@@ -764,7 +838,7 @@ impl DiscordHandler {
                 send_without_mentions(
                     &context.http,
                     session.thread_id,
-                    &format!("Cannot queue OMP turn: {error}"),
+                    &format!("Cannot accept OMP message: {error}"),
                 )
                 .await?;
                 return Ok(());
@@ -781,18 +855,27 @@ impl DiscordHandler {
                 UserId::new(message.author.id.get()),
                 &prompt,
             )
-            .await?
+            .await
         {
-            EnqueueResult::Enqueued(_) => {
-                let counts = self.store.counts(session.thread_id).await?;
-                let response = format!(
-                    "Queued OMP turn: {} running, {} queued.",
-                    counts.running, counts.queued
-                );
-                send_without_mentions(&context.http, session.thread_id, &response).await?;
+            Ok(EnqueueResult::Enqueued(_)) => {
+                // Wake the RPC loop before any Discord HTTP acknowledgement.
                 self.runner.poke(session.thread_id).await;
+                send_without_mentions(
+                    &context.http,
+                    session.thread_id,
+                    "Message accepted. Active work in this thread will be interrupted.",
+                )
+                .await?;
             }
-            EnqueueResult::Duplicate => {}
+            Ok(EnqueueResult::Duplicate) => {}
+            Err(error) => {
+                send_without_mentions(
+                    &context.http,
+                    session.thread_id,
+                    &format!("Cannot accept OMP message: {error}"),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -931,20 +1014,82 @@ mod tests {
     async fn authorized_approval_is_one_shot_and_thread_bound() {
         let broker = ApprovalBroker::default();
         let thread_id = ThreadId::new(10);
-        let (id, receiver) = broker.register(thread_id).await;
-        let custom_id = format!("omp-approval:{id}:approve");
+        let mut registration = broker.register(thread_id);
+        let message_id = MessageId::new(100);
+        registration.bind_message(message_id);
+        let custom_id = format!("omp-approval:{}:approve", registration.id);
 
         assert_eq!(
-            broker.resolve(&custom_id, ThreadId::new(11), true).await,
+            broker.resolve(&custom_id, ThreadId::new(11), message_id, true),
             ApprovalResolution::Unauthorized
         );
         assert_eq!(
-            broker.resolve(&custom_id, thread_id, true).await,
+            broker.resolve(&custom_id, thread_id, message_id, false),
+            ApprovalResolution::Unauthorized
+        );
+        assert_eq!(
+            broker.resolve(&custom_id, thread_id, message_id, true),
             ApprovalResolution::Approved
         );
-        assert!(receiver.await.expect("approval decision"));
+        assert!(
+            (&mut registration.receiver)
+                .await
+                .expect("approval decision")
+        );
         assert_eq!(
-            broker.resolve(&custom_id, thread_id, true).await,
+            broker.resolve(&custom_id, thread_id, message_id, true),
+            ApprovalResolution::Expired
+        );
+    }
+
+    #[test]
+    fn cancelled_approval_wait_invalidates_its_buttons_immediately() {
+        let broker = ApprovalBroker::default();
+        let thread_id = ThreadId::new(10);
+        let registration = broker.register(thread_id);
+        let custom_id = format!("omp-approval:{}:approve", registration.id);
+        drop(registration);
+        assert_eq!(
+            broker.resolve(&custom_id, thread_id, MessageId::new(100), true),
+            ApprovalResolution::Expired
+        );
+        assert!(broker.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_buttons_cannot_authorize_a_reused_id_after_restart() {
+        let thread = ThreadId::new(10);
+        let old_broker = ApprovalBroker::default();
+        let old = old_broker.register(thread);
+        old.bind_message(MessageId::new(100));
+        let custom_id = format!("omp-approval:{}:approve", old.id);
+        drop(old);
+        drop(old_broker);
+
+        let broker = ApprovalBroker::default();
+        let mut current = broker.register(thread);
+        assert_eq!(custom_id, format!("omp-approval:{}:approve", current.id));
+        assert_eq!(
+            broker.resolve(&custom_id, thread, MessageId::new(100), true),
+            ApprovalResolution::Expired
+        );
+        current.bind_message(MessageId::new(101));
+        assert_eq!(
+            broker.resolve(&custom_id, thread, MessageId::new(100), true),
+            ApprovalResolution::Expired
+        );
+        assert_eq!(
+            broker.resolve(
+                &format!("omp-approval:{}:deny", current.id),
+                thread,
+                MessageId::new(101),
+                true,
+            ),
+            ApprovalResolution::Denied
+        );
+        assert!(!(&mut current.receiver).await.unwrap());
+        assert_eq!(
+            broker.resolve(&custom_id, thread, MessageId::new(101), true),
             ApprovalResolution::Expired
         );
     }

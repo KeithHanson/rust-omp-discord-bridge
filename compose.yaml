@@ -6,7 +6,7 @@ services:
       context: .
       args:
         RUST_VERSION: "${RUST_VERSION:-1.99.1}"
-        OMP_VERSION: "${OMP_VERSION:-18.18.0}"
+        OMP_VERSION: "${OMP_VERSION:-18.20.0}"
     image: omp-discord-bridge:local
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:

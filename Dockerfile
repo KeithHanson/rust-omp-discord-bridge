@@ -6,11 +6,11 @@ FROM rust:${RUST_VERSION}-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --locked --release
+RUN cargo build --locked --release --bin omp-discord-bridge
 
 FROM debian:bookworm-slim AS omp-installer
 
-ARG OMP_VERSION=18.18.0
+ARG OMP_VERSION=18.20.0
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \

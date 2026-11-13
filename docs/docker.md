@@ -71,7 +71,7 @@ Back up `BRIDGE_DATA_DIR` together with the workspace. The data directory contai
 To change pinned build versions for a deliberate upgrade:
 
 ```bash
-RUST_VERSION=1.99.1 OMP_VERSION=18.18.0 docker compose build --pull bridge
+RUST_VERSION=1.99.1 OMP_VERSION=18.20.0 docker compose build --pull bridge
 ```
 
 Run `docker compose run --rm bridge check` after every image, configuration, credential, or mount change before restarting the gateway.

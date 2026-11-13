@@ -2,16 +2,17 @@
 
 Rust Discord gateway for persistent, thread-scoped OMP sessions.
 
-A permitted user mentions the bot in an allowed parent channel. The bridge creates a Discord thread, starts an OMP conversation for that thread, serializes follow-up messages, and resumes the same saved OMP session across turns and daemon restarts.
+A permitted user mentions the bot in an allowed parent channel. The bridge creates a Discord thread, starts an OMP conversation for that thread, interrupts active work when a newer message arrives, and resumes the same saved OMP session across idle periods and daemon restarts.
 
 ## Current behavior
 
 - mention-to-thread session creation;
 - explicit guild, parent-channel, and user allowlists;
 - durable SQLite session and turn state;
-- per-thread FIFO execution with bounded global concurrency;
+- ordered, durable message admission with immediate interruption of active work and bounded global concurrency;
 - real OMP resume through its native RPC protocol;
 - one-shot Discord approval buttons for OMP writes and executable actions;
+- one editable activity message per active conversation run, including replacement turns, with assistant messages delivered as they complete;
 - `status`, `stop`, and `new` controls inside managed threads;
 - duplicate Discord message rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
@@ -19,6 +20,19 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - on-demand OMP access to bounded parent-channel message history.
 
 Attachment bytes are not downloaded by the bridge. OMP receives the Discord CDN URL, filename, content type, and byte count as untrusted prompt context.
+
+Activity messages show fixed, public labels for thinking, file inspection, tool
+execution, response writing, approval waits, interruption, retries, and compaction.
+Updates are coalesced every five seconds, including elapsed-time refreshes during
+quiet work. The activity message remains live while newer messages replace earlier
+turns; completion, cancellation, failure, and uncertain outcomes finalize it.
+Tool arguments, tool output, and reasoning content are never included.
+
+Activity delivery is best-effort: a failed or timed-out create/edit is logged and
+disables further status updates for that turn without interrupting OMP or replaying
+work. Each request has a ten-second deadline. Assistant text is delivered in separate
+messages. After a process crash, an old activity message can remain stale; use
+`status` to inspect durable turn state. Activity message IDs are not persisted.
 
 ## Prerequisites
 
@@ -28,7 +42,7 @@ Install Rust with `rustup`:
 rustup toolchain install stable --profile minimal --component rustfmt,clippy
 ```
 
-Install and authenticate OMP, then verify `omp --version` succeeds. The bridge uses `omp --mode rpc-ui`; it does not use ACP.
+Install and authenticate OMP **18.20.0 or newer**, then verify `omp --version` succeeds. The bridge uses `omp --mode rpc-ui` and correlated `prompt_result` completion events; it does not use ACP.
 
 Create a Discord application and bot with:
 
@@ -135,9 +149,37 @@ the unit, reinstall it with `sudo install -m 644 omp-discord-bridge.service
 /etc/systemd/system/omp-discord-bridge.service`, run `sudo systemctl daemon-reload`,
 then restart. Do not launch a second bridge manually against the same database.
 
+When this service carries your current conversation, build a candidate separately
+so the running release stays untouched:
+
+```bash
+cargo build --locked --release --bins --target-dir target/activity-release
+```
+
+Wait for all activity messages to finalize and for all active turns to finish before
+deploying from a local terminal. A streamed final answer can arrive before its turn
+has settled. Stopping the service during a turn interrupts its OMP process;
+recovery marks that turn uncertain rather than replaying it.
+
+```bash
+sudo systemctl stop omp-discord-bridge
+install -m 755 target/activity-release/release/omp-discord-bridge target/release/
+install -m 755 target/activity-release/release/bridge-local target/release/
+sudo systemctl start omp-discord-bridge
+```
+
+### Scheduled improvement reviews
+
+The separate `omp-session-review.timer` runs a proposal-only session review every
+eight hours, without connecting to Discord or restarting the bridge. Empty windows
+exit without a model call. Reports and suggested instruction/documentation changes
+remain local under `~/docs/session-reviews/`; nothing is applied automatically.
+See [scheduled session review](docs/session-review.md) for installation, privacy
+limits, coverage, and operating commands.
+
 ## Docker
 
-`Dockerfile` builds the bridge with Rust 1.99.1 and installs the checksum-verified OMP 18.18.0 binary. `compose.yaml` runs it as a non-root host UID/GID with bind-mounted configuration, durable data, and workspace directories:
+`Dockerfile` builds the bridge with Rust 1.99.1 and installs the checksum-verified OMP 18.20.0 binary. `compose.yaml` runs it as a non-root host UID/GID with bind-mounted configuration, durable data, and workspace directories:
 
 ```bash
 export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
@@ -154,9 +196,33 @@ The default mounts are `./container/config:/config:ro`, `./container/data:/data`
 ## Discord workflow
 
 1. In an allowed parent channel, mention the bot and include a prompt.
-2. The bot creates a thread and queues the prompt.
-3. Continue sending prompts in that thread without mentioning the bot.
-4. When the OMP project configuration requires approval for a write or executable action, an authorized user chooses **Approve once** or **Deny**. Requests expire after five minutes.
+2. The bot creates a thread and starts the prompt when a concurrency slot is available.
+3. Continue sending messages in that thread without mentioning the bot. A newer message immediately requests interruption with OMP's native `abort_and_prompt`, then runs in the same live process and conversation.
+4. When the OMP project configuration requires approval for a write or executable action, an authorized user chooses **Approve once** or **Deny**. Requests expire after five minutes; interruption also expires the old request immediately.
+
+Interruption is cooperative: a running tool may need time to stop, and completed
+file changes or external actions are not rolled back. Rapid messages are retained
+in admission order, not combined or silently replaced. The bridge allows one active
+prompt plus one pending interrupt command; further messages are dispatched as soon
+as an earlier prompt resolves, without waiting for natural turn completion.
+There is a hard limit of 64 queued/running messages per thread; excess messages are
+explicitly rejected, while duplicate Discord deliveries remain harmless.
+
+Each completed assistant message is sent immediately, including commentary before
+tool calls, rather than waiting for the whole turn to finish. This is message-level
+delivery, not token-by-token editing. Long messages are split for Discord.
+A bounded, ordered delivery worker keeps Discord requests off the RPC loop so
+they do not block interruption. Failed or ambiguous sends are not automatically
+retried; a failed message does not suppress later independent messages.
+
+Already-posted messages remain visible if their turn is interrupted. Unfinished
+assistant text stays in SQLite rather than being posted as a finished answer.
+Full turn output is retained in SQLite but is not sent again at completion.
+Interruption notices share the delivery queue with assistant messages. The live
+activity message remains visible throughout. Messages arriving during final
+delivery are picked up by the next run.
+The `interrupted_by_turn_id` database column records which message requested each
+interruption; the column is added automatically when opening an existing database.
 
 The bridge does not override OMP's approval mode, remove tools, or sandbox an approved call. OMP loads the project configuration from the configured working directory, including `tools.approvalMode`. When that policy asks for approval, the bridge translates OMP's one-shot request into Discord buttons. Persistent session-wide approval is intentionally unavailable through Discord.
 
@@ -164,11 +230,21 @@ OMP can call `discord_channel_history` to read messages from the allowed parent 
 
 Thread controls must be the complete message:
 
-- `status` — show session, working directory, queue, and uncertain-turn state;
+- `status` — show session, working directory, queue, uncertain-turn state, and OpenAI/Codex provider quota usage with reset times;
 - `stop` — stop the thread and cancel its active turn;
 - `new` — after the active turn stops, discard queued turns and start a fresh OMP session.
 
-An unexpected process or protocol loss after OMP accepts a prompt is recorded as uncertain. Inspect the working tree and OMP session before manually retrying it.
+`status` queries the configured OMP executable's `usage --json --provider openai-codex`
+interface without interrupting the conversation or making a model call. It shows
+weekly and any other reported quota windows for each authenticated Codex account,
+not this thread's token spending. Accounts are numbered without exposing emails,
+account IDs, or organization metadata. Discord renders reset timestamps in your
+local timezone, with a relative countdown and the snapshot's reported update age.
+Missing usage/reset data is explicitly unavailable, never estimated as zero.
+The query has a 20-second deadline and a 1 MiB output limit; failures leave the
+ordinary session/queue status available. Provider caching may affect freshness.
+
+An unexpected process or protocol loss after prompt dispatch is recorded as uncertain, even if its acknowledgement was lost. Neither the original prompt nor a replacement with an unresolved outcome is automatically replayed. Inspect the working tree and OMP session before manually retrying it.
 
 ## Development checks
 

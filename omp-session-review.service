@@ -1,0 +1,23 @@
+[Unit]
+Description=Read-only OMP session review and improvement proposals
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=hephaestus
+Group=hephaestus
+WorkingDirectory=/home/hephaestus/src/personal/rust-omp-discord-bridge
+Environment=HOME=/home/hephaestus
+Environment=PATH=/home/hephaestus/.local/share/mise/installs/oh-my-pi/latest:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/python /home/hephaestus/src/personal/rust-omp-discord-bridge/scripts/session-review.py
+TimeoutStartSec=6h
+TimeoutStopSec=30
+UMask=0077
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hephaestus/docs/session-reviews /home/hephaestus/.omp /home/hephaestus/.cache
+RestrictSUIDSGID=true
