@@ -1241,7 +1241,7 @@ where
             }, {
                 "name": DISCORD_THREAD_TITLE_TOOL,
                 "label": "Discord Thread Title",
-                "description": "Rename this session's current Discord thread with a concise, meaningful session title. The bridge manages the single leading status emoji; supply the title without a status emoji. Use thinking while planning, working while executing, and completed only when the task is finished. When only changing status, preserve the title by supplying the same title.",
+                "description": "Rename this session's current Discord thread with a concise, meaningful session title. The bridge manages the single leading status emoji; supply the title without a status emoji. Use thinking while planning, working while executing, and completed only when the task is finished. When only changing status, preserve the title by supplying the same title. The bridge also sets working when a run starts and completed when no active or queued turns remain; the automatic checkmark denotes an idle queue, not guaranteed task success.",
                 "loadMode": "essential",
                 "parameters": {
                     "type": "object",

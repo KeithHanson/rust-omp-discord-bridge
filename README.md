@@ -13,7 +13,7 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - ordered, durable message admission with immediate interruption of active work and bounded global concurrency;
 - real OMP resume through its native RPC protocol;
 - one-shot Discord approval buttons for OMP writes and executable actions;
-- one editable activity message per active conversation run, including replacement turns, with assistant messages delivered as they complete;
+- one rolling activity card per active conversation run, including replacement turns, with assistant messages delivered as they complete;
 - `status`, `stop`, and `new` controls inside managed threads;
 - duplicate Discord message rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
@@ -22,18 +22,26 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 
 Attachment bytes are not downloaded by the bridge. OMP receives the Discord CDN URL, filename, content type, and byte count as untrusted prompt context.
 
-Activity messages show fixed, public labels for thinking, file inspection, tool
+Activity cards show fixed, public labels for thinking, file inspection, tool
 execution, response writing, approval waits, interruption, retries, and compaction.
-Updates are coalesced every five seconds, including elapsed-time refreshes during
-quiet work. The activity message remains live while newer messages replace earlier
-turns; completion, cancellation, failure, and uncertain outcomes finalize it.
+A compact embed separates the current action from elapsed time, with a blue
+edge and a prominent NOW heading. Terminal cards use STATUS with green for success,
+red for failure, and yellow for other outcomes. Embed Links permission is required.
 Tool arguments, tool output, and reasoning content are never included.
 
-Activity delivery is best-effort: a failed or timed-out create/edit is logged and
-disables further status updates for that turn without interrupting OMP or replaying
-work. Each request has a ten-second deadline. Assistant text is delivered in separate
-messages. After a process crash, an old activity message can remain stale; use
-`status` to inspect durable turn state. Activity message IDs are not persisted.
+Updates are coalesced every five seconds, including elapsed-time refreshes during
+quiet work. If another message has appeared below the card, the bridge posts a
+replacement before deleting the old card; otherwise it edits in place. Reposts
+suppress notifications and mentions. This keeps status near the latest conversation,
+not anchored to the viewport when reading older messages. Completion, cancellation,
+failure, and uncertain outcomes finalize the card.
+
+Activity delivery is best-effort: a failed or timed-out create/read/edit is logged
+and disables further card updates for that run without interrupting OMP or replaying
+work. Each refresh has a ten-second deadline. Failed deletion can leave an older
+card behind. Assistant text is delivered in separate messages. After a process
+crash, an old card can remain stale; use `status` to inspect durable turn state.
+Activity message IDs are not persisted.
 
 ## Prerequisites
 
@@ -300,11 +308,23 @@ OMP can call `discord_thread_title` with `title` and `status` (`thinking`,
 exactly one status prefix first: `🧠 Session title`, `🛠️ Session title`, or
 `✅ Session title`. Existing status prefixes are replaced, not stacked; long
 titles are bounded to Discord's limit. New threads start with `🧠`.
-The agent selects meaningful titles and updates status explicitly through the tool;
-these are not automatic lifecycle indicators or a guarantee of task success.
+The agent selects meaningful titles and can update status explicitly through the
+tool. The bridge also restores `🛠️` when work starts and sets `✅` once there is
+no active run and no running or queued turn, after final message delivery. These
+automatic updates preserve the existing title. A stopped thread with queued work
+is not idle; failed or aborted turns with no remaining work are idle. Thus `✅`
+means the queue is idle, not that every task succeeded.
 Use `completed` only after finishing the task, and reuse the title for status-only
-updates. Discord permissions and rename rate limits apply; failures are returned
-to the agent. The bot must own the thread or have Manage Threads permission.
+updates. Discord permissions and rename rate limits apply. Tool failures are
+returned to the agent; automatic-update failures are logged without blocking
+turn processing. The bot must own the thread or have Manage Threads permission.
+
+During a run, `[OMP: <phase>]` appears before the meaningful thread title,
+so the current phase remains discoverable while reading older messages. Phase
+updates follow the activity reporter's coalescing, rather than renaming for every
+tool event. An unchanged phase does not trigger another rename. Title-update
+failures are logged independently and do not stop activity cards or model work.
+The idle status hook removes the transient phase when the queue settles.
 
 Thread controls must be the complete message:
 
