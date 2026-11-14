@@ -76,7 +76,7 @@ Builds fail rather than inventing a revision when no metadata is available.
 ## Release versions
 
 `VERSION` is the source of truth for the public release version: `YYYY-MM-DD-#`.
-Use the UTC release date and start its counter at `1`; increment the counter for
+Use the Operator's local release date (America/Chicago) and start its counter at `1`; increment the counter for
 each later release that day, resetting it to `1` on a new date. Update and commit
 `VERSION` before building a release. Rebuilding the same release does not bump it.
 
