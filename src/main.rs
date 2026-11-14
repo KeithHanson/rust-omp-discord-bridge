@@ -25,6 +25,9 @@ enum Command {
     Run,
     /// Validate configuration, database access, token presence, and OMP RPC startup.
     Check,
+    /// Validate a replacement without opening or migrating the live database.
+    #[command(hide = true)]
+    CheckUpdate,
 }
 
 #[tokio::main]
@@ -47,6 +50,20 @@ async fn main() -> ExitCode {
 async fn execute(cli: Cli) -> Result<()> {
     let config_path = expand_cli_home(cli.config)?;
     let config = AppConfig::load(&config_path)?;
+    if matches!(cli.command, Some(Command::CheckUpdate)) {
+        drop(config.discord.load_token()?);
+        let transport = OmpTransport::new(
+            config.omp,
+            Duration::from_secs(config.runtime.turn_timeout_seconds),
+            config.runtime.max_response_bytes,
+            config.runtime.discord_history_max_days,
+        );
+        tokio::time::timeout(Duration::from_secs(30), transport.probe())
+            .await
+            .context("replacement OMP probe timed out")??;
+        println!("replacement configuration, token, and OMP RPC startup are valid");
+        return Ok(());
+    }
     let store = Store::open(&config.runtime.database_path).await?;
 
     match cli.command.unwrap_or(Command::Run) {
@@ -58,7 +75,7 @@ async fn execute(cli: Cli) -> Result<()> {
                     "marked interrupted OMP turns uncertain; they will not be replayed"
                 );
             }
-            discord::run(config, store).await
+            discord::run(config, store, &config_path).await
         }
         Command::Check => {
             drop(config.discord.load_token()?);
@@ -72,6 +89,7 @@ async fn execute(cli: Cli) -> Result<()> {
             println!("configuration, SQLite, Discord token, and OMP RPC startup are valid");
             Ok(())
         }
+        Command::CheckUpdate => unreachable!("handled before opening the database"),
     }
 }
 

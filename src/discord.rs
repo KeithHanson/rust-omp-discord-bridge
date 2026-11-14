@@ -69,7 +69,7 @@ impl ReviewTitle for TitleReviewer {
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run(config: AppConfig, store: Store) -> Result<()> {
+pub async fn run(config: AppConfig, store: Store, config_path: &std::path::Path) -> Result<()> {
     let token = config.discord.load_token()?;
     let config = Arc::new(config);
     let http = Arc::new(Http::new(&token));
@@ -101,6 +101,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<()> {
     let bot_user_id = Arc::new(AtomicU64::new(0));
     let presence = runner.subscribe_presence();
     let (presence_target, presence_targets) = watch::channel(None);
+    let admission = Arc::new(tokio::sync::RwLock::new(()));
     let handler = DiscordHandler {
         config: Arc::clone(&config),
         store: store.clone(),
@@ -109,6 +110,7 @@ pub async fn run(config: AppConfig, store: Store) -> Result<()> {
         prompts,
         bot_user_id,
         presence_target,
+        admission: Arc::clone(&admission),
     };
     let intents =
         GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
@@ -127,10 +129,47 @@ pub async fn run(config: AppConfig, store: Store) -> Result<()> {
             bail!("Discord presence worker stopped unexpectedly")
         }
         result = client.start() => result.context("Discord client stopped"),
+        result = auto_update(config_path, &runner, &admission) => result,
         signal = shutdown_signal() => {
             signal?;
             shard_manager.shutdown_all().await;
             Ok(())
+        }
+    }
+}
+
+async fn auto_update(
+    config_path: &std::path::Path,
+    runner: &ThreadQueueRunner,
+    admission: &tokio::sync::RwLock<()>,
+) -> Result<()> {
+    loop {
+        let mut candidate = crate::update::wait_for_update(config_path).await;
+        // This probe never opens the live database. Keep gateway admission open
+        // during it so a slow OMP startup cannot swallow a minute of messages.
+        if let Err(error) = candidate.preflight().await {
+            tracing::warn!(%error, "update preflight failed; keeping current bridge");
+            continue;
+        }
+        tracing::info!("update staged; waiting for turns, delivery, and title workers to finish");
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Never queue a writer behind a handler waiting for a turn: Tokio's
+            // fair lock would block approval callbacks needed to finish that turn.
+            let Ok(gate) = admission.try_write() else {
+                continue;
+            };
+            if !runner.rollover_idle().await {
+                drop(gate);
+                continue;
+            }
+            // exec replaces this process (including the gateway) without creating
+            // a second database owner. An exec failure restores the old executable.
+            if let Err(error) = candidate.install_and_exec() {
+                tracing::error!(%error, "update installation failed; keeping current bridge");
+            }
+            drop(gate);
+            break;
         }
     }
 }
@@ -376,6 +415,19 @@ impl ThreadMessenger for DiscordMessenger {
                 CreateMessage::new()
                     .content(content)
                     .allowed_mentions(bot_reply_mentions(bots)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn send_image(&self, thread_id: ThreadId, data: Vec<u8>, filename: String) -> Result<()> {
+        let _access = thread_access(&self.store, thread_id).await?;
+        SerenityChannelId::new(thread_id.get())
+            .send_message(
+                &self.http,
+                CreateMessage::new()
+                    .add_file(serenity::all::CreateAttachment::bytes(data, filename))
+                    .allowed_mentions(CreateAllowedMentions::new()),
             )
             .await?;
         Ok(())
@@ -1017,6 +1069,7 @@ struct DiscordHandler {
     prompts: Arc<PromptBroker>,
     bot_user_id: Arc<AtomicU64>,
     presence_target: watch::Sender<Option<ShardMessenger>>,
+    admission: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[async_trait]
@@ -1033,6 +1086,7 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn thread_members_update(&self, _context: Context, event: ThreadMembersUpdateEvent) {
+        let _admission = self.admission.read().await;
         let bot_id = self.bot_user_id.load(Ordering::Acquire);
         if bot_id != 0 && event.removed_member_ids.iter().any(|id| id.get() == bot_id) {
             let thread_id = ThreadId::new(event.id.get());
@@ -1043,6 +1097,7 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn message(&self, context: Context, message: Message) {
+        let _admission = self.admission.read().await;
         if let Err(error) = self.handle_message(&context.http, &message).await {
             tracing::error!(
                 guild_id = message.guild_id.map(|id| id.get()),
@@ -1055,6 +1110,7 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn interaction_create(&self, context: Context, interaction: Interaction) {
+        let _admission = self.admission.read().await;
         let channel_id = match &interaction {
             Interaction::Component(component) => component.channel_id,
             Interaction::Modal(modal) => modal.channel_id,
@@ -2611,6 +2667,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_image_delivery_disables_mentions_and_attaches_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![(
+            "POST", "/channels/3/messages", 200,
+            serde_json::to_value(routing_message(true, "")).unwrap(),
+        )]);
+        let messenger = participants_messenger(root.path(), http).await;
+        // The existing multipart test server decodes bodies as UTF-8.
+        let bytes = b"table image transport payload";
+        messenger.send_image(ThreadId::new(3), bytes.to_vec(), "table-1.png".into()).await.unwrap();
+        let bodies = requests.join().unwrap();
+        let multipart = bodies[0].as_str().unwrap();
+        assert!(multipart.contains("filename=\"table-1.png\""));
+        assert!(multipart.contains(std::str::from_utf8(bytes).unwrap()));
+        let payload = multipart.split("name=\"payload_json\"").nth(1).unwrap()
+            .split("\r\n\r\n").nth(1).unwrap().split("\r\n").next().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert_eq!(payload["attachments"][0]["filename"], "table-1.png");
+    }
+
+    #[tokio::test]
     async fn upload_http_posts_real_multipart_to_current_thread_and_returns_receipt() {
         let root = tempfile::tempdir().unwrap();
         let bytes = b"local attachment bytes\0\n";
@@ -3046,6 +3124,7 @@ mod tests {
         let thread = ThreadId::new(3);
         assert!(messenger.send(thread, "late error").await.is_err());
         assert!(messenger.send_assistant(thread, "<@8> late response").await.is_err());
+        assert!(messenger.send_image(thread, vec![1], "table.png".into()).await.is_err());
         assert!(messenger.create_activity(thread, "Working", false).await.is_err());
         assert!(messenger.edit_activity(thread, MessageId::new(100), "Done", true).await.is_err());
         assert!(messenger.thread_status(thread, "completed").await.is_err());
@@ -3109,6 +3188,7 @@ mod tests {
             prompts,
             bot_user_id: Arc::new(AtomicU64::new(9)),
             presence_target: watch::channel(None).0,
+            admission: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 

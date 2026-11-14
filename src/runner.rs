@@ -70,6 +70,7 @@ impl MessageDelivery {
     }
 }
 
+
 async fn deliver_messages(
     messenger: &dyn ThreadMessenger,
     thread_id: ThreadId,
@@ -78,12 +79,42 @@ async fn deliver_messages(
     send_timeout: Duration,
 ) {
     while let Some(message) = receiver.recv().await {
-        for chunk in chunk_message(&message.text, message_limit) {
+        // Parse/render the complete assistant message before Discord chunking:
+        // a table may span many text-message limits.
+        let parts = if message.assistant {
+            match crate::table_images::prepare(&message.text, message_limit).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    tracing::error!(%thread_id, %error, "assistant table preparation failed");
+                    let notice = "Unable to render this response's table images. The original response remains in the saved session.";
+                    if let Err(error) = timeout(send_timeout, messenger.send(thread_id, notice))
+                        .await
+                        .context("table error notice timed out")
+                        .and_then(|result| result)
+                    {
+                        tracing::error!(%thread_id, %error, "table error notice failed");
+                    }
+                    continue;
+                }
+            }
+        } else {
+            chunk_message(&message.text, message_limit)
+                .into_iter()
+                .map(crate::table_images::AssistantPart::Text)
+                .collect()
+        };
+        for part in parts {
             let result = timeout(send_timeout, async {
-                if message.assistant {
-                    messenger.send_assistant(thread_id, &chunk).await
-                } else {
-                    messenger.send(thread_id, &chunk).await
+                match part {
+                    crate::table_images::AssistantPart::Text(text) if message.assistant => {
+                        messenger.send_assistant(thread_id, &text).await
+                    }
+                    crate::table_images::AssistantPart::Text(text) => {
+                        messenger.send(thread_id, &text).await
+                    }
+                    crate::table_images::AssistantPart::Image { data, filename } => {
+                        messenger.send_image(thread_id, data, filename).await
+                    }
                 }
             })
             .await
@@ -107,6 +138,7 @@ async fn deliver_messages(
 pub trait ThreadMessenger: Send + Sync {
     async fn send(&self, thread_id: ThreadId, content: &str) -> Result<()>;
     async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()>;
+    async fn send_image(&self, thread_id: ThreadId, data: Vec<u8>, filename: String) -> Result<()>;
     async fn create_activity(
         &self,
         thread_id: ThreadId,
@@ -317,6 +349,14 @@ impl ThreadQueueRunner {
 
     pub(crate) fn subscribe_presence(&self) -> watch::Receiver<PresenceSnapshot> {
         self.presence.subscribe()
+    }
+
+    /// Caller must exclude gateway handlers while inspecting this boundary.
+    /// Drains include delivery and activity finalization; title workers are
+    /// separate OMP processes and must also finish before replacing the daemon.
+    pub(crate) async fn rollover_idle(&self) -> bool {
+        self.draining.lock().await.is_empty()
+            && self.statuses.senders.lock().unwrap().is_empty()
     }
 
     pub async fn poke(self: &Arc<Self>, thread_id: ThreadId) {
@@ -782,6 +822,25 @@ fn turn_error_message(error: &OmpTurnError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires uv and system Chromium; exercises the real table renderer"]
+    async fn table_images_are_prepared_before_message_chunking() {
+        let messenger = FakeMessenger::default();
+        let (delivery, receiver) = MessageDelivery::new();
+        let text = format!(
+            "Before table.\n\n| Item | Description |\n| --- | --- |\n| Example | {} |\n\nAfter table.",
+            "Long but readable description. ".repeat(8),
+        );
+        delivery.message(text).unwrap();
+        drop(delivery);
+        deliver_messages(&messenger, ThreadId::new(3), receiver, 100, DELIVERY_TIMEOUT).await;
+        let sent = messenger.sent.lock().await;
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].trim(), "Before table.");
+        assert!(sent[1].starts_with("[image: "));
+        assert_eq!(sent[2].trim(), "After table.");
+    }
+
     use std::{path::PathBuf, sync::Arc, time::Duration};
 
     use tokio::sync::{Mutex, mpsc};
@@ -993,6 +1052,10 @@ mod tests {
     impl ThreadMessenger for FakeMessenger {
         async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()> {
             self.send(thread_id, content).await
+        }
+
+        async fn send_image(&self, thread_id: ThreadId, _data: Vec<u8>, filename: String) -> Result<()> {
+            self.send(thread_id, &format!("[image: {filename}]")).await
         }
 
         async fn send(&self, _thread_id: ThreadId, content: &str) -> Result<()> {
@@ -1738,6 +1801,37 @@ mod tests {
                 .is_none()
         );
         assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn rollover_waits_for_turn_and_final_title_worker() {
+        let (_directory, store) = fixture().await;
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let transport = Arc::new(ControlledTransport::new(observed, false));
+        let (updating, mut updates) = mpsc::unbounded_channel();
+        let title_gate = Arc::new(Semaphore::new(0));
+        let messenger = Arc::new(FakeMessenger {
+            status_gate: Some(("completed", updating, title_gate.clone())),
+            ..FakeMessenger::default()
+        });
+        let runner = ThreadQueueRunner::new(store.clone(), transport.clone(), messenger.clone(), 1_900, 1);
+        assert!(runner.rollover_idle().await);
+        let turn = enqueue(&store, 20).await;
+        runner.poke(THREAD).await;
+        assert_eq!(received(&mut incoming).await, turn);
+        assert!(!runner.rollover_idle().await);
+        transport.finish.add_permits(1);
+        received(&mut updates).await;
+        idle(&runner).await;
+        assert!(!runner.rollover_idle().await, "title subprocess still running");
+        let sender = runner.statuses.senders.lock().unwrap()[&THREAD].clone();
+        title_gate.add_permits(1);
+        messenger.wait_status("completed").await;
+        assert_eq!(store.next_outcome(THREAD, 0).await.unwrap().unwrap().status, TurnStatus::Done);
+        // SQLite uses real blocking workers; pause only after database work settles.
+        tokio::time::pause();
+        sender.closed().await;
+        assert!(runner.rollover_idle().await);
     }
 
     #[tokio::test]

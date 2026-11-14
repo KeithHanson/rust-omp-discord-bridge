@@ -7,5 +7,7 @@ mod presence;
 pub mod render;
 pub mod runner;
 pub mod store;
+mod table_images;
 pub mod titles;
 mod usage;
+mod update;

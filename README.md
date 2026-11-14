@@ -45,6 +45,28 @@ Assistant text is delivered in separate messages. After a process
 crash, an old card can remain stale; use `status` to inspect durable turn state.
 Activity message IDs are not persisted.
 
+### Automatic table images
+
+Assistant Markdown tables are rendered to dark-theme PNG attachments before
+Discord message chunking. Surrounding prose stays in order; table hyperlinks
+are posted separately as clickable URLs. Fenced Markdown examples stay text.
+Wide tables repeat the first column across images, and long tables repeat their
+headers. Images suppress mentions and obey the same thread-exclusion gate as
+text delivery. The original Markdown remains in the saved conversation.
+
+The bridge embeds `scripts/markdown-table-image.py` and requires `uv`, system
+`chromium`, and `/usr/bin/kill` on the Linux host. The first table render may
+download the pinned Python dependencies into uv's cache. Grant the bot Attach
+Files permission. The renderer disables raw HTML, JavaScript, and network
+resource loading. Rendering failures produce an explicit notice rather than
+silently substituting an unrendered table; failed HTTP sends are not retried.
+
+For standalone use:
+`uv run --script scripts/markdown-table-image.py input.md output.png --title 'Comparison'`.
+`--manifest` emits an ordered JSON list of text and image paths for integration.
+No Discord token or message content is sent to an external rendering service.
+
+
 The bot's custom presence summarizes all managed conversations:
 
 - `Idle · v2026-11-13-1 · abc1234` when no threads are engaged, using the running binary's release version and commit.
@@ -85,6 +107,96 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-14-3
+
+Adds automatic Markdown-table PNG delivery and verified GitHub binary updates
+every seven minutes. Updates wait for idle turns, delivery, and title workers.
+Table rendering requires `uv`, system Chromium, and Attach Files permission;
+the Python renderer is embedded in the binary.
+
+The first installation of this release needs a controlled idle-time replacement.
+Subsequent clean release builds update themselves unless explicitly disabled.
+Keep the previous executable for rollback; gateway reconnection is not message
+backfill, and post-startup failures still require manual rollback.
+
+### Build and publish a GitHub release
+
+Run `scripts/release.sh` on **Linux x86-64** with Rust installed through rustup,
+`musl-gcc`, GNU coreutils/tar/gzip, binutils (`readelf`), and Git. On Arch, install
+`musl binutils github-cli`; on Debian/Ubuntu, install `musl-tools binutils gh`.
+Publishing additionally requires GitHub CLI authentication with release-write
+permission (`gh auth login --hostname github.com`).
+
+Commit all release changes, including `VERSION`, and tag that exact commit:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+version=$(cat VERSION)
+git tag -a "v$version" -m "v$version"
+scripts/release.sh --dry-run
+git push origin HEAD "refs/tags/v$version"
+scripts/release.sh
+```
+
+The checkout must be clean, including untracked files; the local tag must point
+at `HEAD`. Publishing also checks that GitHub's tag resolves to the same commit.
+`--dry-run` performs the local build, static-link/version checks, and packaging
+without contacting GitHub. `--help` prints usage without building. Builds use a
+snapshot of the committed tree, locked Cargo dependencies, and static musl linking;
+neither local secrets nor ignored source files enter the package.
+The final link uses the selected Rust toolchain's bundled `rust-lld`; `musl-gcc`
+compiles C dependencies. This avoids host linker specs injecting an ELF interpreter
+into an otherwise static executable.
+
+Artifacts are retained in a fresh `target/releases/vVERSION.XXXXXX/` directory:
+
+- `omp-discord-bridge-VERSION-linux-x86_64.tar.gz`: a versioned directory with
+  `omp-discord-bridge`, `bridge-local`, `.env.example`, example TOML configs,
+  `omp-discord-bridge.service`, README, and license.
+- `omp-discord-bridge-linux-x86_64`: the raw static executable used for updates.
+- `SHA256SUMS`: SHA-256 checksums of both assets, using those exact basenames.
+
+The fixed repository is `KeithHanson/rust-omp-discord-bridge` and the tag is
+`vVERSION`. The script creates a **draft**, uploads all three assets without
+overwriting, and only then publishes it as the latest release. Any existing
+release, including a draft, is refused. Failed uploads leave the draft for manual
+inspection; remove an abandoned draft only after checking its state, then retry.
+Never overwrite or retag a published release: commit a new `VERSION` instead.
+No service is installed or restarted by the release script.
+
+### Automatic binary updates
+
+Clean Linux x86-64 release builds check the latest GitHub release in
+`KeithHanson/rust-omp-discord-bridge` every **420 seconds (7 minutes)** by default.
+Dirty builds never enable updates. Clean debug builds require
+`OMP_DISCORD_BRIDGE_AUTO_UPDATE=true`. Set
+`OMP_DISCORD_BRIDGE_AUTO_UPDATE=false` to opt out of release-build updates.
+The optional dedicated `OMP_DISCORD_BRIDGE_UPDATE_TOKEN` authenticates GitHub requests; it is not the
+Discord bot token.
+
+The updater requires a `vYYYY-MM-DD-N` tag, the raw
+`omp-discord-bridge-linux-x86_64` asset, and its matching entry in `SHA256SUMS`.
+It verifies the checksum and candidate's `--version`, then runs a bounded
+`check-update` preflight to validate the selected configuration, token, and OMP
+probe **without migrating or otherwise modifying the live database**. Gateway
+admission remains open throughout preflight. The updater then waits until turns,
+message/activity deliveries, title OMP workers, and admitted handlers are all
+idle. Continuous activity can defer an update indefinitely; updates never
+interrupt a turn to meet a deadline.
+
+New work admission is held exclusively only across the final idle recheck and
+synchronous atomic executable replacement/`exec`. The replacement runs with the
+same arguments, environment, and PID.
+The previous binary is retained with a `.previous` suffix and restored if `exec`
+fails. A later application/startup failure does **not** trigger automatic rollback;
+stop the service and restore the previous executable manually in that case.
+
+The executable's parent directory must be writable by the service account.
+Containers should opt out and use image rollouts instead. Rollover briefly
+disconnects the Discord gateway; messages during that gap may be missed because
+the bridge does not backfill them. This is safe work draining, not guaranteed
+zero-downtime message ingestion.
+
 ### Deploy release 2026-11-14-2
 
 Use the same release tag on each bot; keep each bot's token, database, OMP
@@ -111,7 +223,7 @@ build from the tag above; this bundle is not an ARM or macOS executable.
 ```bash
 gh release download v2026-11-14-2 --repo KeithHanson/rust-omp-discord-bridge \
   --pattern 'omp-discord-bridge-2026-11-14-2-linux-x86_64.tar.gz' --pattern SHA256SUMS
-sha256sum -c SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf omp-discord-bridge-2026-11-14-2-linux-x86_64.tar.gz
 cd omp-discord-bridge-2026-11-14-2-linux-x86_64
 ./omp-discord-bridge --version

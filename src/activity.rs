@@ -140,6 +140,10 @@ mod tests {
             unreachable!("activity must use the activity delivery methods")
         }
 
+        async fn send_image(&self, _: ThreadId, _: Vec<u8>, _: String) -> Result<()> {
+            unreachable!("activity must use the activity delivery methods")
+        }
+
         async fn send(&self, _: ThreadId, _: &str) -> Result<()> {
             unreachable!("activity must use the activity delivery methods")
         }
