@@ -411,6 +411,7 @@ mod tests {
             executable: "omp".into(), session_dir: directory.path().into(),
             allowed_root: directory.path().into(), model: Some("primary".into()),
             title_model: None, thinking_level: None,
+            note_retrieval: None,
         };
         let mut reviewer = TitleReviewer::new(config, store);
         let command = reviewer.command(directory.path());

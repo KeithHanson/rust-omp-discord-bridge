@@ -24,7 +24,7 @@ use tokio_util::{
 };
 
 use crate::{
-    config::OmpConfig,
+    config::{NoteRetrievalConfig, OmpConfig},
     domain::{Session, Turn, TurnStatus},
 };
 
@@ -364,7 +364,25 @@ impl OmpTransport {
         R: AsyncRead + Unpin + Send,
     {
         let abort_started = Notify::new();
-        let operation = self.drive_loop(input, frames, turns, cancellation, ui, &abort_started);
+        let operation = async {
+            let notes = if !cancellation.is_cancelled()
+                && let Some(config) = self.config.note_retrieval.as_ref()
+                    .filter(|config| !config.notebook_ids.is_empty())
+            {
+                let snapshot = bounded(
+                    STARTUP_TIMEOUT,
+                    "reading initial TODO state",
+                    startup_command(
+                        input, frames, &json!({"id": "initial-todos", "type": "get_state"}),
+                        ui, self.discord_history_max_days,
+                    ),
+                ).await?;
+                Some(NoteContext::new(config, todo_snapshot(&snapshot["data"])?))
+            } else {
+                None
+            };
+            self.drive_loop(input, frames, turns, cancellation, ui, &abort_started, notes).await
+        };
         tokio::pin!(operation);
         tokio::select! {
             result = &mut operation => return result,
@@ -388,12 +406,13 @@ impl OmpTransport {
         cancellation: &CancellationToken,
         ui: &dyn OmpUi,
         abort_started: &Notify,
+        mut notes: Option<NoteContext<'_>>,
     ) -> Result<OmpTurnResult, OmpTurnError>
     where
         W: AsyncWrite + Unpin + Send,
         R: AsyncRead + Unpin + Send,
     {
-        let mut pending = Vec::with_capacity(MAX_PENDING_PROMPTS);
+        let mut pending = Vec::with_capacity(MAX_PENDING_PROMPTS + usize::from(notes.is_some()));
         let mut requests = Vec::new();
         let mut active = None;
         let mut background_possible = false;
@@ -408,6 +427,7 @@ impl OmpTransport {
         let mut abort_deadline = None;
         let mut deadline = Instant::now() + self.turn_timeout;
         let mut abort_acknowledged = false;
+        let mut note_sequence = 0_i64;
 
         if cancellation.is_cancelled() {
             bounded(
@@ -429,7 +449,7 @@ impl OmpTransport {
             if drain_queue
                 && abort_deadline.is_none()
                 && !cancellation.is_cancelled()
-                && pending.len() < MAX_PENDING_PROMPTS
+                && pending.iter().filter(|prompt| !prompt.note_context).count() < MAX_PENDING_PROMPTS
             {
                 match bounded(IO_TIMEOUT, "claiming next input", turns.control.next_turn()).await? {
                     Some(turn) => {
@@ -443,6 +463,9 @@ impl OmpTransport {
                             )
                             .await?;
                         } else {
+                            if let Some(notes) = notes.as_mut() {
+                                notes.cancel();
+                            }
                             ui.activity("Interrupting");
                             dispatch_prompt(input, &mut pending, &turn, true, self.turn_timeout)
                                 .await?;
@@ -456,9 +479,24 @@ impl OmpTransport {
                     None => drain_queue = false,
                 }
             }
+            if abort_deadline.is_none()
+                && !cancellation.is_cancelled()
+                && state_request.is_none()
+                && !state_dirty
+                && !pending.iter().any(|prompt| prompt.note_context)
+                && let Some(notes) = notes.as_mut()
+                && let Some(message) = notes.ready.take()
+            {
+                note_sequence += 1;
+                dispatch_note_context(input, &mut pending, note_sequence, &message, self.turn_timeout).await?;
+                settled = false;
+                state_dirty = true;
+                deadline = Instant::now() + self.turn_timeout;
+            }
             if pending.is_empty()
                 && settled
                 && state_request.is_none()
+                && notes.as_ref().is_none_or(|notes| !notes.is_pending())
                 && (abort_deadline.is_none() || abort_acknowledged)
             {
                 let (session_path, session_id) = state.ok_or_else(|| {
@@ -508,6 +546,9 @@ impl OmpTransport {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled(), if abort_deadline.is_none() => {
+                    if let Some(notes) = notes.as_mut() {
+                        notes.cancel();
+                    }
                     abort_deadline = Some(Box::pin(sleep(ABORT_GRACE)));
                     abort_started.notify_one();
                     ui.activity("Stopping");
@@ -529,6 +570,9 @@ impl OmpTransport {
                     ));
                 }
                 () = sleep_until(turn_deadline), if abort_deadline.is_none() => {
+                    if let Some(notes) = notes.as_mut() {
+                        notes.cancel();
+                    }
                     abort_deadline = Some(Box::pin(sleep(ABORT_GRACE)));
                     abort_started.notify_one();
                     ui.activity("Stopping after timeout");
@@ -542,7 +586,7 @@ impl OmpTransport {
                 }
                 () = turns.interrupts.notified(), if abort_deadline.is_none() => {
                     drain_queue = true;
-                    if pending.len() == MAX_PENDING_PROMPTS {
+                    if pending.iter().filter(|prompt| !prompt.note_context).count() == MAX_PENDING_PROMPTS {
                         cancel_requests(input, &mut requests).await?;
                     }
                 }
@@ -550,6 +594,28 @@ impl OmpTransport {
                     requests.swap_remove(index);
                     if !response.is_null() {
                         send_frame(input, &response).await?;
+                    }
+                }
+                result = next_note_context(&mut notes), if notes.as_ref().is_some_and(|notes| notes.pending.is_some()) => {
+                    let notes = notes.as_mut().expect("enabled note retrieval");
+                    notes.pending = None;
+                    match result {
+                        Ok(message) => {
+                            notes.ready = message;
+                            // Fence delivery with a canonical snapshot: an HTTP result
+                            // must not outrun a TODO mutation still buffered on stdout.
+                            if notes.ready.is_some() {
+                                state_dirty = true;
+                                if state_request.is_none() {
+                                    request_state(input, &mut state_request, &mut state_sequence).await?;
+                                    state_dirty = false;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "notebook retrieval failed");
+                            ui.message(&format!("Notebook retrieval failed: {error:#}"))?;
+                        }
                     }
                 }
                 frame = frames.next() => {
@@ -562,6 +628,26 @@ impl OmpTransport {
                         ui.activity(status);
                     }
                     match kind {
+                        Some("tool_execution_end" | "todo_auto_clear") if notes.is_some() && abort_deadline.is_none() => {
+                            let notes = notes.as_mut().expect("enabled note retrieval");
+                            if kind == Some("todo_auto_clear") {
+                                notes.observe(&json!([]));
+                            } else if frame["toolName"] == "todo"
+                                && frame["isError"] != true
+                                && frame.pointer("/result/isError") != Some(&Value::Bool(true))
+                                && frame.pointer("/result/details/op").and_then(Value::as_str) != Some("view")
+                                && let Some(phases) = frame.pointer("/result/details/phases").filter(|v| v.is_array())
+                            {
+                                notes.observe(phases);
+                            }
+                            // eval/device calls can mutate TODOs without a top-level todo event.
+                            // Read canonical state after every completed tool, not its rendered text.
+                            state_dirty = true;
+                            if state_request.is_none() {
+                                request_state(input, &mut state_request, &mut state_sequence).await?;
+                                state_dirty = false;
+                            }
+                        }
                         Some("extension_ui_request")
                             if frame.get("method").and_then(Value::as_str) == Some("cancel") =>
                         {
@@ -570,7 +656,7 @@ impl OmpTransport {
                         Some("host_tool_call" | "extension_ui_request") => {
                             let request = ServiceRequest::new(frame, ui, self.discord_history_max_days)?;
                             if abort_deadline.is_some()
-                                || (pending.len() == MAX_PENDING_PROMPTS
+                                || (pending.iter().filter(|prompt| !prompt.note_context).count() == MAX_PENDING_PROMPTS
                                     && pending.first().is_some_and(|prompt| active == Some(prompt.turn_id)))
                             {
                                 if !request.cancel.is_null() {
@@ -606,6 +692,11 @@ impl OmpTransport {
                             let data = frame.get("data").ok_or_else(|| {
                                 OmpTurnError::Protocol("OMP get_state omitted data".to_owned())
                             })?;
+                            if abort_deadline.is_none()
+                                && let Some(notes) = notes.as_mut()
+                            {
+                                notes.observe(todo_snapshot(data)?);
+                            }
                             let path = data.get("sessionFile").and_then(Value::as_str).ok_or_else(|| {
                                 OmpTurnError::Uncertain("OMP has no persistent session file".to_owned())
                             })?;
@@ -677,6 +768,7 @@ impl OmpTransport {
                                 if !settled
                                     && kind == Some("prompt_result")
                                     && frame.get("agentInvoked").and_then(Value::as_bool) == Some(true)
+                                    && !pending.iter().any(|next| next.note_context)
                                     && (pending.is_empty()
                                         || (status != TurnStatus::Aborted
                                             && pending.iter().any(|next| !next.acknowledged)))
@@ -707,9 +799,15 @@ impl OmpTransport {
                                 if kind == Some("prompt_result") && status == TurnStatus::Done {
                                     prompt.publish(ui)?;
                                 }
-                                bounded(IO_TIMEOUT, "recording prompt result", turns.control.record_result(
-                                    prompt.turn_id, status, &prompt.output, error,
-                                )).await?;
+                                if prompt.note_context {
+                                    if status == TurnStatus::Failed {
+                                        ui.message("OMP could not process the retrieved notebook context.")?;
+                                    }
+                                } else {
+                                    bounded(IO_TIMEOUT, "recording prompt result", turns.control.record_result(
+                                        prompt.turn_id, status, &prompt.output, error,
+                                    )).await?;
+                                }
                                 if background_possible && pending.iter().any(|next| {
                                     active == Some(next.turn_id) && !next.acknowledged
                                 }) {
@@ -717,7 +815,7 @@ impl OmpTransport {
                                         "OMP started an uncorrelated run before acknowledging the replacement".to_owned(),
                                     ));
                                 }
-                                if last.as_ref().is_none_or(|(id, _, _)| prompt.turn_id > *id) {
+                                if !prompt.note_context && last.as_ref().is_none_or(|(id, _, _)| prompt.turn_id > *id) {
                                     last = Some((prompt.turn_id, prompt.output, status));
                                 }
                                 drain_queue = true;
@@ -936,6 +1034,7 @@ async fn bounded<T>(
 struct PendingPrompt {
     id: String,
     turn_id: i64,
+    note_context: bool,
     acknowledged: bool,
     interrupt: bool,
     yielded: bool,
@@ -1091,6 +1190,7 @@ async fn dispatch_prompt<W: AsyncWrite + Unpin>(
     pending.push(PendingPrompt {
         id,
         turn_id: turn.id,
+        note_context: false,
         acknowledged: false,
         interrupt,
         yielded: false,
@@ -1099,6 +1199,91 @@ async fn dispatch_prompt<W: AsyncWrite + Unpin>(
         output: String::new(),
         deadline: Instant::now() + turn_timeout,
         ack_deadline: interrupt.then_some(interruption_deadline),
+        interrupted_deadline: None,
+    });
+    Ok(())
+}
+
+type NoteRetrievalFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + 'a>>;
+
+struct NoteContext<'a> {
+    config: &'a NoteRetrievalConfig,
+    todos: Value,
+    pending: Option<NoteRetrievalFuture<'a>>,
+    ready: Option<String>,
+}
+
+impl<'a> NoteContext<'a> {
+    fn new(config: &'a NoteRetrievalConfig, todos: &Value) -> Self {
+        Self { config, todos: todos.clone(), pending: None, ready: None }
+    }
+
+    fn observe(&mut self, todos: &Value) {
+        if self.todos == *todos {
+            return;
+        }
+        self.todos = todos.clone();
+        self.ready = None;
+        let config = self.config;
+        let todos = todos.clone();
+        // Dropping the previous future cancels stale HTTP work in this session.
+        self.pending = Some(Box::pin(async move {
+            crate::note_retrieval::retrieve(config, &todos).await
+        }));
+    }
+
+    fn cancel(&mut self) {
+        self.pending = None;
+        self.ready = None;
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending.is_some() || self.ready.is_some()
+    }
+}
+
+fn todo_snapshot(state: &Value) -> Result<&Value, OmpTurnError> {
+    state.get("todoPhases").filter(|phases| phases.is_array()).ok_or_else(|| {
+        OmpTurnError::Protocol("OMP state omitted TODO phases required for notebook retrieval".to_owned())
+    })
+}
+
+async fn next_note_context(notes: &mut Option<NoteContext<'_>>) -> anyhow::Result<Option<String>> {
+    match notes.as_mut().and_then(|notes| notes.pending.as_mut()) {
+        Some(pending) => pending.await,
+        None => future::pending().await,
+    }
+}
+
+async fn dispatch_note_context<W: AsyncWrite + Unpin>(
+    input: &mut BufWriter<W>,
+    pending: &mut Vec<PendingPrompt>,
+    sequence: i64,
+    message: &str,
+    turn_timeout: Duration,
+) -> Result<(), OmpTurnError> {
+    let id = format!("notes-{sequence}");
+    send_frame(input, &json!({
+        "id": id,
+        "type": "prompt",
+        "message": message,
+        "streamingBehavior": "followUp",
+    })).await?;
+    // Private tickets own any resulting assistant output but are never Discord
+    // input rows. Keep them separate from the two user interruption slots.
+    pending.push(PendingPrompt {
+        id,
+        turn_id: -sequence,
+        note_context: true,
+        acknowledged: false,
+        interrupt: false,
+        yielded: false,
+        message_start: 0,
+        delivery_cursor: 0,
+        output: String::new(),
+        deadline: Instant::now() + turn_timeout,
+        ack_deadline: Some(Instant::now() + IO_TIMEOUT),
         interrupted_deadline: None,
     });
     Ok(())
@@ -1879,6 +2064,7 @@ mod tests {
         PendingPrompt {
             id: format!("turn-{id}"),
             turn_id: id,
+            note_context: false,
             acknowledged: false,
             interrupt: false,
             yielded: false,
@@ -1957,6 +2143,7 @@ mod tests {
         events: BufWriter<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
         session_path: PathBuf,
         settled: bool,
+        todo_phases: Value,
     }
 
     impl Protocol {
@@ -1971,6 +2158,7 @@ mod tests {
                     "sessionFile": self.session_path,
                     "sessionId": "test-session",
                     "isSettled": self.settled,
+                    "todoPhases": self.todo_phases,
                 },
             }))
             .await;
@@ -2053,6 +2241,13 @@ mod tests {
     }
 
     fn driver_with_stop(cancelled: bool) -> Driver {
+        driver_with_note_result(cancelled, None)
+    }
+
+    fn driver_with_note_result(
+        cancelled: bool,
+        note_result: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Option<String>>>>,
+    ) -> Driver {
         let directory = tempfile::tempdir().unwrap();
         let session_path = directory.path().join("session.jsonl");
         std::fs::write(&session_path, "{}\n").unwrap();
@@ -2064,6 +2259,7 @@ mod tests {
                 model: None,
                 title_model: None,
                 thinking_level: None,
+                note_retrieval: None,
             },
             Duration::from_secs(60),
             1_024,
@@ -2091,6 +2287,21 @@ mod tests {
                     client_read,
                     LinesCodec::new_with_max_length(MAX_RPC_LINE_BYTES),
                 );
+                if let Some(result) = note_result {
+                    let config = NoteRetrievalConfig {
+                        notebook_ids: vec!["notebook:test".to_owned()],
+                        base_url: "http://127.0.0.1:1".to_owned(),
+                        password_file: None,
+                        typesafe_key_file: PathBuf::from("/nonexistent/test-note-key"),
+                    };
+                    let mut notes = NoteContext::new(&config, &json!([]));
+                    notes.pending = Some(Box::pin(async move { result.await.unwrap() }));
+                    return transport.drive_loop(
+                        &mut input, &mut frames,
+                        TurnInput { first: &first, interrupts, control: control.as_ref() },
+                        &stop, ui.as_ref(), &Notify::new(), Some(notes),
+                    ).await;
+                }
                 transport
                     .drive(
                         &mut input,
@@ -2116,6 +2327,7 @@ mod tests {
                 events: BufWriter::new(server_write),
                 session_path,
                 settled: false,
+                todo_phases: json!([]),
             },
             control,
             ui,
@@ -2123,6 +2335,144 @@ mod tests {
             stop,
             task,
         }
+    }
+
+    #[tokio::test]
+    async fn notebook_context_snapshot_fence_discards_stale_content_and_reports_errors() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut run = driver_with_note_result(false, Some(receive));
+        run.protocol.command().await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.ack(1).await;
+        run.protocol.message_end("Original answer", "stop").await;
+        run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
+        run.protocol.settled = true;
+        run.protocol.result(1, "completed").await;
+        run.protocol.todo_phases = json!([{
+            "name": "Changed", "tasks": [{"content": "Different work", "status": "in_progress"}],
+        }]);
+        send.send(Ok(Some("Stale reference must not be injected".to_owned()))).unwrap();
+        // The new snapshot invalidates that result. Retrieval for the new state
+        // has an intentionally absent key file, so it must report an error,
+        // not silently classify the notes as irrelevant or dispatch stale text.
+        run.protocol.finish().await;
+        assert!(run.task.await.unwrap().is_ok());
+        let messages = run.ui.messages.lock().unwrap();
+        assert_eq!(messages[0], "Original answer");
+        assert!(messages.iter().any(|message| message.starts_with("Notebook retrieval failed:")));
+        assert!(!messages.iter().any(|message| message.contains("Stale reference")));
+    }
+
+    #[tokio::test]
+    async fn notebook_context_keeps_output_owned_without_duplicate_discord_turns() {
+        for late in [false, true] {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let mut run = driver_with_note_result(false, Some(receive));
+            assert_eq!(run.protocol.command().await["id"], "turn-1");
+            run.protocol.emit(json!({"type": "agent_start"})).await;
+            run.protocol.ack(1).await;
+            run.protocol.message_end("Original answer", "stop").await;
+            if late {
+                run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
+                run.protocol.settled = true;
+                run.protocol.result(1, "completed").await;
+            }
+            send.send(Ok(Some("Notebook reference body".to_owned()))).unwrap();
+            let command = run.protocol.command().await;
+            assert_eq!(command["id"], "notes-1");
+            assert_eq!(command["type"], "prompt");
+            assert_eq!(command["streamingBehavior"], "followUp");
+            assert_eq!(command["message"], "Notebook reference body");
+            run.protocol.emit(json!({
+                "type": "response", "id": "notes-1", "success": true,
+            })).await;
+            if !late {
+                run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
+                // New run may begin before the preceding ticket resolves.
+                run.protocol.emit(json!({"type": "agent_start"})).await;
+                run.protocol.result(1, "completed").await;
+            } else {
+                run.protocol.emit(json!({"type": "agent_start"})).await;
+            }
+            run.protocol.message_end("References considered", "stop").await;
+            run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
+            run.protocol.settled = true;
+            run.protocol.emit(json!({
+                "type": "prompt_result", "id": "notes-1", "agentInvoked": true,
+                "status": "completed", "sessionSettled": true,
+            })).await;
+            run.protocol.finish().await;
+            let result = run.task.await.unwrap().unwrap();
+            assert_eq!(result.turn_id, 1);
+            assert_eq!(result.text, "Original answer");
+            let records = run.control.records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].text, "Original answer");
+            assert_eq!(*run.ui.messages.lock().unwrap(), ["Original answer", "References considered"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn notebook_context_does_not_block_user_interruption() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut run = driver_with_note_result(false, Some(receive));
+        run.protocol.command().await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.ack(1).await;
+        send.send(Ok(Some("Notebook reference body".to_owned()))).unwrap();
+        assert_eq!(run.protocol.command().await["id"], "notes-1");
+        run.protocol.emit(json!({"type": "response", "id": "notes-1", "success": true})).await;
+        run.control.queue.lock().unwrap().push_back(turn(2));
+        run.interrupts.notify_one();
+        let replacement = run.protocol.command().await;
+        assert_eq!(replacement["type"], "abort_and_prompt");
+        assert_eq!(replacement["id"], "turn-2");
+        run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
+        run.protocol.ack(2).await;
+        run.protocol.result(1, "aborted").await;
+        run.protocol.emit(json!({
+            "type": "prompt_result", "id": "notes-1", "agentInvoked": true,
+            "status": "aborted", "sessionSettled": false,
+        })).await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.message_end("Replacement answer", "stop").await;
+        run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
+        run.protocol.settled = true;
+        run.protocol.result(2, "completed").await;
+        run.protocol.finish().await;
+        assert_eq!(run.task.await.unwrap().unwrap().text, "Replacement answer");
+        let records = run.control.records.lock().unwrap();
+        assert_eq!(records.iter().map(|record| record.id).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(records[0].status, TurnStatus::Aborted);
+        assert_eq!(records[1].status, TurnStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn notebook_context_changes_discard_stale_results_and_allow_repeated_notes() {
+        let config = NoteRetrievalConfig {
+            notebook_ids: vec!["notebook:test".to_owned()],
+            base_url: "http://127.0.0.1:1".to_owned(),
+            password_file: None,
+            typesafe_key_file: PathBuf::from("/nonexistent/test-note-key"),
+        };
+        let first = json!([{"name": "Work", "tasks": [{"content": "Build", "status": "in_progress"}]}]);
+        let second = json!([{"name": "Work", "tasks": [{"content": "Build", "status": "completed"}]}]);
+        let mut notes = NoteContext::new(&config, &first);
+        notes.observe(&first);
+        assert!(!notes.is_pending(), "unchanged reads must not call Jev");
+        let (send, receive) = tokio::sync::oneshot::channel::<Option<String>>();
+        notes.pending = Some(Box::pin(async move { Ok(receive.await.unwrap()) }));
+        notes.ready = Some("stale note".to_owned());
+        notes.observe(&second);
+        assert!(send.send(Some("stale result".to_owned())).is_err());
+        assert!(notes.ready.is_none());
+        assert!(notes.pending.is_some(), "completion status changes must retrieve");
+        notes.cancel();
+        notes.observe(&first);
+        assert!(notes.pending.is_some(), "returning to an earlier state must retrieve again");
+        notes.cancel();
+        notes.observe(&json!([]));
+        assert!(notes.pending.is_some(), "clearing the list must retrieve");
     }
 
     #[tokio::test]

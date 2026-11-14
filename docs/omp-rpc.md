@@ -154,6 +154,43 @@ A message arriving after the RPC loop commits to shutdown is picked up by the ne
 process using the saved session. The stopped-session check and durable claim are
 atomic, so a stale Discord handler cannot admit new work after `stop`.
 
+## Optional notebook context
+
+`omp.note_retrieval` is disabled when omitted or when `notebook_ids` is empty.
+Disabled sessions make no notebook or Jev requests and need no extra credentials.
+Enabled sessions establish an initial `get_state.todoPhases` baseline, observe
+successful native TODO results and auto-clear events, and refresh canonical
+TODO state after completed tools (including eval/device calls).
+Unchanged snapshots and pure views do not start retrieval.
+
+Retrieval lists full notes through Open Notebook's REST `/api/notes` endpoint,
+whose response is an unpaginated array including note content. It deduplicates
+note IDs within that retrieval, then sends one `jev-1.14.0` Noul request per note,
+with at most four requests in flight. The state contains only `TODOS`,
+`NOTE_TITLE`, and `NOTE_CONTENT`; the question is “Is this note relevant to TODOS?”
+Every probability at or above `0.50` qualifies. There is no confidence gate,
+top-k selection, truncation, or deduplication across TODO changes.
+
+A changed TODO snapshot cancels older HTTP work and discards any undelivered
+result. A fresh state response fences delivery against buffered mutations.
+User interruption and stop also cancel pending retrieval. Configured retrieval
+errors produce a visible notice; they are not negative relevance answers.
+
+Matching notes enter the same OMP process as one reference-data message through
+`prompt` with `streamingBehavior: "followUp"`. Running tools are not interrupted.
+The bridge tracks this private prompt's acknowledgement and terminal result,
+delivers any resulting assistant messages, and waits for it before closing OMP.
+It does not create a synthetic Discord input row or consume a user interruption
+slot. Results arriving after the original answer still reach the same session.
+The existing 1 MiB RPC frame ceiling applies; oversized context fails explicitly
+rather than being silently shortened.
+
+Verification: the targeted configuration (9), retrieval (6), and RPC transport
+(51) tests passed. These include local HTTP request/response fixtures, the
+inclusive threshold, stale-result fencing, late result delivery, and user
+interruption with a queued context prompt. This does not establish live Jev
+judgment quality, deployment, or Discord-client appearance.
+
 ## Cancellation and shutdown
 
 `stop` first marks the Discord session stopped, then sends RPC `abort` to an active process. The bridge waits up to 15 seconds for all correlated prompt outcomes and a settled session. A missing outcome or unsettled session is uncertain, because tools may already have changed external state; an uncorrelated `agent_end` alone is not completion.

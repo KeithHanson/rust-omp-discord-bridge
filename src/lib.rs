@@ -2,6 +2,7 @@ mod activity;
 pub mod config;
 pub mod discord;
 pub mod domain;
+mod note_retrieval;
 pub mod omp;
 mod presence;
 pub mod render;

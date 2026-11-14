@@ -44,6 +44,15 @@ pub struct OmpConfig {
     pub model: Option<String>,
     pub title_model: Option<String>,
     pub thinking_level: Option<String>,
+    pub note_retrieval: Option<NoteRetrievalConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NoteRetrievalConfig {
+    pub notebook_ids: Vec<String>,
+    pub base_url: String,
+    pub password_file: Option<PathBuf>,
+    pub typesafe_key_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +107,57 @@ struct RawOmpConfig {
     model: Option<String>,
     title_model: Option<String>,
     thinking_level: Option<String>,
+    note_retrieval: Option<RawNoteRetrievalConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNoteRetrievalConfig {
+    #[serde(default)]
+    notebook_ids: Vec<String>,
+    base_url: Option<String>,
+    password_file: Option<PathBuf>,
+    typesafe_key_file: Option<PathBuf>,
+}
+
+impl RawNoteRetrievalConfig {
+    fn validate(self) -> Result<Option<NoteRetrievalConfig>> {
+        if self.notebook_ids.is_empty() {
+            return Ok(None);
+        }
+        if self.notebook_ids.iter().any(|id| id.trim().is_empty()) {
+            bail!("omp.note_retrieval.notebook_ids must not contain empty IDs");
+        }
+        let base_url = self
+            .base_url
+            .unwrap_or_else(|| "http://127.0.0.1:5055".to_owned());
+        let url = reqwest::Url::parse(&base_url)
+            .map_err(|_| anyhow::anyhow!("omp.note_retrieval.base_url must be an HTTP(S) URL"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!(
+                "omp.note_retrieval.base_url must be HTTP(S) without embedded credentials, query, or fragment"
+            );
+        }
+        let typesafe_key_file = self
+            .typesafe_key_file
+            .filter(|path| !path.as_os_str().is_empty())
+            .context("omp.note_retrieval.typesafe_key_file is required when notebook_ids is nonempty")?;
+        if self.password_file.as_ref().is_some_and(|path| path.as_os_str().is_empty()) {
+            bail!("omp.note_retrieval.password_file must not be empty");
+        }
+        Ok(Some(NoteRetrievalConfig {
+            notebook_ids: self.notebook_ids,
+            base_url,
+            password_file: self.password_file.as_deref().map(expand_home).transpose()?,
+            typesafe_key_file: expand_home(&typesafe_key_file)?,
+        }))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +298,10 @@ impl AppConfig {
                 model: nonempty_optional(raw.omp.model, "omp.model")?,
                 title_model: nonempty_optional(raw.omp.title_model, "omp.title_model")?,
                 thinking_level: nonempty_optional(raw.omp.thinking_level, "omp.thinking_level")?,
+                note_retrieval: raw.omp.note_retrieval
+                    .map(RawNoteRetrievalConfig::validate)
+                    .transpose()?
+                    .flatten(),
             },
             runtime: RuntimeConfig {
                 database_path,
@@ -400,6 +464,7 @@ mod tests {
                 model: None,
                 title_model: None,
                 thinking_level: None,
+                note_retrieval: None,
             },
             runtime: RawRuntimeConfig::default(),
         };
@@ -434,6 +499,7 @@ mod tests {
                 model: None,
                 title_model: None,
                 thinking_level: None,
+                note_retrieval: None,
             },
             runtime: RawRuntimeConfig::default(),
         };
@@ -463,6 +529,7 @@ mod tests {
                 model: None,
                 title_model: None,
                 thinking_level: None,
+                note_retrieval: None,
             },
             runtime: RawRuntimeConfig::default(),
         })
@@ -493,9 +560,67 @@ mod tests {
                 model: None,
                 title_model: None,
                 thinking_level: None,
+                note_retrieval: None,
             },
             runtime,
         }
+    }
+
+    #[test]
+    fn note_retrieval_is_opt_in_and_defers_credential_loading() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.omp = toml::from_str(&format!(
+            "session_dir = {:?}\nallowed_root = {:?}",
+            root.path().join("sessions"), root.path()
+        ))
+        .expect("existing TOML remains valid");
+        assert!(AppConfig::from_raw(raw).unwrap().omp.note_retrieval.is_none());
+
+        for section in ["", "notebook_ids = []", "notebook_ids = []\nbase_url = 'invalid'"] {
+            let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+            raw.omp.note_retrieval = Some(toml::from_str(section).unwrap());
+            assert!(AppConfig::from_raw(raw).unwrap().omp.note_retrieval.is_none());
+        }
+
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.omp.note_retrieval = Some(toml::from_str(
+            "notebook_ids = ['notebook:example']\ntypesafe_key_file = '~/missing-key'\npassword_file = '~/missing-password'",
+        ).unwrap());
+        let config = AppConfig::from_raw(raw).expect("credentials are not read at parse time");
+        let retrieval = config.omp.note_retrieval.unwrap();
+        assert_eq!(retrieval.base_url, "http://127.0.0.1:5055");
+        assert_eq!(retrieval.typesafe_key_file, expand_home(Path::new("~/missing-key")).unwrap());
+        assert_eq!(retrieval.password_file, Some(expand_home(Path::new("~/missing-password")).unwrap()));
+    }
+
+    #[test]
+    fn rejects_invalid_enabled_note_retrieval() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for (section, expected) in [
+            ("notebook_ids = ['notebook:example']", "typesafe_key_file"),
+            ("notebook_ids = [' ']\ntypesafe_key_file = '/missing-key'", "notebook_ids"),
+            ("notebook_ids = ['notebook:example']\ntypesafe_key_file = ''", "typesafe_key_file"),
+            ("notebook_ids = ['notebook:example']\ntypesafe_key_file = '/missing-key'\npassword_file = ''", "password_file"),
+        ] {
+            let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+            raw.omp.note_retrieval = Some(toml::from_str(section).unwrap());
+            assert!(AppConfig::from_raw(raw).unwrap_err().to_string().contains(expected));
+        }
+        for url in [
+            "not a URL", "file:///tmp/notebook", "ftp://localhost",
+            "https://user:secret@example.com", "https://user@example.com",
+            "https://example.com?token=value", "https://example.com#fragment",
+        ] {
+            let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+            raw.omp.note_retrieval = Some(toml::from_str(&format!(
+                "notebook_ids = ['notebook:example']\ntypesafe_key_file = '/missing-key'\nbase_url = {url:?}"
+            )).unwrap());
+            assert!(AppConfig::from_raw(raw).unwrap_err().to_string().contains("base_url"));
+        }
+        assert!(toml::from_str::<RawNoteRetrievalConfig>(
+            "notebook_ids = []\nunknown_option = true"
+        ).is_err());
     }
 
     fn assert_invalid_history_runtime(

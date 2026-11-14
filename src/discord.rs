@@ -2432,6 +2432,7 @@ mod tests {
                 model: None,
                 title_model: None,
                 thinking_level: None,
+                note_retrieval: None,
             },
             runtime: RuntimeConfig {
                 database_path: root.join("bridge.sqlite"),
