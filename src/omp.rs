@@ -31,6 +31,7 @@ const MAX_RPC_LINE_BYTES: usize = 1_048_576;
 const ABORT_GRACE: Duration = Duration::from_secs(15);
 const DISCORD_HISTORY_TOOL: &str = "discord_channel_history";
 const DISCORD_PARTICIPANTS_TOOL: &str = "discord_thread_participants";
+const DISCORD_UPLOAD_TOOL: &str = "discord_upload_file";
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 // Preserve Discord's five-minute approval window plus bounded HTTP overhead.
@@ -64,6 +65,13 @@ pub struct ApprovalRequest {
     pub details: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadRequest {
+    pub path: PathBuf,
+    pub caption: Option<String>,
+}
+
 #[async_trait]
 pub trait OmpUi: Send + Sync {
     fn activity(&self, status: &'static str);
@@ -74,6 +82,7 @@ pub trait OmpUi: Send + Sync {
     async fn notify(&self, message: &str);
     async fn channel_history(&self, days: u16) -> Result<String, String>;
     async fn thread_participants(&self) -> Result<String, String>;
+    async fn upload_file(&self, request: UploadRequest) -> Result<String, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +139,7 @@ fn activity_status(frame: &Value) -> Option<&'static str> {
             Some("wait") => "Waiting for background work",
             Some("discord_channel_history") => "Reading channel history",
             Some("discord_thread_participants") => "Reading thread membership",
+            Some("discord_upload_file") => "Uploading a file",
             _ => "Running a tool",
         }),
         "tool_execution_end" => Some("Tool finished; working"),
@@ -1056,7 +1066,12 @@ impl<'a> ServiceRequest<'a> {
             })?
             .to_owned();
         let cancel = if frame.get("type").and_then(Value::as_str) == Some("host_tool_call") {
-            history_response(&id, Err("Bridge request cancelled".to_owned()))
+            let reason = if frame.get("toolName").and_then(Value::as_str) == Some(DISCORD_UPLOAD_TOOL) {
+                "Upload cancelled or timed out; delivery may already have occurred. Inspect the thread before retrying."
+            } else {
+                "Bridge request cancelled"
+            };
+            history_response(&id, Err(reason.to_owned()))
         } else if matches!(
             frame.get("method").and_then(Value::as_str),
             Some("cancel" | "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text")
@@ -1249,6 +1264,20 @@ where
                     "properties": {},
                     "additionalProperties": false
                 }
+            }, {
+                "name": DISCORD_UPLOAD_TOOL,
+                "label": "Discord Upload File",
+                "description": "Upload one local regular file to this session's current Discord thread. Relative paths resolve against the session working directory; files must be inside the configured allowed root and within the attachment size limit. Optional caption; mentions are disabled. Returns the message and attachment URLs. Upload only files the user authorized sharing; never upload credentials or private files without permission. On timeout or interruption delivery may have occurred: inspect the thread before retrying.",
+                "loadMode": "essential",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "caption": {"type": "string"}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
             }]
         }),
     )
@@ -1271,7 +1300,7 @@ where
                 .pointer("/data/toolNames")
                 .and_then(Value::as_array)
                 .is_some_and(|names| {
-                    [DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL]
+                    [DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL, DISCORD_UPLOAD_TOOL]
                         .iter()
                         .all(|required| names.iter().any(|name| name.as_str() == Some(*required)))
                 });
@@ -1360,6 +1389,15 @@ async fn service_response(frame: &Value, ui: &dyn OmpUi, max_history_days: u16) 
             }
             _ => Err("`discord_thread_participants` accepts no arguments".to_owned()),
         },
+        Some(DISCORD_UPLOAD_TOOL) => {
+            match serde_json::from_value::<UploadRequest>(
+                frame.get("arguments").cloned().unwrap_or(Value::Null),
+            ) {
+                Ok(request) if !request.path.as_os_str().is_empty() => ui.upload_file(request).await,
+                Ok(_) => Err("`path` must not be empty".to_owned()),
+                Err(error) => Err(format!("Invalid upload arguments: {error}")),
+            }
+        }
         _ => Err("OMP requested an unknown bridge-owned tool".to_owned()),
     };
     history_response(id, result)
@@ -1670,6 +1708,10 @@ mod tests {
         async fn thread_participants(&self) -> Result<String, String> {
             self.channel_history(1).await
         }
+
+        async fn upload_file(&self, _request: UploadRequest) -> Result<String, String> {
+            self.channel_history(1).await
+        }
     }
 
     fn turn(id: i64) -> Turn {
@@ -1948,7 +1990,11 @@ mod tests {
                 json!({
                     "type": "host_tool_call", "id": "wait-1",
                     "toolName": tool,
-                    "arguments": if tool == DISCORD_HISTORY_TOOL { json!({"days": 1}) } else { json!({}) },
+                    "arguments": match tool {
+                        DISCORD_HISTORY_TOOL => json!({"days": 1}),
+                        DISCORD_UPLOAD_TOOL => json!({"path": "report.txt"}),
+                        _ => json!({}),
+                    },
                 })
             } else {
                 json!({
@@ -1987,6 +2033,14 @@ mod tests {
         assert!(run.ui.dropped.load(Ordering::SeqCst));
         if tool.is_some() {
             assert_eq!(cancelled["isError"], true);
+            if tool == Some(DISCORD_UPLOAD_TOOL) {
+                assert!(
+                    cancelled["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("delivery may already have occurred")
+                );
+            }
         } else {
             assert_eq!(cancelled["cancelled"], true);
             assert!(cancelled.get("value").is_none());
@@ -2035,6 +2089,12 @@ mod tests {
     async fn host_participants_wait_is_cancelled_by_new_input_and_stop() {
         cancel_side_channel(false, Some(DISCORD_PARTICIPANTS_TOOL)).await;
         cancel_side_channel(true, Some(DISCORD_PARTICIPANTS_TOOL)).await;
+    }
+
+    #[tokio::test]
+    async fn host_upload_wait_is_cancelled_by_new_input_and_stop() {
+        cancel_side_channel(false, Some(DISCORD_UPLOAD_TOOL)).await;
+        cancel_side_channel(true, Some(DISCORD_UPLOAD_TOOL)).await;
     }
 
     #[tokio::test]
@@ -2793,6 +2853,10 @@ mod tests {
         async fn thread_participants(&self) -> Result<String, String> {
             panic!("prompts do not request participants")
         }
+
+        async fn upload_file(&self, _request: UploadRequest) -> Result<String, String> {
+            panic!("prompts do not upload files")
+        }
     }
 
     #[tokio::test]
@@ -3011,6 +3075,10 @@ mod tests {
                 Ok("thread members: <@42> (untrusted label: Peer)".to_owned())
             }
         }
+
+        async fn upload_file(&self, _request: UploadRequest) -> Result<String, String> {
+            panic!("history requests do not upload files")
+        }
     }
 
     #[test]
@@ -3156,11 +3224,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_rejects_invalid_arguments_before_accessing_files() {
+        for arguments in [
+            Value::Null,
+            json!({}),
+            json!({"path": ""}),
+            json!({"path": 42}),
+            json!({"path": "report.txt", "caption": false}),
+            json!({"path": "report.txt", "channel_id": "123"}),
+        ] {
+            let response = service_response(
+                &json!({
+                    "type": "host_tool_call",
+                    "id": "invalid-upload",
+                    "toolName": DISCORD_UPLOAD_TOOL,
+                    "arguments": arguments,
+                }),
+                &HistoryUi(false),
+                30,
+            ).await;
+            assert_eq!(response["isError"], true, "{arguments}");
+            assert_eq!(response["id"], "invalid-upload");
+        }
+    }
+
+    #[tokio::test]
     async fn registration_requires_all_discord_tools() {
         for names in [
             json!([DISCORD_HISTORY_TOOL]),
             json!([DISCORD_PARTICIPANTS_TOOL]),
             json!([DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL]),
+            json!([DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL, DISCORD_UPLOAD_TOOL]),
         ] {
             let (writer, reader) = tokio::io::duplex(8_192);
             let (response_writer, response_reader) = tokio::io::duplex(1_024);
@@ -3177,7 +3271,7 @@ mod tests {
             .unwrap();
             let mut frames = FramedRead::new(response_reader, LinesCodec::new());
             let result = register_host_tools(&mut input, &mut frames, &HistoryUi(false), 30).await;
-            assert_eq!(result.is_ok(), names.as_array().unwrap().len() == 2);
+            assert_eq!(result.is_ok(), names.as_array().unwrap().len() == 3);
             let mut commands = FramedRead::new(reader, LinesCodec::new());
             let command: Value =
                 serde_json::from_str(&commands.next().await.unwrap().unwrap()).unwrap();
@@ -3188,7 +3282,8 @@ mod tests {
                 command["tools"][1]["parameters"]["additionalProperties"],
                 false
             );
-            assert_eq!(command["tools"].as_array().unwrap().len(), 2);
+            assert_eq!(command["tools"][2]["name"], DISCORD_UPLOAD_TOOL);
+            assert_eq!(command["tools"].as_array().unwrap().len(), 3);
         }
     }
 }

@@ -47,6 +47,9 @@ use crate::{
 mod discord_prompts;
 use discord_prompts::PromptBroker;
 
+#[path = "discord_upload.rs"]
+mod discord_upload;
+
 #[path = "title_http.rs"]
 mod title_http;
 use title_http::{Reply as TitleReply, TitleHttp, TitleState};
@@ -472,6 +475,17 @@ impl ThreadMessenger for DiscordMessenger {
                 self.config.runtime.discord_history_timeout_seconds
             )
         })?
+    }
+
+    async fn upload_file(&self, thread_id: ThreadId, request: crate::omp::UploadRequest) -> Result<String> {
+        tokio::time::timeout(
+            Duration::from_secs(self.config.runtime.discord_history_timeout_seconds),
+            self.upload_file_inner(thread_id, request),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!(
+            "Discord upload timed out; delivery may have succeeded. Check the thread before retrying; no automatic retry was made"
+        ))?
     }
 
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()> {
@@ -2568,6 +2582,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_http_posts_real_multipart_to_current_thread_and_returns_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"local attachment bytes\0\n";
+        std::fs::write(root.path().join("report.txt"), bytes).unwrap();
+        let mut response = history_message(456, 1_700_000_001, "");
+        response.channel_id = SerenityChannelId::new(3);
+        response.attachments.push(serde_json::from_value(serde_json::json!({
+            "id": "789",
+            "filename": "discord-report.txt",
+            "size": bytes.len(),
+            "url": "https://cdn.discordapp.com/attachments/3/789/discord-report.txt",
+            "proxy_url": "https://media.discordapp.net/attachments/3/789/discord-report.txt"
+        })).unwrap());
+        let (http, requests) = discord_api(vec![
+            ("POST", "/channels/3/messages", 200, serde_json::to_value(response).unwrap()),
+        ]);
+        let messenger = participants_messenger(root.path(), http).await;
+        let receipt: serde_json::Value = serde_json::from_str(&messenger.upload_file(
+            ThreadId::new(3),
+            crate::omp::UploadRequest {
+                path: "report.txt".into(),
+                caption: Some("@everyone <@7> report".into()),
+            },
+        ).await.unwrap()).unwrap();
+        assert_eq!(receipt["message_id"], "456");
+        assert_eq!(receipt["channel_id"], "3");
+        assert_eq!(receipt["message_url"], "https://discord.com/channels/1/3/456");
+        assert_eq!(receipt["attachment"]["filename"], "discord-report.txt");
+        assert_eq!(receipt["attachment"]["size"], bytes.len());
+        assert_eq!(receipt["attachment"]["url"], "https://cdn.discordapp.com/attachments/3/789/discord-report.txt");
+        let bodies = requests.join().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let multipart = bodies[0].as_str().unwrap();
+        assert!(multipart.contains("name=\"files[0]\"; filename=\"report.txt\""));
+        assert!(multipart.as_bytes().windows(bytes.len()).any(|part| part == bytes));
+        assert!(!multipart.contains(root.path().to_str().unwrap()));
+        let payload = multipart.split("name=\"payload_json\"\r\n\r\n").nth(1).unwrap()
+            .split("\r\n--").next().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload["content"], "@everyone <@7> report");
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert_eq!(payload["attachments"][0]["filename"], "report.txt");
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_unauthorized_sessions_before_network_or_file_access() {
+        for case in ["unknown", "guild", "parent"] {
+            let root = tempfile::tempdir().unwrap();
+            let (http, requests) = discord_api(vec![]);
+            let mut messenger = participants_messenger(root.path(), http).await;
+            let thread = match case {
+                "unknown" => ThreadId::new(4),
+                "guild" => {
+                    Arc::make_mut(&mut messenger.config).discord.guilds.clear();
+                    ThreadId::new(3)
+                }
+                _ => {
+                    Arc::make_mut(&mut messenger.config).discord.guilds[0].allowed_channels.clear();
+                    ThreadId::new(3)
+                }
+            };
+            let error = messenger.upload_file(thread, crate::omp::UploadRequest {
+                path: "missing".into(),
+                caption: None,
+            }).await.unwrap_err().to_string();
+            assert!(error.contains(match case {
+                "unknown" => "unknown Discord thread",
+                "guild" => "unconfigured guild",
+                _ => "not authorized",
+            }), "{error}");
+            assert!(requests.join().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_http_failure_reports_ambiguous_delivery_without_application_retry() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("report.txt"), b"hello").unwrap();
+        let (http, requests) = discord_api(vec![
+            ("POST", "/channels/3/messages", 500, serde_json::json!({"code": 0, "message": "lost response"})),
+        ]);
+        let messenger = participants_messenger(root.path(), http).await;
+        let error = messenger.upload_file(ThreadId::new(3), crate::omp::UploadRequest {
+            path: "report.txt".into(),
+            caption: None,
+        }).await.unwrap_err().to_string();
+        assert!(error.contains("delivery may have succeeded"));
+        assert!(error.contains("no automatic retry"));
+        assert_eq!(requests.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn participants_http_paginates_current_thread_and_resolves_missing_member_identity() {
         let root = tempfile::tempdir().unwrap();
         let first_page: Vec<_> = (1..=100).map(|id| thread_member_json(id, true)).collect();
@@ -2839,6 +2945,13 @@ mod tests {
                 stream.read_exact(&mut body).unwrap();
                 let body = if body.is_empty() {
                     serde_json::Value::Null
+                } else if headers.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-type")
+                            && value.trim().starts_with("multipart/form-data;")
+                    })
+                }) {
+                    serde_json::Value::String(String::from_utf8(body).unwrap())
                 } else {
                     serde_json::from_slice(&body).unwrap()
                 };

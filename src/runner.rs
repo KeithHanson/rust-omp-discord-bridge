@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     activity::ActivityReporter,
     domain::{MessageId, SessionStatus, ThreadId, Turn, TurnStatus},
-    omp::{AgentTransport, ApprovalRequest, OmpTurnError, OmpUi, TurnControl, TurnInput},
+    omp::{AgentTransport, ApprovalRequest, OmpTurnError, OmpUi, TurnControl, TurnInput, UploadRequest},
     presence::{PresenceSnapshot, PresenceTracker, WorkingPresence},
     render::chunk_message,
     store::Store,
@@ -125,6 +125,7 @@ pub trait ThreadMessenger: Send + Sync {
     async fn notify(&self, thread_id: ThreadId, message: &str);
     async fn channel_history(&self, thread_id: ThreadId, days: u16) -> Result<String>;
     async fn thread_participants(&self, thread_id: ThreadId) -> Result<String>;
+    async fn upload_file(&self, thread_id: ThreadId, request: UploadRequest) -> Result<String>;
     /// Review a working session's topic/phase, or mark its current topic completed.
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()>;
 }
@@ -712,6 +713,13 @@ impl OmpUi for RunnerUi<'_> {
             .await
             .map_err(|error| format!("{error:#}"))
     }
+
+    async fn upload_file(&self, request: UploadRequest) -> Result<String, String> {
+        self.messenger
+            .upload_file(self.thread_id, request)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
 }
 
 fn outcome_notice(
@@ -1028,6 +1036,10 @@ mod tests {
 
         async fn thread_participants(&self, _thread_id: ThreadId) -> Result<String> {
             Ok("[]".to_owned())
+        }
+
+        async fn upload_file(&self, _thread_id: ThreadId, _request: UploadRequest) -> Result<String> {
+            panic!("unexpected file upload")
         }
 
         async fn thread_status(&self, _thread_id: ThreadId, status: &str) -> Result<()> {

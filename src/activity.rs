@@ -190,6 +190,14 @@ mod tests {
             unreachable!()
         }
 
+        async fn upload_file(
+            &self,
+            _: ThreadId,
+            _: crate::omp::UploadRequest,
+        ) -> Result<String> {
+            unreachable!("activity must not upload files")
+        }
+
         async fn thread_status(&self, _: ThreadId, _: &str) -> Result<()> {
             unreachable!("activity must not change thread status")
         }

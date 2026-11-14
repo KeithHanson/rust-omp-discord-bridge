@@ -382,6 +382,20 @@ can indicate that this toggle is disabled or that the bot lacks thread access.
 The tool reports the underlying Discord error; it never substitutes message
 authors for actual thread membership.
 
+OMP can call `discord_upload_file` with `{"path":"report.pdf","caption":"Report"}`
+to attach one local file to the current managed thread. `caption` is optional;
+mentions are disabled. Relative paths resolve against the session working
+directory, and resolved files must stay within `omp.allowed_root`. Only regular
+files are accepted, with reads bounded by `runtime.max_attachment_bytes`
+(25,000,000 bytes by default). Discord can impose a lower limit.
+Uploads share `runtime.discord_history_timeout_seconds`. Opened-file containment
+checks require Linux `/proc/self/fd`, including in containers.
+The result contains the posted message and attachment URLs. No target channel
+argument is accepted. Upload only files authorized for sharing; the allowed root
+is a file-access boundary, not permission to disclose its contents.
+Interrupted or timed-out uploads may already be visible: inspect the thread
+before retrying rather than creating duplicate attachments.
+
 Thread titles are reviewed approximately once a minute while the queue is not
 completed. A separate, tool-free OMP call reads bounded recent conversation
 context and infers a concise topic and status: `🛠️` working, `🧠` thinking,

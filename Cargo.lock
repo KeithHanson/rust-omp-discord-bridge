@@ -992,6 +992,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "futures-util",
+ "libc",
  "regex",
  "reqwest",
  "serde",

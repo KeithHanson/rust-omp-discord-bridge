@@ -73,6 +73,9 @@ impl OmpUi for Ui {
     async fn thread_participants(&self) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
+    async fn upload_file(&self, _: omp_discord_bridge::omp::UploadRequest) -> Result<String, String> {
+        Err("Discord is deliberately unavailable in this local smoke test".into())
+    }
 }
 
 fn turn(id: i64, content: &str) -> Turn {
