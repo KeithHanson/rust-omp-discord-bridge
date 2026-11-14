@@ -8,11 +8,12 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use futures_util::{StreamExt, future};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     process::{Child, ChildStdout, Command},
     sync::Notify,
     time::{Instant, Sleep, sleep, sleep_until, timeout},
@@ -110,9 +111,18 @@ impl OmpTurnError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct AvailableModel {
+    pub provider: String,
+    pub id: String,
+}
+
 #[async_trait]
 pub trait AgentTransport: Send + Sync {
     async fn usage(&self) -> anyhow::Result<String>;
+    async fn available_models(&self) -> anyhow::Result<Vec<AvailableModel>> {
+        anyhow::bail!("model listing is unavailable for this transport")
+    }
     async fn run_turn(
         &self,
         session: &Session,
@@ -177,11 +187,52 @@ impl OmpTransport {
         }
     }
 
+    pub async fn available_models(&self) -> anyhow::Result<Vec<AvailableModel>> {
+        // OMP's chat catalog uses ModelRegistry.getAvailable(), including
+        // configured credentials and extension-provided models.
+        let mut process = Command::new(&self.config.executable)
+            .args(["models", "--json"])
+            .current_dir(&self.config.allowed_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("could not start OMP model query")?;
+        let result = timeout(STARTUP_TIMEOUT, async {
+            let stdout = process.stdout.take().context("model stdout unavailable")?;
+            let mut bytes = Vec::new();
+            stdout
+                .take(MAX_RPC_LINE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            anyhow::ensure!(
+                bytes.len() <= MAX_RPC_LINE_BYTES,
+                "OMP model response exceeded size limit"
+            );
+            anyhow::ensure!(process.wait().await?.success(), "OMP model query failed");
+            #[derive(serde::Deserialize)]
+            struct Catalog {
+                models: Vec<AvailableModel>,
+            }
+            let catalog: Catalog =
+                serde_json::from_slice(&bytes).context("invalid OMP model response")?;
+            Ok(catalog.models)
+        })
+        .await
+        .context("OMP model query timed out")
+        .and_then(|result| result);
+        if result.is_err() {
+            kill_process(&mut process).await?;
+        }
+        result
+    }
+
     pub async fn probe(&self) -> Result<(), OmpTurnError> {
         let mut process = bounded(
             STARTUP_TIMEOUT,
             "spawning OMP",
-            self.spawn(None, &self.config.allowed_root),
+            self.spawn(None, &self.config.allowed_root, None),
         )
         .await?;
         let result = async {
@@ -236,7 +287,7 @@ impl OmpTransport {
         let mut process = bounded(
             STARTUP_TIMEOUT,
             "spawning OMP",
-            self.spawn(resume_path.as_ref(), &session.cwd),
+            self.spawn(resume_path.as_ref(), &session.cwd, session.model.as_deref()),
         )
         .await?;
         let result = async {
@@ -247,6 +298,26 @@ impl OmpTransport {
                 })?);
             let startup = bounded(STARTUP_TIMEOUT, "initializing OMP RPC", async {
                 expect_ready(&mut frames).await?;
+                if let Some(model) = session.model.as_deref() {
+                    set_session_model(&mut input, &mut frames, model, ui, self.discord_history_max_days)
+                        .await?;
+                    // set_model resets thinking to the selected model's default.
+                    // Reapply the bridge's explicit thinking configuration.
+                    if let Some(level) = self.config.thinking_level.as_deref() {
+                        startup_command(
+                            &mut input,
+                            &mut frames,
+                            &json!({
+                                "id": "session-thinking",
+                                "type": "set_thinking_level",
+                                "level": level,
+                            }),
+                            ui,
+                            self.discord_history_max_days,
+                        )
+                        .await?;
+                    }
+                }
                 register_host_tools(&mut input, &mut frames, ui, self.discord_history_max_days)
                     .await
             });
@@ -722,6 +793,7 @@ impl OmpTransport {
         &self,
         resume_path: Option<&PathBuf>,
         cwd: &std::path::Path,
+        model: Option<&str>,
     ) -> Result<Child, OmpTurnError> {
         tokio::fs::create_dir_all(&self.config.session_dir)
             .await
@@ -744,7 +816,7 @@ impl OmpTransport {
         if let Some(path) = resume_path {
             command.arg("--resume").arg(path);
         }
-        if let Some(model) = &self.config.model {
+        if let Some(model) = model.or(self.config.model.as_deref()) {
             command.arg("--model").arg(model);
         }
         if let Some(level) = &self.config.thinking_level {
@@ -834,6 +906,10 @@ impl OmpTransport {
 impl AgentTransport for OmpTransport {
     async fn usage(&self) -> anyhow::Result<String> {
         crate::usage::fetch(&self.config.executable, &self.config.allowed_root).await
+    }
+
+    async fn available_models(&self) -> anyhow::Result<Vec<AvailableModel>> {
+        OmpTransport::available_models(self).await
     }
 
     async fn run_turn(
@@ -1220,6 +1296,80 @@ where
         })
     })
     .await
+}
+
+async fn startup_command<W, R>(
+    input: &mut BufWriter<W>,
+    frames: &mut FramedRead<R, LinesCodec>,
+    command: &Value,
+    ui: &dyn OmpUi,
+    max_history_days: u16,
+) -> Result<Value, OmpTurnError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    send_frame(input, command).await?;
+    loop {
+        let frame = next_frame(frames.next().await, false)?;
+        service_frame(&frame, input, ui, max_history_days).await?;
+        if frame.get("type").and_then(Value::as_str) == Some("response")
+            && frame.get("id") == command.get("id")
+        {
+            if frame.get("success").and_then(Value::as_bool) != Some(true) {
+                return Err(OmpTurnError::Rejected(
+                    frame
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("OMP rejected session configuration")
+                        .to_owned(),
+                ));
+            }
+            return Ok(frame);
+        }
+    }
+}
+
+async fn set_session_model<W, R>(
+    input: &mut BufWriter<W>,
+    frames: &mut FramedRead<R, LinesCodec>,
+    model: &str,
+    ui: &dyn OmpUi,
+    max_history_days: u16,
+) -> Result<(), OmpTurnError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let (provider, id) = model
+        .split_once('/')
+        .filter(|(provider, id)| !provider.is_empty() && !id.is_empty())
+        .ok_or_else(|| {
+            OmpTurnError::Rejected("session model must be an exact provider/model".to_owned())
+        })?;
+    // CLI selection initializes OMP; this authenticated exact RPC selection
+    // also overrides any model restored from the conversation before dispatch.
+    let response = startup_command(
+        input,
+        frames,
+        &json!({
+            "id": "session-model",
+            "type": "set_model",
+            "provider": provider,
+            "modelId": id,
+        }),
+        ui,
+        max_history_days,
+    )
+    .await?;
+    if response.pointer("/data/provider").and_then(Value::as_str) != Some(provider)
+        || response.pointer("/data/id").and_then(Value::as_str) != Some(id)
+    {
+        return Err(OmpTurnError::Protocol(
+            "OMP selected a different model than the session override".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn register_host_tools<W, R>(
@@ -1738,6 +1888,67 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(60),
             ack_deadline: None,
             interrupted_deadline: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_model_requires_exact_correlated_acknowledgement() {
+        for (response, accepted) in [
+            (
+                json!({
+                    "success": true,
+                    "data": {"provider": "provider", "id": "namespace/model"},
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "success": true,
+                    "data": {"provider": "other", "id": "namespace/model"},
+                }),
+                false,
+            ),
+            (
+                json!({"success": false, "error": "No API key for provider/namespace/model"}),
+                false,
+            ),
+        ] {
+            let (client, server) = tokio::io::duplex(4096);
+            let (client_read, client_write) = tokio::io::split(client);
+            let (server_read, server_write) = tokio::io::split(server);
+            let mut input = BufWriter::new(client_write);
+            let mut frames =
+                FramedRead::new(client_read, LinesCodec::new_with_max_length(MAX_RPC_LINE_BYTES));
+            let ui = TestUi::default();
+            let selection =
+                set_session_model(&mut input, &mut frames, "provider/namespace/model", &ui, 7);
+            let protocol = async {
+                let mut commands =
+                    FramedRead::new(server_read, LinesCodec::new_with_max_length(MAX_RPC_LINE_BYTES));
+                let mut events = BufWriter::new(server_write);
+                let command = next_frame(commands.next().await, false).unwrap();
+                assert_eq!(
+                    command,
+                    json!({
+                        "id": "session-model",
+                        "type": "set_model",
+                        "provider": "provider",
+                        "modelId": "namespace/model",
+                    })
+                );
+                send_frame(
+                    &mut events,
+                    &json!({"type": "response", "id": "unrelated", "success": true}),
+                )
+                .await
+                .unwrap();
+                let mut response = response;
+                response["type"] = json!("response");
+                response["id"] = command["id"].clone();
+                send_frame(&mut events, &response).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(selection, protocol);
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
         }
     }
 

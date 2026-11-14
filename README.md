@@ -16,7 +16,7 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - Discord prompts for OMP `ask` forms, choices, and text input, with answers returned to the waiting call;
 - one rolling activity card per active conversation run, including replacement turns, with assistant messages delivered as they complete;
 - minute-based topic/status title review, rate-limit-aware refresh, and queue-idle completion;
-- `status`, `stop`, and `new` controls inside managed threads;
+- `status`, `models`, `model`, `stop`, and `new` controls inside managed threads;
 - duplicate Discord message rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
 - bounded attachment metadata and Discord-safe response chunking;
@@ -317,7 +317,7 @@ human messages handled by that bridge. The counter survives daemon restarts and
 is updated atomically with admission. Duplicate deliveries and replayed older
 human messages do not replenish the budget. At the limit, an authorized human
 must speak again before
-bot exchanges can resume. Bot messages cannot invoke `status`, `stop`, or `new`,
+bot exchanges can resume. Bot messages cannot invoke `status`, `models`, `model`, `stop`, or `new`,
 or approve tool calls, even if a bot ID appears in the human-user allowlist.
 
 Any bot with access to an allowed channel can request OMP work by mentioning this
@@ -434,8 +434,19 @@ treat inferred summaries as a secret-storage boundary.
 Thread controls must be the complete message:
 
 - `status` — show session, working directory, queue, uncertain-turn state, and OpenAI/Codex provider quota usage with reset times;
+- `models` (or `model`) — list available provider/model pairs and this thread's model override;
+- `model provider/model` — select an exact entry from that list for this thread;
+- `model default` — clear this thread's override;
 - `stop` — stop the thread and cancel its active turn;
 - `new` — after the active turn stops, discard queued turns and start a fresh OMP session.
+
+Model changes require an idle thread with no queued or running turns. They retain
+conversation history and apply on the next turn; they never interrupt active work.
+The override survives bridge restarts and `new`, and does not change other threads,
+the global OMP configuration, or the title-review model. Clearing the override
+restores normal bridge/OMP model selection, including saved-session selection when
+no bridge model is configured. Commands also accept a leading `/` as ordinary text;
+these are not registered Discord slash commands. Only authorized humans may use them.
 
 `status` queries the configured OMP executable's `usage --json --provider openai-codex`
 interface without interrupting the conversation or making a model call. It shows

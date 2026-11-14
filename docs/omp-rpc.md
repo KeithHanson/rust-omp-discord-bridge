@@ -18,6 +18,26 @@ omp --mode rpc-ui \
 
 The child inherits the bridge process environment, including `HOME` and provider API-key variables. OMP therefore uses its normal credential database at `~/.omp/agent/agent.db`, its normal `.env` lookup, and the project configuration in `<cwd>/.omp`. `session-dir` relocates conversation files only; it does not create a separate OMP installation. When `omp.model` is omitted, OMP selects its configured default. An explicit model must use an authenticated provider ID: `openai-codex` account access and `openai` API-key access are distinct routes.
 
+Managed threads can select a persistent, nullable provider/model override using
+`model provider/model`, with choices listed by `models`. The bridge validates the
+exact pair against OMP's available-model catalog before saving it. Selection is
+idle-only and does not create a new conversation. The override takes precedence
+over `omp.model` and saved-session selection for subsequent conversation runs.
+`model default` removes the override; title review retains its separate selection
+policy. SQLite migration adds the nullable session field without modifying prior
+conversation files.
+
+Verification of this feature used OMP 18.20.0 with the host authentication profile
+and isolated temporary workspace, SQLite, and session directory. The real catalog
+returned eight available models. A new conversation selected
+`openai-codex/gpt-5.6-luna`; its resumed conversation selected
+`openai-codex/gpt-5.6-sol` and recalled the original marker. Both exact RPC selections
+were acknowledged. All 191 library tests passed, including model persistence,
+idle guards, provider-ID validation, and the local Discord HTTP control route.
+Only one authenticated provider was available for this live smoke; cross-provider
+selection is covered by deterministic tests, not a live provider-to-provider turn.
+This does not establish deployment or Discord-client appearance.
+
 `rpc-ui` is required for interactive requests. OMP 18.20.0 sends tool approvals as `extension_ui_request` `select` frames. The bridge recognizes only the exact one-shot `Approve` and `Deny` choices and presents them as Discord buttons; persistent session-wide approval remains unavailable. Other selections and text/editor requests are routed to Discord prompts rather than silently cancelled. OMP's HTML `ask` tool uses these requests field by field: checkbox groups repeatedly select one toggle until “Done selecting,” and OMP performs form validation and assembles the final typed answer object. The bridge returns exact option strings and text, not display labels truncated to Discord's component limits.
 
 UI waits remain interruptible. An OMP `cancel` request targets the original request ID; dropping its wait invalidates the Discord controls. Responses to a host-side UI timeout include `cancelled: true` and `timedOut: true`, so OMP can distinguish elapsed time from explicit cancellation. Secret-input requests are refused rather than collected in a public thread. Unsupported UI methods produce a visible explanation rather than pretending the user cancelled.

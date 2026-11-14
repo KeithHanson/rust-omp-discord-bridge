@@ -116,6 +116,7 @@ pub struct Session {
     pub parent_channel_id: ChannelId,
     pub trigger_message_id: MessageId,
     pub omp_session_path: Option<PathBuf>,
+    pub model: Option<String>,
     pub cwd: PathBuf,
     pub created_by_user_id: UserId,
     pub status: SessionStatus,

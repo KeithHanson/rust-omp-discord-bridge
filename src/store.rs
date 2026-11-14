@@ -122,6 +122,7 @@ impl Store {
                 "latest_human_message_id",
                 "ALTER TABLE sessions ADD COLUMN latest_human_message_id TEXT",
             ),
+            ("model", "ALTER TABLE sessions ADD COLUMN model TEXT"),
         ] {
             let existing: Option<String> =
                 sqlx::query_scalar("SELECT name FROM pragma_table_info('sessions') WHERE name = ?")
@@ -196,6 +197,23 @@ impl Store {
         .execute(&self.pool)
         .await?;
         require_one_row(result.rows_affected(), "session path update")
+    }
+
+    pub async fn set_session_model(&self, thread_id: ThreadId, model: Option<&str>) -> Result<()> {
+        // Admission may race the runner's idle check. Check pending work and
+        // update the override in one write so no queued turn changes models.
+        let result = sqlx::query(
+            "UPDATE sessions SET model = ?, updated_at_ms = ? WHERE thread_id = ? AND NOT EXISTS (SELECT 1 FROM turns WHERE turns.thread_id = sessions.thread_id AND status IN ('queued', 'running'))",
+        )
+        .bind(model)
+        .bind(now_ms()?)
+        .bind(thread_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            bail!("model changes require a mapped session with no queued or running turns");
+        }
+        Ok(())
     }
 
     pub async fn reset_session(&self, thread_id: ThreadId) -> Result<u64> {
@@ -548,6 +566,7 @@ fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Session> {
         omp_session_path: row
             .try_get::<Option<String>, _>("omp_session_path")?
             .map(Into::into),
+        model: row.try_get("model")?,
         cwd: row.try_get::<String, _>("cwd")?.into(),
         created_by_user_id: parse_id(row.try_get("created_by_user_id")?, "created_by_user_id")?,
         status: SessionStatus::from_database(row.try_get("status")?)?,
@@ -717,7 +736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_mapping_and_omp_path_survive_reopen() {
+    async fn session_mapping_path_and_model_survive_reopen() {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("bridge.sqlite");
         let session_path = directory.path().join("omp-session.jsonl");
@@ -730,6 +749,10 @@ mod tests {
             .set_session_path(ThreadId::new(10), &session_path)
             .await
             .expect("set OMP path");
+        store
+            .set_session_model(ThreadId::new(10), Some("openai/shared"))
+            .await
+            .expect("set model");
         store.pool.close().await;
 
         let reopened = Store::open(&database).await.expect("reopen store");
@@ -743,6 +766,22 @@ mod tests {
             Some(session_path.as_path())
         );
         assert_eq!(session.cwd, std::env::temp_dir());
+        assert_eq!(session.model.as_deref(), Some("openai/shared"));
+        reopened
+            .set_session_model(ThreadId::new(10), None)
+            .await
+            .expect("clear override");
+        reopened.pool.close().await;
+        let defaulted = Store::open(&database).await.expect("reopen default");
+        assert!(
+            defaulted
+                .session(ThreadId::new(10))
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .is_none()
+        );
     }
 
     async fn enqueue(store: &Store, thread: u64, message: u64) -> i64 {
@@ -1226,10 +1265,12 @@ mod tests {
             .await
             .expect("create original schema");
         let original = Store { pool };
-        original
-            .create_session(&new_session(10, 20))
-            .await
-            .expect("create original session");
+        sqlx::query(
+            "INSERT INTO sessions (thread_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES ('10', '1', '2', '20', '/tmp', '3', 'active', 0, 0)",
+        )
+        .execute(&original.pool)
+        .await
+        .expect("create original session");
         let mut ids = Vec::new();
         for message in [30, 31] {
             let result = sqlx::query(
@@ -1254,6 +1295,15 @@ mod tests {
         let migrated = Store::open(&database).await.expect("migrate");
         assert_eq!(budget_state(&migrated, 10).await, (0, None));
         assert_eq!(interruption_link(&migrated, first).await, None);
+        assert!(
+            migrated
+                .session(ThreadId::new(10))
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .is_none()
+        );
         assert_eq!(
             migrated
                 .session_by_trigger(MessageId::new(20))
