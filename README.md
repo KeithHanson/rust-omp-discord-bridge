@@ -14,7 +14,7 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - real OMP resume through its native RPC protocol;
 - one-shot Discord approval buttons for OMP writes and executable actions;
 - Discord prompts for OMP `ask` forms, choices, and text input, with answers returned to the waiting call;
-- one rolling activity card per active conversation run, including replacement turns, with assistant messages delivered as they complete;
+- one stationary activity card per active conversation run, including replacement turns, with assistant messages delivered as they complete;
 - minute-based topic/status title review, rate-limit-aware refresh, and queue-idle completion;
 - `status`, `stop`, and `new` controls inside managed threads;
 - duplicate Discord message rejection;
@@ -33,16 +33,15 @@ Tool arguments, tool output, and reasoning content are never included.
 The embed stands alone, without a separate `OMP:` text line.
 
 Updates are coalesced every five seconds, including elapsed-time refreshes during
-quiet work. If another message has appeared below the card, the bridge posts a
-replacement before deleting the old card; otherwise it edits in place. Reposts
-suppress notifications and mentions. This keeps status near the latest conversation,
-not anchored to the viewport when reading older messages. Completion, cancellation,
-failure, and uncertain outcomes finalize the card.
+quiet work. The bridge edits the original card in place, even when newer messages
+appear below it. It never relocates the card to the bottom of the conversation.
+Cards suppress notifications and mentions and can scroll out of view.
+Completion, cancellation, failure, and uncertain outcomes finalize the same card.
 
-Activity delivery is best-effort: a failed or timed-out create/read/edit is logged
+Activity delivery is best-effort: a failed or timed-out create/edit is logged
 and disables further card updates for that run without interrupting OMP or replaying
-work. Each refresh has a ten-second deadline. Failed deletion can leave an older
-card behind. Assistant text is delivered in separate messages. After a process
+work. Each refresh has a ten-second deadline.
+Assistant text is delivered in separate messages. After a process
 crash, an old card can remain stale; use `status` to inspect durable turn state.
 Activity message IDs are not persisted.
 
@@ -412,7 +411,7 @@ idle. Thus `✅` means the queue is idle, not that every task succeeded.
 Discord permissions and rename rate limits apply. Update failures are logged
 without blocking turns. The bot must own the thread or have Manage Threads permission.
 
-Titles use only the status emoji and topic; detailed activity stays in the rolling
+Titles use only the status emoji and topic; detailed activity stays in the stationary
 card. Completion sets `✅` on the latest topic and stops periodic inference.
 A new turn reopens review. The reviewer cannot override the queue-idle completion
 rule. The earlier `[OMP: <phase>]` prefix is removed on the next title update.

@@ -404,18 +404,6 @@ impl ThreadMessenger for DiscordMessenger {
         finished: bool,
     ) -> Result<MessageId> {
         let channel_id = SerenityChannelId::new(thread_id.get());
-        let newest = channel_id.messages(&self.http, GetMessages::new().limit(1)).await?;
-        if newest.first().map(|message| message.id.get()) != Some(message_id.get()) {
-            let replacement = self.create_activity(thread_id, content, finished).await?;
-            // Never lose the tracked replacement because cleanup failed.
-            if let Err(error) = channel_id
-                .delete_message(&self.http, serenity::all::MessageId::new(message_id.get()))
-                .await
-            {
-                tracing::warn!(%thread_id, %message_id, %error, "failed to delete previous activity card");
-            }
-            return Ok(replacement);
-        }
         channel_id
             .edit_message(
                 &self.http,
@@ -1825,11 +1813,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activity_refresh_edits_only_when_card_is_newest() {
+    async fn activity_refresh_edits_original_card_without_reading_or_reposting() {
         let root = tempfile::tempdir().unwrap();
         let message = serde_json::to_value(routing_message(true, "OMP:")).unwrap();
         let (http, requests) = discord_api(vec![
-            ("GET", "/channels/3/messages?&limit=1", 200, serde_json::json!([message.clone()])),
             ("PATCH", "/channels/3/messages/100", 200, message),
         ]);
         let messenger = participants_messenger(root.path(), http).await;
@@ -1838,64 +1825,25 @@ mod tests {
         ).await.unwrap();
         assert_eq!(id, MessageId::new(100));
         let bodies = requests.join().unwrap();
-        assert_eq!(bodies[1]["content"], "");
-        assert_eq!(bodies[1]["embeds"][0]["title"], "NOW");
-        assert_eq!(bodies[1]["embeds"][0]["description"], "**Thinking**\n5s elapsed");
-        assert_eq!(bodies[1]["embeds"][0]["color"], 0x3498db);
-        assert_eq!(bodies[1]["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert_eq!(bodies[0]["content"], "");
+        assert_eq!(bodies[0]["embeds"][0]["title"], "NOW");
+        assert_eq!(bodies[0]["embeds"][0]["description"], "**Thinking**\n5s elapsed");
+        assert_eq!(bodies[0]["embeds"][0]["color"], 0x3498db);
+        assert_eq!(bodies[0]["allowed_mentions"]["parse"], serde_json::json!([]));
     }
 
     #[tokio::test]
-    async fn activity_reposts_before_deleting_and_tracks_replacement_after_delete_failure() {
-        for delete_status in [204, 403] {
-            let root = tempfile::tempdir().unwrap();
-            let mut newest = routing_message(false, "A newer message");
-            newest.id = serenity::all::MessageId::new(101);
-            let mut replacement = routing_message(true, "");
-            replacement.id = serenity::all::MessageId::new(102);
-            let replacement = serde_json::to_value(replacement).unwrap();
-            let (http, requests) = discord_api(vec![
-                ("GET", "/channels/3/messages?&limit=1", 200, serde_json::json!([newest])),
-                ("POST", "/channels/3/messages", 200, replacement.clone()),
-                ("DELETE", "/channels/3/messages/100", delete_status,
-                    serde_json::json!({"code": 50013, "message": "Missing Permissions"})),
-                ("GET", "/channels/3/messages?&limit=1", 200, serde_json::json!([replacement.clone()])),
-                ("PATCH", "/channels/3/messages/102", 200, replacement),
-            ]);
-            let messenger = participants_messenger(root.path(), http).await;
-            let id = messenger.edit_activity(
-                ThreadId::new(3), MessageId::new(100), "OMP: Thinking <@8> — 5s elapsed", false,
-            ).await.unwrap();
-            assert_eq!(id, MessageId::new(102));
-            assert_eq!(messenger.edit_activity(
-                ThreadId::new(3), id, "OMP: Failed — 10s elapsed", true,
-            ).await.unwrap(), id);
-            let bodies = requests.join().unwrap();
-            assert_eq!(bodies[1]["content"], "");
-            assert_eq!(bodies[1]["flags"], MessageFlags::SUPPRESS_NOTIFICATIONS.bits());
-            for field in ["parse", "users", "roles"] {
-                assert_eq!(bodies[1]["allowed_mentions"][field], serde_json::json!([]));
-            }
-            assert!(!bodies[1]["embeds"][0]["description"].as_str().unwrap().contains("<@"));
-            assert_eq!(bodies[4]["content"], "");
-            assert_eq!(bodies[4]["embeds"][0]["title"], "STATUS");
-            assert_eq!(bodies[4]["embeds"][0]["color"], 0xe74c3c);
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_activity_repost_never_deletes_old_card() {
+    async fn failed_activity_edit_does_not_repost_card() {
         let root = tempfile::tempdir().unwrap();
         let (http, requests) = discord_api(vec![
-            ("GET", "/channels/3/messages?&limit=1", 200, serde_json::json!([])),
-            ("POST", "/channels/3/messages", 403,
+            ("PATCH", "/channels/3/messages/100", 403,
                 serde_json::json!({"code": 50013, "message": "Missing Permissions"})),
         ]);
         let messenger = participants_messenger(root.path(), http).await;
         assert!(messenger.edit_activity(
             ThreadId::new(3), MessageId::new(100), "OMP: Thinking — 5s elapsed", false,
         ).await.is_err());
-        assert_eq!(requests.join().unwrap().len(), 2);
+        assert_eq!(requests.join().unwrap().len(), 1);
     }
 
     #[test]
