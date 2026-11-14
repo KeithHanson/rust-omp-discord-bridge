@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
         parent_channel_id: ChannelId::new(1),
         trigger_message_id: MessageId::new(1),
         omp_session_path: None,
+        model: None,
         cwd: workspace.clone(),
         created_by_user_id: UserId::new(1),
         status: SessionStatus::Active,

@@ -476,6 +476,78 @@ impl ThreadQueueRunner {
         Ok(discarded)
     }
 
+    pub async fn models(&self, thread_id: ThreadId) -> Result<String> {
+        let session = self
+            .store
+            .session(thread_id)
+            .await?
+            .context("no OMP session is mapped to this thread")?;
+        let mut models: Vec<_> = self
+            .transport
+            .available_models()
+            .await?
+            .into_iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect();
+        models.sort_unstable();
+        models.dedup();
+        let mut response = format!(
+            "Current session model: `{}`\nAvailable authenticated models:",
+            session.model.as_deref().unwrap_or("default")
+        );
+        if models.is_empty() {
+            response.push_str("\n(none)");
+        } else {
+            for model in models {
+                response.push_str("\n- `");
+                response.push_str(&model);
+                response.push('`');
+            }
+        }
+        response.push_str(
+            "\n\nUse `model provider/model` to select an exact entry or `model default` to clear the override. Changes require an idle session.",
+        );
+        Ok(response)
+    }
+
+    pub async fn set_model(&self, thread_id: ThreadId, selection: &str) -> Result<String> {
+        self.store
+            .session(thread_id)
+            .await?
+            .context("no OMP session is mapped to this thread")?;
+        let model = if selection == "default" {
+            None
+        } else {
+            let (provider, id) = selection
+                .split_once('/')
+                .filter(|(provider, id)| !provider.is_empty() && !id.is_empty())
+                .filter(|_| !selection.chars().any(|ch| ch.is_whitespace() || ch.is_control()))
+                .context("use `model provider/model` with an exact entry from `models`, or `model default`")?;
+            if !self
+                .transport
+                .available_models()
+                .await?
+                .iter()
+                .any(|model| model.provider == provider && model.id == id)
+            {
+                bail!("model `{selection}` is unavailable; use `models` to list authenticated models");
+            }
+            Some(selection)
+        };
+        // Hold the same lock as poke through the atomic store update. A drain
+        // includes permit waits and final delivery even after running reaches zero.
+        let draining = self.draining.lock().await;
+        if draining.contains_key(&thread_id) {
+            bail!("wait for this session to become idle before changing its model");
+        }
+        self.store.set_session_model(thread_id, model).await?;
+        drop(draining);
+        Ok(match model {
+            Some(model) => format!("Session model set to `{model}`. Conversation retained."),
+            None => "Session model reset to `default`. Conversation retained.".to_owned(),
+        })
+    }
+
     pub async fn status(&self, thread_id: ThreadId) -> Result<String> {
         let session = self
             .store
@@ -572,6 +644,8 @@ impl ThreadQueueRunner {
         active: &ActiveRun,
         presence: &WorkingPresence,
     ) -> Result<()> {
+        // Reload after permit acquisition and claiming; the earlier drain
+        // snapshot may predate a session reset while waiting for capacity.
         let session = self
             .store
             .session(turn.thread_id)
@@ -848,7 +922,7 @@ mod tests {
     use super::*;
     use crate::{
         domain::{ChannelId, GuildId, NewSession, UserId},
-        omp::OmpTurnResult,
+        omp::{AvailableModel, OmpTurnResult},
         store::{EnqueueResult, TurnSource},
     };
 
@@ -858,6 +932,8 @@ mod tests {
         observed: mpsc::UnboundedSender<i64>,
         waiting: Option<mpsc::UnboundedSender<i64>>,
         recorded: Option<mpsc::UnboundedSender<i64>>,
+        sessions: Option<mpsc::UnboundedSender<crate::domain::Session>>,
+        models_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
         finish: Semaphore,
         lose_connection: bool,
         completed: Vec<String>,
@@ -870,6 +946,8 @@ mod tests {
                 observed,
                 waiting: None,
                 recorded: None,
+                sessions: None,
+                models_gate: None,
                 finish: Semaphore::new(0),
                 lose_connection,
                 completed: Vec::new(),
@@ -891,14 +969,36 @@ mod tests {
             Ok("OpenAI/Codex quota usage: Weekly: 20.0% used; resets <t:1795021679:F>".into())
         }
 
+        async fn available_models(&self) -> Result<Vec<AvailableModel>> {
+            if let Some((started, gate)) = &self.models_gate {
+                started.send(())?;
+                gate.acquire().await?.forget();
+            }
+            Ok([
+                ("openai", "shared"),
+                ("openrouter", "vendor/nested"),
+                ("anthropic", "shared"),
+                ("openai", "shared"),
+            ]
+            .into_iter()
+            .map(|(provider, id)| AvailableModel {
+                provider: provider.into(),
+                id: id.into(),
+            })
+            .collect())
+        }
+
         async fn run_turn(
             &self,
-            _session: &crate::domain::Session,
+            session: &crate::domain::Session,
             input: TurnInput<'_>,
             cancellation: CancellationToken,
             ui: &dyn OmpUi,
         ) -> Result<OmpTurnResult, OmpTurnError> {
             let path = PathBuf::from("/tmp/fake-session.jsonl");
+            if let Some(sessions) = &self.sessions {
+                sessions.send(session.clone()).unwrap();
+            }
             input.control.save_session(&path).await?;
             let mut current = input.first.clone();
             let mut text = self.publish_completed(ui)?;
@@ -1445,12 +1545,14 @@ mod tests {
             assert_eq!(received(&mut outcomes).await, turn);
             let counts = store.counts(THREAD).await.unwrap();
             assert_eq!((counts.running, counts.queued), (0, 0));
+            assert!(runner.set_model(THREAD, "default").await.is_err());
             assert_eq!(messenger.statuses.lock().await.last().unwrap(), "working");
             assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
             send_gate.add_permits(1);
             received(&mut edits).await;
             let counts = store.counts(THREAD).await.unwrap();
             assert_eq!((counts.running, counts.queued), (0, 0));
+            assert!(runner.set_model(THREAD, "default").await.is_err());
             assert!(runner.active.lock().unwrap().contains_key(&THREAD));
             assert_eq!(messenger.statuses.lock().await.last().unwrap(), "working");
             assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
@@ -2613,5 +2715,192 @@ mod tests {
             store.next_outcome(THREAD, 0).await.unwrap().unwrap().status,
             TurnStatus::Done
         );
+    }
+
+    #[tokio::test]
+    async fn models_list_canonical_entries_and_only_accept_exact_selections() {
+        let (_directory, store) = fixture().await;
+        let (observed, _incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        let listing = runner.models(THREAD).await.unwrap();
+        assert!(listing.starts_with("Current session model: `default`\n"));
+        assert_eq!(
+            listing.lines().filter(|line| line.starts_with("- ")).collect::<Vec<_>>(),
+            vec![
+                "- `anthropic/shared`",
+                "- `openai/shared`",
+                "- `openrouter/vendor/nested`",
+            ]
+        );
+        assert!(listing.contains("`model provider/model`"));
+        assert!(listing.contains("`model default`"));
+        for selection in ["openai/shared", "anthropic/shared", "openrouter/vendor/nested"] {
+            runner.set_model(THREAD, selection).await.unwrap();
+            assert_eq!(
+                store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+                Some(selection)
+            );
+            assert!(
+                runner.models(THREAD).await.unwrap()
+                    .starts_with(&format!("Current session model: `{selection}`\n"))
+            );
+        }
+        for selection in [
+            "", "shared", "/shared", "openai/", "openai/shared extra",
+            "openai/shared\n", "OpenAI/shared", "unknown/shared", "openai/unknown",
+        ] {
+            assert!(runner.set_model(THREAD, selection).await.is_err(), "{selection:?}");
+        }
+        assert_eq!(
+            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            Some("openrouter/vendor/nested")
+        );
+        assert!(runner.models(ThreadId::new(99)).await.is_err());
+        assert!(runner.set_model(ThreadId::new(99), "default").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn clearing_model_skips_catalog_and_keeps_conversation_and_status() {
+        let (directory, store) = fixture().await;
+        let path = directory.path().join("saved.jsonl");
+        store.set_session_path(THREAD, &path).await.unwrap();
+        store.set_session_model(THREAD, Some("openai/shared")).await.unwrap();
+        store.set_session_status(THREAD, SessionStatus::Stopped).await.unwrap();
+        let (observed, _incoming) = mpsc::unbounded_channel();
+        let (started, requests) = mpsc::unbounded_channel();
+        drop(requests); // A catalog lookup would fail.
+        let mut transport = ControlledTransport::new(observed, false);
+        transport.models_gate = Some((started, Arc::new(Semaphore::new(0))));
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(transport),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        runner.set_model(THREAD, "default").await.unwrap();
+        let session = store.session(THREAD).await.unwrap().unwrap();
+        assert!(session.model.is_none());
+        assert_eq!(session.omp_session_path, Some(path));
+        assert_eq!(session.status, SessionStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn model_changes_reject_queued_and_running_turns_without_a_drain() {
+        let (_directory, store) = fixture().await;
+        let (observed, _incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        runner.set_model(THREAD, "openai/shared").await.unwrap();
+        let turn = enqueue(&store, 20).await;
+        assert!(runner.set_model(THREAD, "anthropic/shared").await.is_err());
+        assert!(runner.set_model(THREAD, "default").await.is_err());
+        store.claim_next(THREAD).await.unwrap().unwrap();
+        assert!(runner.set_model(THREAD, "anthropic/shared").await.is_err());
+        assert!(runner.set_model(THREAD, "default").await.is_err());
+        assert_eq!(
+            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            Some("openai/shared")
+        );
+        store.finish_turn(turn, TurnStatus::Done, None, None).await.unwrap();
+        runner.set_model(THREAD, "anthropic/shared").await.unwrap();
+        runner.new_session(THREAD).await.unwrap();
+        idle(&runner).await;
+        assert_eq!(
+            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            Some("anthropic/shared")
+        );
+    }
+
+    #[tokio::test]
+    async fn work_started_during_catalog_lookup_prevents_model_change() {
+        let (_directory, store) = fixture().await;
+        store.set_session_model(THREAD, Some("anthropic/shared")).await.unwrap();
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let (started, mut requests) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let mut transport = ControlledTransport::new(observed, false);
+        transport.models_gate = Some((started, gate.clone()));
+        let transport = Arc::new(transport);
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            transport.clone(),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        let changing_runner = runner.clone();
+        let change = tokio::spawn(async move {
+            changing_runner.set_model(THREAD, "openai/shared").await
+        });
+        received(&mut requests).await;
+        let turn = enqueue(&store, 20).await;
+        runner.poke(THREAD).await;
+        assert_eq!(received(&mut incoming).await, turn);
+        gate.add_permits(1);
+        assert!(
+            timeout(Duration::from_secs(3), change).await.unwrap().unwrap()
+                .unwrap_err().to_string().contains("idle")
+        );
+        assert_eq!(
+            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            Some("anthropic/shared")
+        );
+        transport.finish.add_permits(1);
+        idle(&runner).await;
+    }
+
+    #[tokio::test]
+    async fn waiting_drain_reloads_reset_session_and_model_before_dispatch() {
+        let (directory, store) = fixture().await;
+        store.set_session_model(THREAD, Some("openai/shared")).await.unwrap();
+        store.set_session_path(THREAD, &directory.path().join("old.jsonl")).await.unwrap();
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let (sessions, mut launched) = mpsc::unbounded_channel();
+        let mut transport = ControlledTransport::new(observed, false);
+        transport.sessions = Some(sessions);
+        let transport = Arc::new(transport);
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            transport.clone(),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        let mut snapshots = runner.subscribe_presence();
+        let permit = runner.permits.acquire().await.unwrap();
+        let discarded = enqueue(&store, 20).await;
+        runner.poke(THREAD).await;
+        timeout(Duration::from_secs(3), snapshots.changed()).await.unwrap().unwrap();
+        assert!(runner.set_model(THREAD, "default").await.is_err());
+        assert_eq!(runner.new_session(THREAD).await.unwrap(), 1);
+        assert_eq!(
+            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            Some("openai/shared")
+        );
+        // Exercise a persisted change after the drain's pre-permit snapshot.
+        store.set_session_model(THREAD, Some("anthropic/shared")).await.unwrap();
+        let next = enqueue(&store, 21).await;
+        drop(permit);
+        assert_eq!(received(&mut incoming).await, next);
+        let session = received(&mut launched).await;
+        assert_eq!(session.model.as_deref(), Some("anthropic/shared"));
+        assert!(session.omp_session_path.is_none());
+        let outcome = store.next_outcome(THREAD, 0).await.unwrap().unwrap();
+        assert_eq!(outcome.id, discarded);
+        assert_eq!(outcome.status, TurnStatus::Aborted);
+        transport.finish.add_permits(1);
+        idle(&runner).await;
     }
 }

@@ -1350,7 +1350,7 @@ impl DiscordHandler {
         send_without_mentions(
             http,
             input.thread_id,
-            "OMP session created. Controls: `status`, `stop`, `new`, and `@Bot kick` (humans only).",
+            "OMP session created. Controls: `status`, `models`, `model provider/model`, `model default`, `stop`, `new`, and `@Bot kick` (humans only).",
         )
         .await?;
         if matches!(
@@ -1388,6 +1388,26 @@ impl DiscordHandler {
             Some(Control::Status) => {
                 let status = self.runner.status(session.thread_id).await?;
                 for chunk in chunk_message(&status, self.config.runtime.discord_message_limit) {
+                    send_without_mentions(http, session.thread_id, &chunk).await?;
+                }
+                return Ok(());
+            }
+            Some(Control::Models) => {
+                let response = match self.runner.models(session.thread_id).await {
+                    Ok(response) => response,
+                    Err(error) => format!("Model listing failed: {error}"),
+                };
+                for chunk in chunk_message(&response, self.config.runtime.discord_message_limit) {
+                    send_without_mentions(http, session.thread_id, &chunk).await?;
+                }
+                return Ok(());
+            }
+            Some(Control::Model(selection)) => {
+                let response = match self.runner.set_model(session.thread_id, &selection).await {
+                    Ok(response) => response,
+                    Err(error) => format!("Model unchanged: {error}"),
+                };
+                for chunk in chunk_message(&response, self.config.runtime.discord_message_limit) {
                     send_without_mentions(http, session.thread_id, &chunk).await?;
                 }
                 return Ok(());
@@ -1601,20 +1621,29 @@ fn bot_reply_mentions(bots: Vec<serenity::all::UserId>) -> CreateAllowedMentions
     CreateAllowedMentions::new().users(bots).replied_user(false)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Control {
     Status,
     Stop,
     New,
     Kick,
+    Models,
+    Model(String),
 }
 
 fn parse_control(content: &str) -> Option<Control> {
-    match content.trim().to_ascii_lowercase().as_str() {
-        "status" | "/status" => Some(Control::Status),
-        "stop" | "/stop" | "abort" | "/abort" => Some(Control::Stop),
-        "new" | "/new" => Some(Control::New),
-        "kick" | "/kick" => Some(Control::Kick),
+    let content = content.trim();
+    let (command, argument) = content
+        .split_once(char::is_whitespace)
+        .map_or((content, ""), |(command, argument)| (command, argument.trim()));
+    match command.trim_start_matches('/').to_ascii_lowercase().as_str() {
+        "model" if argument.is_empty() => Some(Control::Models),
+        "model" => Some(Control::Model(argument.to_owned())),
+        "models" if argument.is_empty() => Some(Control::Models),
+        "status" if argument.is_empty() => Some(Control::Status),
+        "stop" | "abort" if argument.is_empty() => Some(Control::Stop),
+        "new" if argument.is_empty() => Some(Control::New),
+        "kick" if argument.is_empty() => Some(Control::Kick),
         _ => None,
     }
 }
@@ -2521,7 +2550,7 @@ mod tests {
     #[tokio::test]
     async fn bots_never_control_or_approve_even_when_human_allowlisted() {
         let policy = routing_policy();
-        for command in ["status", "stop", "new", "/stop", "abort"] {
+        for command in ["status", "stop", "new", "/stop", "abort", "models", "/model", "model anthropic/claude-sonnet-4-5", "model default"] {
             for content in [
                 command.to_owned(),
                 format!("<@9> {command}"),
@@ -3193,6 +3222,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_default_control_clears_override_without_enqueuing_a_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let response = serde_json::to_value(routing_message(true, "Model reset.")).unwrap();
+        let (http, requests) = discord_api(vec![
+            ("POST", "/channels/3/messages", 200, response),
+        ]);
+        let handler = routing_handler(root.path(), http.clone()).await;
+        handler.store.create_session(&NewSession {
+            thread_id: ThreadId::new(3),
+            guild_id: GuildId::new(1),
+            parent_channel_id: ChannelId::new(2),
+            trigger_message_id: MessageId::new(99),
+            cwd: root.path().to_path_buf(),
+            created_by_user_id: UserId::new(7),
+        }).await.unwrap();
+        handler.store.set_session_model(ThreadId::new(3), Some("provider/model"))
+            .await.unwrap();
+        let message = routing_message(false, "model default");
+        handler.handle_message(&http, &message).await.unwrap();
+        let session = handler.store.session(ThreadId::new(3)).await.unwrap().unwrap();
+        assert_eq!(session.model, None);
+        assert!(handler.store.claim_next(ThreadId::new(3)).await.unwrap().is_none());
+        let bodies = requests.join().unwrap();
+        assert!(!bodies[0]["content"].as_str().unwrap().contains("Model unchanged"));
+        assert_eq!(bodies[0]["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn replies_to_closed_question_cards_do_not_interrupt_or_stop_work() {
         let root = tempfile::tempdir().unwrap();
         let (http, requests) = discord_api_with_title_updates(vec![(
@@ -3376,6 +3433,17 @@ mod tests {
     fn control_parser_requires_the_whole_message() {
         assert_eq!(parse_control(" /STOP "), Some(Control::Stop));
         assert_eq!(parse_control("stop doing that"), None);
+        assert_eq!(parse_control(" /MODELS "), Some(Control::Models));
+        assert_eq!(parse_control("model"), Some(Control::Models));
+        assert_eq!(
+            parse_control("/MODEL Provider/Case-Sensitive-ID"),
+            Some(Control::Model("Provider/Case-Sensitive-ID".into()))
+        );
+        assert_eq!(parse_control("models please"), None);
+        assert_eq!(
+            addressed_control("<@9> model provider/model", 9),
+            Some(Control::Model("provider/model".into()))
+        );
     }
 
     #[test]

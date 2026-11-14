@@ -16,7 +16,7 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - Discord prompts for OMP `ask` forms, choices, and text input, with answers returned to the waiting call;
 - one stationary activity card per active conversation run, including replacement turns, with assistant messages delivered as they complete;
 - minute-based topic/status title review, rate-limit-aware refresh, and queue-idle completion;
-- `status`, `stop`, `new`, and targeted `@Bot kick` controls inside threads;
+- `status`, `models`, `model`, `stop`, `new`, and targeted `@Bot kick` controls inside threads;
 - duplicate Discord message rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
 - bounded attachment metadata and Discord-safe response chunking;
@@ -106,6 +106,13 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 `[VERSION] ([short commit])`. Neither value is read from the checkout at runtime.
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
+
+### Release 2026-11-14-4
+
+Adds persistent per-thread provider/model selection through `models`,
+`model provider/model`, and `model default`. Changes require an idle thread,
+preserve conversation history, and leave other threads and title review unchanged.
+Includes the table images, automatic updates, and targeted bot kicks from earlier releases.
 
 ### Release 2026-11-14-3
 
@@ -449,7 +456,7 @@ human messages handled by that bridge. The counter survives daemon restarts and
 is updated atomically with admission. Duplicate deliveries and replayed older
 human messages do not replenish the budget. At the limit, an authorized human
 must speak again before
-bot exchanges can resume. Bot messages cannot invoke `status`, `stop`, `new`, or `kick`,
+bot exchanges can resume. Bot messages cannot invoke `status`, `models`, `model`, `stop`, `new`, or `kick`,
 or approve tool calls, even if a bot ID appears in the human-user allowlist.
 
 Any bot with access to an allowed channel can request OMP work by mentioning this
@@ -566,6 +573,9 @@ treat inferred summaries as a secret-storage boundary.
 Thread controls must be the complete message:
 
 - `status` — show session, working directory, queue, uncertain-turn state, and OpenAI/Codex provider quota usage with reset times;
+- `models` (or `model`) — list available provider/model pairs and this thread's model override;
+- `model provider/model` — select an exact entry from that list for this thread;
+- `model default` — clear this thread's override;
 - `stop` — stop the thread and cancel its active turn;
 - `new` — after the active turn stops, discard queued turns and start a fresh OMP session;
 - `@Bot kick` — an authorized human mentions the specific bot and sends `kick`
@@ -586,6 +596,14 @@ receives an event removing its own user. Removal while offline may not deliver
 that event: use the explicit command while connected for durable enforcement.
 Native removal is not a Discord-level ban; persistence belongs to this bridge's
 SQLite database. Keep that database when restarting or migrating the bot.
+
+Model changes require an idle thread with no queued or running turns. They retain
+conversation history and apply on the next turn; they never interrupt active work.
+The override survives bridge restarts and `new`, and does not change other threads,
+the global OMP configuration, or the title-review model. Clearing the override
+restores normal bridge/OMP model selection, including saved-session selection when
+no bridge model is configured. Commands also accept a leading `/` as ordinary text;
+these are not registered Discord slash commands. Only authorized humans may use them.
 
 `status` queries the configured OMP executable's `usage --json --provider openai-codex`
 interface without interrupting the conversation or making a model call. It shows
