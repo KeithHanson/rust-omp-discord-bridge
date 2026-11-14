@@ -1,7 +1,14 @@
-use std::{path::Path, str::FromStr, time::SystemTime};
+use std::{
+    collections::HashMap,
+    path::Path,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
 
 use anyhow::{Context, Result, bail};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+use tokio::sync::RwLock;
 
 use crate::domain::{
     MessageId, NewSession, Session, SessionStatus, ThreadId, Turn, TurnCounts, TurnStatus, UserId,
@@ -11,6 +18,11 @@ const MAX_PENDING_TURNS_PER_THREAD: i64 = 64;
 pub const MAX_BOT_EXCHANGES: usize = 8;
 
 const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS excluded_threads (
+    thread_id TEXT PRIMARY KEY NOT NULL,
+    excluded_at_ms INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     thread_id TEXT PRIMARY KEY NOT NULL,
     guild_id TEXT NOT NULL,
@@ -44,6 +56,7 @@ CREATE INDEX IF NOT EXISTS turns_thread_status_id_idx ON turns(thread_id, status
 #[derive(Debug, Clone)]
 pub struct Store {
     pool: SqlitePool,
+    thread_access: Arc<Mutex<HashMap<ThreadId, Arc<RwLock<()>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,10 +146,65 @@ impl Store {
             }
         }
         transaction.commit().await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            thread_access: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Serialize thread admission and outbound effects with exclusion across Store clones.
+    /// Callers take a read guard for admission/output, or a write guard before exclusion.
+    pub fn thread_access(&self, thread_id: ThreadId) -> Arc<RwLock<()>> {
+        self.thread_access
+            .lock()
+            .expect("thread access registry poisoned")
+            .entry(thread_id)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    pub async fn is_thread_excluded(&self, thread_id: ThreadId) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM excluded_threads WHERE thread_id = ?)",
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Persist exclusion even for an unmanaged thread; preserve history and running turns.
+    /// The caller holds the thread's write guard and cancels running work after committing.
+    pub async fn exclude_thread(&self, thread_id: ThreadId) -> Result<()> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = now_ms()?;
+        sqlx::query(
+            "INSERT INTO excluded_threads (thread_id, excluded_at_ms) VALUES (?, ?) ON CONFLICT(thread_id) DO NOTHING",
+        )
+        .bind(thread_id.to_string())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE sessions SET status = 'stopped', updated_at_ms = ? WHERE thread_id = ?",
+        )
+        .bind(now)
+        .bind(thread_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE turns SET status = 'aborted', error = 'bot was kicked from this thread', finished_at_ms = ? WHERE thread_id = ? AND status = 'queued'",
+        )
+        .bind(now)
+        .bind(thread_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn create_session(&self, input: &NewSession) -> Result<CreateSessionResult> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        require_thread_admitted(&mut transaction, input.thread_id).await?;
         let now = now_ms()?;
         let result = sqlx::query(
             "INSERT INTO sessions (thread_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?) ON CONFLICT DO NOTHING",
@@ -149,25 +217,27 @@ impl Store {
         .bind(input.created_by_user_id.to_string())
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
-
-        if result.rows_affected() == 1 {
-            let session = self
-                .session(input.thread_id)
-                .await?
-                .context("newly inserted session was not found")?;
-            return Ok(CreateSessionResult::Created(session));
+        let row = sqlx::query(
+            "SELECT * FROM sessions WHERE trigger_message_id = ? OR thread_id = ? ORDER BY (trigger_message_id = ?) DESC LIMIT 1",
+        )
+        .bind(input.trigger_message_id.to_string())
+        .bind(input.thread_id.to_string())
+        .bind(input.trigger_message_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .context("inserted or conflicting session was not found")?;
+        let session = session_from_row(&row)?;
+        if session.thread_id != input.thread_id {
+            require_thread_admitted(&mut transaction, session.thread_id).await?;
         }
-
-        let session = match self.session_by_trigger(input.trigger_message_id).await? {
-            Some(session) => session,
-            None => self
-                .session(input.thread_id)
-                .await?
-                .context("conflicting thread or trigger message has no session")?,
-        };
-        Ok(CreateSessionResult::Existing(session))
+        transaction.commit().await?;
+        if result.rows_affected() == 1 {
+            Ok(CreateSessionResult::Created(session))
+        } else {
+            Ok(CreateSessionResult::Existing(session))
+        }
     }
 
     pub async fn session(&self, thread_id: ThreadId) -> Result<Option<Session>> {
@@ -199,7 +269,8 @@ impl Store {
     }
 
     pub async fn reset_session(&self, thread_id: ThreadId) -> Result<u64> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        require_thread_admitted(&mut transaction, thread_id).await?;
         let running: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM turns WHERE thread_id = ? AND status = 'running'",
         )
@@ -235,13 +306,15 @@ impl Store {
         thread_id: ThreadId,
         status: SessionStatus,
     ) -> Result<()> {
-        let result =
-            sqlx::query("UPDATE sessions SET status = ?, updated_at_ms = ? WHERE thread_id = ?")
-                .bind(status.as_str())
-                .bind(now_ms()?)
-                .bind(thread_id.to_string())
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE sessions SET status = ?, updated_at_ms = ? WHERE thread_id = ? AND (? = 'stopped' OR NOT EXISTS (SELECT 1 FROM excluded_threads WHERE excluded_threads.thread_id = sessions.thread_id))",
+        )
+        .bind(status.as_str())
+        .bind(now_ms()?)
+        .bind(thread_id.to_string())
+        .bind(status.as_str())
+        .execute(&self.pool)
+        .await?;
         require_one_row(result.rows_affected(), "session status update")
     }
 
@@ -252,6 +325,7 @@ impl Store {
         message_id: MessageId,
     ) -> Result<()> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        require_thread_admitted(&mut transaction, thread_id).await?;
         let row = sqlx::query("SELECT latest_human_message_id FROM sessions WHERE thread_id = ?")
             .bind(thread_id.to_string())
             .fetch_optional(&mut *transaction)
@@ -280,6 +354,7 @@ impl Store {
         source: TurnSource,
     ) -> Result<EnqueueResult> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        require_thread_admitted(&mut transaction, thread_id).await?;
         let duplicate: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM turns WHERE discord_message_id = ?)")
                 .bind(message_id.to_string())
@@ -372,7 +447,7 @@ impl Store {
     ) -> Result<Option<Turn>> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
-            "SELECT * FROM turns WHERE thread_id = ? AND status = 'queued' AND EXISTS (SELECT 1 FROM sessions WHERE sessions.thread_id = turns.thread_id AND sessions.status = 'active') ORDER BY id LIMIT 1",
+            "SELECT * FROM turns WHERE thread_id = ? AND status = 'queued' AND EXISTS (SELECT 1 FROM sessions WHERE sessions.thread_id = turns.thread_id AND sessions.status = 'active') AND NOT EXISTS (SELECT 1 FROM excluded_threads WHERE excluded_threads.thread_id = turns.thread_id) ORDER BY id LIMIT 1",
         )
         .bind(thread_id.to_string())
         .fetch_optional(&mut *transaction)
@@ -517,7 +592,7 @@ impl Store {
 
     pub async fn queued_thread_ids(&self) -> Result<Vec<ThreadId>> {
         let rows = sqlx::query(
-            "SELECT DISTINCT thread_id FROM turns WHERE status = 'queued' ORDER BY thread_id",
+            "SELECT DISTINCT thread_id FROM turns WHERE status = 'queued' AND NOT EXISTS (SELECT 1 FROM excluded_threads WHERE excluded_threads.thread_id = turns.thread_id) ORDER BY thread_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -525,6 +600,22 @@ impl Store {
             .map(|row| parse_id(row.try_get::<String, _>("thread_id")?, "thread_id"))
             .collect()
     }
+}
+
+async fn require_thread_admitted(
+    connection: &mut sqlx::SqliteConnection,
+    thread_id: ThreadId,
+) -> Result<()> {
+    let excluded: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM excluded_threads WHERE thread_id = ?)",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(connection)
+    .await?;
+    if excluded {
+        bail!("bot was kicked from this thread");
+    }
+    Ok(())
 }
 
 fn is_new_human_message(row: &sqlx::sqlite::SqliteRow, message_id: MessageId) -> Result<bool> {
@@ -614,6 +705,222 @@ mod tests {
             trigger_message_id: MessageId::new(trigger),
             cwd: std::env::temp_dir(),
             created_by_user_id: UserId::new(3),
+        }
+    }
+
+    #[tokio::test]
+    async fn unmanaged_thread_exclusion_survives_reopen_and_blocks_creation() {
+        let (directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        assert!(!store.is_thread_excluded(thread).await.unwrap());
+        store.exclude_thread(thread).await.unwrap();
+        store.exclude_thread(thread).await.unwrap();
+        assert!(store.session(thread).await.unwrap().is_none());
+        store.pool.close().await;
+
+        let reopened = Store::open(&directory.path().join("bridge.sqlite"))
+            .await
+            .unwrap();
+        assert!(reopened.is_thread_excluded(thread).await.unwrap());
+        assert!(reopened.create_session(&new_session(10, 20)).await.is_err());
+        assert!(reopened.session(thread).await.unwrap().is_none());
+        assert!(!reopened.is_thread_excluded(ThreadId::new(11)).await.unwrap());
+        reopened.create_session(&new_session(11, 21)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exclusion_discards_only_queued_turns_and_preserves_history_on_reopen() {
+        let (directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        let other = ThreadId::new(11);
+        let session_path = directory.path().join("omp-session.jsonl");
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        store.create_session(&new_session(11, 21)).await.unwrap();
+        store.set_session_path(thread, &session_path).await.unwrap();
+        let done = enqueue(&store, 10, 30).await;
+        store.claim_next(thread).await.unwrap().unwrap();
+        store
+            .finish_turn(done, TurnStatus::Done, Some("preserved response"), None)
+            .await
+            .unwrap();
+        let running = enqueue(&store, 10, 31).await;
+        store.claim_next(thread).await.unwrap().unwrap();
+        let queued = enqueue(&store, 10, 32).await;
+        let other_queued = enqueue(&store, 11, 33).await;
+
+        store.exclude_thread(thread).await.unwrap();
+        store.exclude_thread(thread).await.unwrap();
+        let counts = store.counts(thread).await.unwrap();
+        assert_eq!((counts.queued, counts.running, counts.uncertain), (0, 1, 0));
+        let preserved = store.next_outcome(thread, 0).await.unwrap().unwrap();
+        assert_eq!(preserved.id, done);
+        assert_eq!(preserved.status, TurnStatus::Done);
+        assert_eq!(preserved.response.as_deref(), Some("preserved response"));
+        let discarded = store.next_outcome(thread, done).await.unwrap().unwrap();
+        assert_eq!(discarded.id, queued);
+        assert_eq!(discarded.status, TurnStatus::Aborted);
+        assert_eq!(discarded.error.as_deref(), Some("bot was kicked from this thread"));
+        assert_eq!(store.queued_thread_ids().await.unwrap(), vec![other]);
+        store.pool.close().await;
+
+        let reopened = Store::open(&directory.path().join("bridge.sqlite"))
+            .await
+            .unwrap();
+        assert!(reopened.is_thread_excluded(thread).await.unwrap());
+        let session = reopened.session(thread).await.unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Stopped);
+        assert_eq!(session.omp_session_path.as_deref(), Some(session_path.as_path()));
+        assert_eq!(reopened.next_outcome(thread, done).await.unwrap(), Some(discarded));
+        assert!(reopened.claim_next(thread).await.unwrap().is_none());
+        assert!(reopened.claim_next_interrupting(thread).await.unwrap().is_none());
+        // The runner can still resolve an in-flight turn after exclusion.
+        reopened
+            .finish_turn(running, TurnStatus::Aborted, Some("partial"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.claim_next(other).await.unwrap().unwrap().id,
+            other_queued
+        );
+        assert_eq!(
+            reopened.session(other).await.unwrap().unwrap().status,
+            SessionStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusion_blocks_reset_reactivation_and_all_admission_paths() {
+        let (_directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        enqueue(&store, 10, 30).await;
+        store.exclude_thread(thread).await.unwrap();
+        assert!(store.reset_session(thread).await.is_err());
+        assert!(store.set_session_status(thread, SessionStatus::Active).await.is_err());
+        store.set_session_status(thread, SessionStatus::Stopped).await.unwrap();
+        assert!(store.create_session(&new_session(10, 20)).await.is_err());
+        assert!(store.create_session(&new_session(10, 21)).await.is_err());
+        // A duplicate trigger must not return the excluded session under another thread ID.
+        assert!(store.create_session(&new_session(11, 20)).await.is_err());
+        assert!(store.session(ThreadId::new(11)).await.unwrap().is_none());
+        assert!(store.note_human_message(thread, MessageId::new(40)).await.is_err());
+        for (message, source) in [(30, TurnSource::Human), (31, TurnSource::Human), (32, TurnSource::Bot)] {
+            assert!(
+                store
+                    .enqueue_turn(thread, MessageId::new(message), UserId::new(3), "blocked", source)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(store.claim_next(thread).await.unwrap().is_none());
+        assert!(store.claim_next_interrupting(thread).await.unwrap().is_none());
+        assert!(store.queued_thread_ids().await.unwrap().is_empty());
+        assert_eq!(store.session(thread).await.unwrap().unwrap().status, SessionStatus::Stopped);
+
+        let other = ThreadId::new(11);
+        store.create_session(&new_session(11, 21)).await.unwrap();
+        store.set_session_status(other, SessionStatus::Stopped).await.unwrap();
+        store.reset_session(other).await.unwrap();
+        store.note_human_message(other, MessageId::new(41)).await.unwrap();
+        let admitted = enqueue(&store, 11, 42).await;
+        assert_eq!(store.claim_next(other).await.unwrap().unwrap().id, admitted);
+    }
+
+    #[tokio::test]
+    async fn claims_and_queue_discovery_independently_honor_exclusion() {
+        let (_directory, store) = test_store().await;
+        let thread = ThreadId::new(10);
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        let turn = enqueue(&store, 10, 30).await;
+        store.exclude_thread(thread).await.unwrap();
+        // Simulate stale state imported by an older writer: neither the active flag nor
+        // a queued turn may override the independent durable tombstone.
+        sqlx::query("UPDATE sessions SET status = 'active' WHERE thread_id = '10'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE turns SET status = 'queued' WHERE id = ?")
+            .bind(turn)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.claim_next(thread).await.unwrap().is_none());
+        assert!(store.claim_next_interrupting(thread).await.unwrap().is_none());
+        assert!(store.queued_thread_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_access_locks_are_shared_by_clones_and_isolated_by_thread() {
+        let (_directory, store) = test_store().await;
+        let clone = store.clone();
+        let lock = store.thread_access(ThreadId::new(10));
+        let same = clone.thread_access(ThreadId::new(10));
+        let other = clone.thread_access(ThreadId::new(11));
+        assert!(Arc::ptr_eq(&lock, &same));
+        assert!(!Arc::ptr_eq(&lock, &other));
+        let reader = lock.clone().read_owned().await;
+        assert!(same.try_write().is_err());
+        assert!(other.try_write().is_ok());
+        drop(reader);
+        let writer = same.clone().write_owned().await;
+        assert!(lock.try_read().is_err());
+        assert!(other.try_read().is_ok());
+        drop(writer);
+        assert!(lock.try_read().is_ok());
+    }
+
+    #[tokio::test]
+    async fn independent_connections_serialize_exclusion_with_creation_and_admission() {
+        let (directory, store) = test_store().await;
+        let independent = Store::open(&directory.path().join("bridge.sqlite"))
+            .await
+            .unwrap();
+        for thread_number in 10..14 {
+            let thread = ThreadId::new(thread_number);
+            let input = new_session(thread_number, thread_number + 100);
+            let (created, excluded) = tokio::join!(
+                store.create_session(&input),
+                independent.exclude_thread(thread),
+            );
+            excluded.unwrap();
+            assert!(store.is_thread_excluded(thread).await.unwrap());
+            if created.is_ok() {
+                assert_eq!(
+                    store.session(thread).await.unwrap().unwrap().status,
+                    SessionStatus::Stopped
+                );
+            } else {
+                assert!(store.session(thread).await.unwrap().is_none());
+            }
+            assert!(store.create_session(&input).await.is_err());
+        }
+
+        for thread_number in 20..24 {
+            let thread = ThreadId::new(thread_number);
+            store.create_session(&new_session(thread_number, thread_number + 100)).await.unwrap();
+            enqueue(&store, thread_number, thread_number + 200).await;
+            let (_, _, _, _, excluded) = tokio::join!(
+                store.reset_session(thread),
+                store.set_session_status(thread, SessionStatus::Active),
+                store.enqueue_turn(
+                    thread,
+                    MessageId::new(thread_number + 300),
+                    UserId::new(3),
+                    "racing admission",
+                    TurnSource::Human,
+                ),
+                store.claim_next_interrupting(thread),
+                independent.exclude_thread(thread),
+            );
+            excluded.unwrap();
+            assert_eq!(
+                store.session(thread).await.unwrap().unwrap().status,
+                SessionStatus::Stopped
+            );
+            assert_eq!(store.counts(thread).await.unwrap().queued, 0);
+            assert!(store.claim_next(thread).await.unwrap().is_none());
+            assert!(store.claim_next_interrupting(thread).await.unwrap().is_none());
+            assert!(!store.queued_thread_ids().await.unwrap().contains(&thread));
         }
     }
 
@@ -1225,7 +1532,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("create original schema");
-        let original = Store { pool };
+        let original = Store { pool, thread_access: Arc::new(Mutex::new(HashMap::new())) };
         original
             .create_session(&new_session(10, 20))
             .await

@@ -16,7 +16,7 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - Discord prompts for OMP `ask` forms, choices, and text input, with answers returned to the waiting call;
 - one stationary activity card per active conversation run, including replacement turns, with assistant messages delivered as they complete;
 - minute-based topic/status title review, rate-limit-aware refresh, and queue-idle completion;
-- `status`, `stop`, and `new` controls inside managed threads;
+- `status`, `stop`, `new`, and targeted `@Bot kick` controls inside threads;
 - duplicate Discord message rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
 - bounded attachment metadata and Discord-safe response chunking;
@@ -85,31 +85,52 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
-### Deploy release 2026-11-13-3
+### Deploy release 2026-11-14-2
 
 Use the same release tag on each bot; keep each bot's token, database, OMP
 credentials, and session directory separate.
 
 ```bash
 git fetch origin --tags
-git checkout v2026-11-13-3
+git checkout v2026-11-14-2
 cargo test --locked --all-targets
 cargo build --locked --release --bin omp-discord-bridge --target-dir target/candidate
 ./target/candidate/release/omp-discord-bridge --version
 ```
 
-Existing TOML files remain compatible. `omp.title_model` is optional; title
-inference otherwise uses the normal configured model and consumes its quota.
-OMP 18.20.0 or newer is required. No new database migration is introduced.
-For containers, follow [the Docker upgrade instructions](docs/docker.md#upgrade-to-2026-11-13-3).
+Existing TOML files remain compatible. OMP 18.20.0 or newer is required.
+This release adds a persistent `excluded_threads` SQLite table. Keep the database
+when upgrading: it contains the bot's thread exclusions as well as session history.
+For containers, follow [the Docker upgrade instructions](docs/docker.md#upgrade-to-2026-11-14-2).
 
-Wait for active conversations and delivery to finish, stop the service, make a
-consistent database backup, and atomically replace the executable. Do not build
-over a running executable or restart the bridge from inside its active OMP turn.
+The GitHub release also includes a static **Linux x86-64** bundle containing
+`omp-discord-bridge`, `bridge-local`, example configs, and the systemd unit.
+OMP must still be installed and authenticated separately. Other platforms should
+build from the tag above; this bundle is not an ARM or macOS executable.
+
+```bash
+gh release download v2026-11-14-2 --repo KeithHanson/rust-omp-discord-bridge \
+  --pattern 'omp-discord-bridge-2026-11-14-2-linux-x86_64.tar.gz' --pattern SHA256SUMS
+sha256sum -c SHA256SUMS
+tar -xzf omp-discord-bridge-2026-11-14-2-linux-x86_64.tar.gz
+cd omp-discord-bridge-2026-11-14-2-linux-x86_64
+./omp-discord-bridge --version
+```
+
+For first installation, follow the configuration section below and adapt the
+included service unit to your user, executable, configuration, and OMP paths.
+For upgrades, wait for active conversations and delivery to finish, stop the
+service, make a consistent database backup, and atomically replace the executable.
+Do not overwrite a running executable or restart from inside an active OMP turn.
 Run the candidate's `check` with the same selected config before starting the
-service. Keep the previous executable/image for rollback. Verify the running
-version, then exercise a choice/text form and a title transition in an authorized
-thread; gateway connectivity alone does not prove either feature.
+service. Keep the previous executable/image for rollback, but older versions do
+not enforce kicks; restoring an old binary weakens the exclusion policy.
+Never restore an old database over newly admitted work.
+
+Verify the running version. In a disposable authorized thread, send `@Bot kick`,
+then mention it again and send `new`; neither should produce a reply or rejoin.
+Repeat after a controlled restart. Do not kick a bot from a thread you want it
+to keep using: there is deliberately no chat-based undo command.
 
 
 ## Prerequisites
@@ -316,7 +337,7 @@ human messages handled by that bridge. The counter survives daemon restarts and
 is updated atomically with admission. Duplicate deliveries and replayed older
 human messages do not replenish the budget. At the limit, an authorized human
 must speak again before
-bot exchanges can resume. Bot messages cannot invoke `status`, `stop`, or `new`,
+bot exchanges can resume. Bot messages cannot invoke `status`, `stop`, `new`, or `kick`,
 or approve tool calls, even if a bot ID appears in the human-user allowlist.
 
 Any bot with access to an allowed channel can request OMP work by mentioning this
@@ -434,7 +455,25 @@ Thread controls must be the complete message:
 
 - `status` — show session, working directory, queue, uncertain-turn state, and OpenAI/Codex provider quota usage with reset times;
 - `stop` — stop the thread and cancel its active turn;
-- `new` — after the active turn stops, discard queued turns and start a fresh OMP session.
+- `new` — after the active turn stops, discard queued turns and start a fresh OMP session;
+- `@Bot kick` — an authorized human mentions the specific bot and sends `kick`
+  (or `/kick`) as the rest of the message. The bridge permanently excludes itself
+  from this thread, cancels active work, discards queued work, and leaves without
+  posting a farewell. This also works before the bot has adopted the thread.
+
+Exclusions survive restarts. Human/peer mentions, `new`, and re-adding the bot to
+the Discord thread do not clear them. There is no chat command to undo a kick.
+Other bots and other threads are unaffected; each bot must run this bridge version
+to honor its own exclusion. Messages, uploads, approvals, forms, activity edits,
+and title updates are blocked after exclusion commits. HTTP requests already in
+flight finish before that commit; a kick cannot retract something Discord already
+received. A failed Discord leave does not undo local exclusion.
+
+Discord's native member-removal event also persists exclusion when the bridge
+receives an event removing its own user. Removal while offline may not deliver
+that event: use the explicit command while connected for durable enforcement.
+Native removal is not a Discord-level ban; persistence belongs to this bridge's
+SQLite database. Keep that database when restarting or migrating the bot.
 
 `status` queries the configured OMP executable's `usage --json --provider openai-codex`
 interface without interrupting the conversation or making a model call. It shows

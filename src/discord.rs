@@ -21,7 +21,7 @@ use serenity::{
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
         EditMessage, Embed, EventHandler, GatewayIntents, GetMessages, GuildChannel, Http,
         Interaction, Member, Message, MessageFlags, OnlineStatus, Ready, ResumedEvent, ThreadMember,
-        Timestamp, User,
+        ThreadMembersUpdateEvent, Timestamp, User,
     },
     builder::Builder,
     gateway::{ActivityData, ShardMessenger},
@@ -352,11 +352,15 @@ struct DiscordMessenger {
 
 #[async_trait]
 impl ThreadMessenger for DiscordMessenger {
+    // A kick takes the corresponding write lock before persisting exclusion.
+    // Holding this guard through HTTP lets already-started sends finish first.
     async fn send(&self, thread_id: ThreadId, content: &str) -> Result<()> {
+        let _access = thread_access(&self.store, thread_id).await?;
         send_without_mentions(&self.http, thread_id, content).await
     }
 
     async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()> {
+        let _access = thread_access(&self.store, thread_id).await?;
         // The runner's send deadline includes user lookups as well as delivery.
         let mut bots = Vec::new();
         for id in textual_user_mentions(content) {
@@ -383,6 +387,7 @@ impl ThreadMessenger for DiscordMessenger {
         content: &str,
         finished: bool,
     ) -> Result<MessageId> {
+        let _access = thread_access(&self.store, thread_id).await?;
         let message = SerenityChannelId::new(thread_id.get())
             .send_message(
                 &self.http,
@@ -403,6 +408,7 @@ impl ThreadMessenger for DiscordMessenger {
         content: &str,
         finished: bool,
     ) -> Result<MessageId> {
+        let _access = thread_access(&self.store, thread_id).await?;
         let channel_id = SerenityChannelId::new(thread_id.get());
         channel_id
             .edit_message(
@@ -432,7 +438,7 @@ impl ThreadMessenger for DiscordMessenger {
     }
 
     async fn notify(&self, thread_id: ThreadId, message: &str) {
-        if let Err(error) = send_without_mentions(&self.http, thread_id, message).await {
+        if let Err(error) = self.send(thread_id, message).await {
             tracing::error!(thread_id = %thread_id, error = %error, "failed to deliver OMP notification");
         }
     }
@@ -466,6 +472,7 @@ impl ThreadMessenger for DiscordMessenger {
     }
 
     async fn upload_file(&self, thread_id: ThreadId, request: crate::omp::UploadRequest) -> Result<String> {
+        let _access = thread_access(&self.store, thread_id).await?;
         tokio::time::timeout(
             Duration::from_secs(self.config.runtime.discord_history_timeout_seconds),
             self.upload_file_inner(thread_id, request),
@@ -506,6 +513,7 @@ impl ThreadMessenger for DiscordMessenger {
                     continue;
                 }
                 if name != channel.name {
+                    let _access = thread_access(&self.store, thread_id).await?;
                     match self.title_http.patch(thread_id, &name, &mut state).await? {
                         TitleReply::Ready(()) => {}
                         TitleReply::Limited => continue,
@@ -531,6 +539,7 @@ impl ThreadMessenger for DiscordMessenger {
                 continue;
             }
             if name != channel.name {
+                let _access = thread_access(&self.store, thread_id).await?;
                 match self.title_http.patch(thread_id, &name, &mut state).await? {
                     TitleReply::Ready(()) => {}
                     TitleReply::Limited => continue,
@@ -570,6 +579,9 @@ impl DiscordMessenger {
     }
 
     async fn authorize_thread_title(&self, thread_id: ThreadId) -> Result<crate::domain::Session> {
+        if self.store.is_thread_excluded(thread_id).await? {
+            bail!("bot was kicked from this thread");
+        }
         let session = self.store.session(thread_id).await?
             .context("title requested for an unknown Discord thread")?;
         let policy = self.config.guild_policy(session.guild_id)
@@ -581,6 +593,7 @@ impl DiscordMessenger {
     }
 
     async fn confirm_inner(&self, thread_id: ThreadId, request: ApprovalRequest) -> Result<bool> {
+        let access = thread_access(&self.store, thread_id).await?;
         let session = self
             .store
             .session(thread_id)
@@ -621,6 +634,7 @@ impl DiscordMessenger {
             .send_message(&self.http, message)
             .await?;
         registration.bind_message(MessageId::new(sent.id.get()));
+        drop(access);
 
         let decision = tokio::time::timeout(APPROVAL_TIMEOUT, &mut registration.receiver).await;
         Ok(matches!(decision, Ok(Ok(true))))
@@ -1018,6 +1032,16 @@ impl EventHandler for DiscordHandler {
         self.presence_target.send_replace(Some(context.shard));
     }
 
+    async fn thread_members_update(&self, _context: Context, event: ThreadMembersUpdateEvent) {
+        let bot_id = self.bot_user_id.load(Ordering::Acquire);
+        if bot_id != 0 && event.removed_member_ids.iter().any(|id| id.get() == bot_id) {
+            let thread_id = ThreadId::new(event.id.get());
+            if let Err(error) = self.exclude_thread(thread_id).await {
+                tracing::error!(%thread_id, %error, "failed to persist thread removal");
+            }
+        }
+    }
+
     async fn message(&self, context: Context, message: Message) {
         if let Err(error) = self.handle_message(&context.http, &message).await {
             tracing::error!(
@@ -1031,6 +1055,14 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn interaction_create(&self, context: Context, interaction: Interaction) {
+        let channel_id = match &interaction {
+            Interaction::Component(component) => component.channel_id,
+            Interaction::Modal(modal) => modal.channel_id,
+            _ => return,
+        };
+        let Ok(_access) = thread_access(&self.store, ThreadId::new(channel_id.get())).await else {
+            return;
+        };
         if self.prompt_interaction(&context.http, &interaction).await {
             return;
         }
@@ -1085,6 +1117,16 @@ impl EventHandler for DiscordHandler {
 }
 
 impl DiscordHandler {
+    async fn exclude_thread(&self, thread_id: ThreadId) -> Result<()> {
+        let lock = self.store.thread_access(thread_id);
+        let _access = lock.write().await;
+        self.store.exclude_thread(thread_id).await?;
+        if self.store.session(thread_id).await?.is_some() {
+            self.runner.stop(thread_id).await?;
+        }
+        Ok(())
+    }
+
     async fn handle_message(&self, http: &Http, message: &Message) -> Result<()> {
         let bot_id = self.bot_user_id.load(Ordering::Acquire);
         let Some(source) = message_source(message, bot_id) else {
@@ -1098,6 +1140,32 @@ impl DiscordHandler {
             return Ok(());
         };
         let thread_id = ThreadId::new(message.channel_id.get());
+        if message_control(message, bot_id) == Some(Control::Kick) {
+            if !policy.allowed_users.contains(&UserId::new(message.author.id.get())) {
+                return Ok(());
+            }
+            let authorized = if let Some(session) = self.store.session(thread_id).await? {
+                session.guild_id == guild_id
+                    && policy.allowed_channels.contains(&session.parent_channel_id)
+            } else {
+                let Channel::Guild(channel) = http.get_channel(message.channel_id).await? else {
+                    return Ok(());
+                };
+                adoption_parent(&channel, message, policy).is_some()
+            };
+            if authorized {
+                self.exclude_thread(thread_id).await?;
+                // No farewell message: exclusion is effective even if Discord refuses the leave.
+                message.channel_id.leave_thread(http).await
+                    .context("thread excluded locally, but Discord leave failed")?;
+            }
+            return Ok(());
+        }
+        let lock = self.store.thread_access(thread_id);
+        let _access = lock.read().await;
+        if self.store.is_thread_excluded(thread_id).await? {
+            return Ok(());
+        }
         if let Some(session) = self.store.session(thread_id).await? {
             if session.guild_id != guild_id
                 || !permits_message(policy, session.parent_channel_id, message, source)
@@ -1226,7 +1294,7 @@ impl DiscordHandler {
         send_without_mentions(
             http,
             input.thread_id,
-            "OMP session created. Controls: `status`, `stop`, and `new` (humans only).",
+            "OMP session created. Controls: `status`, `stop`, `new`, and `@Bot kick` (humans only).",
         )
         .await?;
         if matches!(
@@ -1292,6 +1360,7 @@ impl DiscordHandler {
                 }
                 return Ok(());
             }
+            Some(Control::Kick) => return Ok(()), // handled before admission locking
             None => {}
         }
         if session.status == SessionStatus::Stopped {
@@ -1440,7 +1509,9 @@ fn message_control(message: &Message, bot_id: u64) -> Option<Control> {
     if message.author.bot || message.webhook_id.is_some() {
         return None;
     }
-    addressed_control(&message.content, bot_id)
+    let control = addressed_control(&message.content, bot_id)?;
+    // Destructive controls must name this bot, not every bridge in the thread.
+    (control != Control::Kick || explicitly_mentions(message, bot_id)).then_some(control)
 }
 
 fn addressed_control(content: &str, bot_id: u64) -> Option<Control> {
@@ -1479,6 +1550,7 @@ enum Control {
     Status,
     Stop,
     New,
+    Kick,
 }
 
 fn parse_control(content: &str) -> Option<Control> {
@@ -1486,6 +1558,7 @@ fn parse_control(content: &str) -> Option<Control> {
         "status" | "/status" => Some(Control::Status),
         "stop" | "/stop" | "abort" | "/abort" => Some(Control::Stop),
         "new" | "/new" => Some(Control::New),
+        "kick" | "/kick" => Some(Control::Kick),
         _ => None,
     }
 }
@@ -1593,6 +1666,14 @@ fn strip_activity_phase(title: &str) -> &str {
     title.strip_prefix("[OMP: ")
         .and_then(|rest| rest.split_once("] ").map(|(_, base)| base))
         .unwrap_or(title)
+}
+
+async fn thread_access(store: &Store, thread_id: ThreadId) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+    let guard = store.thread_access(thread_id).read_owned().await;
+    if store.is_thread_excluded(thread_id).await? {
+        bail!("bot was kicked from this thread");
+    }
+    Ok(guard)
 }
 
 async fn send_without_mentions(http: &Http, thread_id: ThreadId, content: &str) -> Result<()> {
@@ -2932,6 +3013,70 @@ mod tests {
             .build();
         (Arc::new(http), worker)
     }
+    #[tokio::test]
+    async fn kick_excludes_unmanaged_thread_without_joining_and_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![
+            ("GET", "/channels/3", 200, serde_json::to_value(routing_channel()).unwrap()),
+            ("DELETE", "/channels/3/thread-members/@me", 204, serde_json::Value::Null),
+        ]);
+        let handler = routing_handler(root.path(), Arc::clone(&http)).await;
+        handler.handle_message(&http, &routing_message(false, "<@9> kick")).await.unwrap();
+        assert!(handler.store.is_thread_excluded(ThreadId::new(3)).await.unwrap());
+        assert!(handler.store.session(ThreadId::new(3)).await.unwrap().is_none());
+        drop(handler);
+        let restarted = routing_handler(root.path(), Arc::clone(&http)).await;
+        for (bot, content) in [(false, "<@9> new"), (false, "status"), (false, "<@9> return"), (true, "<@9> review")] {
+            restarted.handle_message(&http, &routing_message(bot, content)).await.unwrap();
+        }
+        assert!(restarted.store.session(ThreadId::new(3)).await.unwrap().is_none());
+        assert_eq!(requests.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn kick_failure_to_leave_still_blocks_outbound_surfaces() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![
+            ("DELETE", "/channels/3/thread-members/@me", 403,
+                serde_json::json!({"code":50001,"message":"Missing Access"})),
+        ]);
+        let messenger = participants_messenger(root.path(), Arc::clone(&http)).await;
+        let handler = routing_handler(root.path(), Arc::clone(&http)).await;
+        assert!(handler.handle_message(&http, &routing_message(false, "<@9> kick")).await.is_err());
+        let thread = ThreadId::new(3);
+        assert!(messenger.send(thread, "late error").await.is_err());
+        assert!(messenger.send_assistant(thread, "<@8> late response").await.is_err());
+        assert!(messenger.create_activity(thread, "Working", false).await.is_err());
+        assert!(messenger.edit_activity(thread, MessageId::new(100), "Done", true).await.is_err());
+        assert!(messenger.thread_status(thread, "completed").await.is_err());
+        messenger.notify(thread, "late notification").await;
+        let response = messenger.prompt(thread, serde_json::json!({"id":"late","method":"input"})).await;
+        assert_eq!(response["cancelled"], true);
+        assert!(!messenger.confirm(thread, ApprovalRequest {
+            title: "late approval".into(), details: "must not send".into(),
+        }).await);
+        assert!(messenger.upload_file(thread, crate::omp::UploadRequest {
+            path: "must-not-open".into(), caption: None,
+        }).await.unwrap_err().to_string().contains("kicked"));
+        assert_eq!(requests.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn kick_requires_authorized_human_and_explicit_target() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![]);
+        let handler = routing_handler(root.path(), Arc::clone(&http)).await;
+        let mut unauthorized = routing_message(false, "<@9> kick");
+        unauthorized.author.id = serenity::all::UserId::new(8);
+        handler.handle_message(&http, &unauthorized).await.unwrap();
+        handler.handle_message(&http, &routing_message(true, "<@9> kick")).await.unwrap();
+        assert!(!handler.store.is_thread_excluded(ThreadId::new(3)).await.unwrap());
+        assert_eq!(message_control(&routing_message(false, "kick"), 9), None);
+        assert_eq!(message_control(&routing_message(false, "<@8> kick"), 9), None);
+        assert_eq!(message_control(&routing_message(false, "<@!9> /kick"), 9), Some(Control::Kick));
+        assert!(requests.join().unwrap().is_empty());
+    }
+
 
     async fn routing_handler(root: &std::path::Path, http: Arc<Http>) -> DiscordHandler {
         let config = Arc::new(routing_config(root));

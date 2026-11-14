@@ -320,6 +320,14 @@ impl ThreadQueueRunner {
     }
 
     pub async fn poke(self: &Arc<Self>, thread_id: ThreadId) {
+        match self.store.is_thread_excluded(thread_id).await {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(error) => {
+                tracing::error!(thread_id = %thread_id, error = %error, "failed to inspect thread exclusion");
+                return;
+            }
+        }
         if let Some(active) = self.active.lock().unwrap().get(&thread_id) {
             active.interrupts.notify_one();
         }
@@ -351,20 +359,23 @@ impl ThreadQueueRunner {
                 }
                 let mut draining = runner.draining.lock().await;
                 let remaining = async {
+                    if runner.store.is_thread_excluded(thread_id).await? {
+                        return Ok(None);
+                    }
                     let session = runner.store.session(thread_id).await?;
                     let counts = runner.store.counts(thread_id).await?;
                     let idle = counts.queued == 0
                         && counts.running == 0
                         && !runner.active.lock().unwrap().contains_key(&thread_id);
-                    Ok::<_, anyhow::Error>((
+                    Ok::<_, anyhow::Error>(Some((
                         session.is_some_and(|session| session.status == SessionStatus::Active)
                             && counts.queued > 0,
                         idle,
-                    ))
+                    )))
                 }
                 .await;
                 match remaining {
-                    Ok((true, _)) => {
+                    Ok(Some((true, _))) => {
                         // Reset may make new work runnable before a stopped drain settles.
                         if cancellation.is_cancelled() {
                             cancellation = CancellationToken::new();
@@ -372,7 +383,7 @@ impl ThreadQueueRunner {
                         }
                         continue 'drain;
                     }
-                    Ok((false, idle)) => runner.statuses.set(
+                    Ok(Some((false, idle))) => runner.statuses.set(
                         thread_id,
                         if idle {
                             ThreadStatus::Completed
@@ -380,6 +391,7 @@ impl ThreadQueueRunner {
                             ThreadStatus::Working
                         },
                     ),
+                    Ok(None) => {}
                     Err(error) => {
                         tracing::error!(thread_id = %thread_id, error = %error, "failed to inspect remaining queue");
                     }
@@ -393,9 +405,11 @@ impl ThreadQueueRunner {
     }
 
     pub async fn stop(&self, thread_id: ThreadId) -> Result<bool> {
-        self.store
-            .set_session_status(thread_id, SessionStatus::Stopped)
-            .await?;
+        if !self.store.is_thread_excluded(thread_id).await? {
+            self.store
+                .set_session_status(thread_id, SessionStatus::Stopped)
+                .await?;
+        }
         if let Some(cancellation) = self.draining.lock().await.get(&thread_id) {
             cancellation.cancel();
         }
@@ -409,6 +423,9 @@ impl ThreadQueueRunner {
     }
 
     pub async fn new_session(self: &Arc<Self>, thread_id: ThreadId) -> Result<u64> {
+        if self.store.is_thread_excluded(thread_id).await? {
+            bail!("the bot has been kicked from this thread");
+        }
         if self.active.lock().unwrap().contains_key(&thread_id) {
             bail!(
                 "stop the active OMP turn and wait for it to finish before starting a new session"
@@ -464,6 +481,9 @@ impl ThreadQueueRunner {
         presence: &mut Option<WorkingPresence>,
     ) -> Result<()> {
         loop {
+            if cancellation.is_cancelled() || self.store.is_thread_excluded(thread_id).await? {
+                return Ok(());
+            }
             let session = self
                 .store
                 .session(thread_id)
@@ -489,7 +509,8 @@ impl ThreadQueueRunner {
                 return Ok(());
             };
             let active = ActiveRun {
-                cancellation: CancellationToken::new(),
+                // Stop may cancel the drain after a claim but before active insertion.
+                cancellation: cancellation.child_token(),
                 interrupts: Arc::new(Notify::new()),
             };
             self.active.lock().unwrap().insert(thread_id, active.clone());
@@ -516,7 +537,9 @@ impl ThreadQueueRunner {
             .session(turn.thread_id)
             .await?
             .context("claimed turn has no session mapping")?;
-        if session.status == SessionStatus::Stopped {
+        if session.status == SessionStatus::Stopped
+            || self.store.is_thread_excluded(turn.thread_id).await?
+        {
             active.cancellation.cancel();
         }
         let activity = ActivityReporter::start(Arc::clone(&self.messenger), turn.thread_id);
@@ -774,6 +797,7 @@ mod tests {
 
     struct ControlledTransport {
         observed: mpsc::UnboundedSender<i64>,
+        waiting: Option<mpsc::UnboundedSender<i64>>,
         recorded: Option<mpsc::UnboundedSender<i64>>,
         finish: Semaphore,
         lose_connection: bool,
@@ -785,6 +809,7 @@ mod tests {
         fn new(observed: mpsc::UnboundedSender<i64>, lose_connection: bool) -> Self {
             Self {
                 observed,
+                waiting: None,
                 recorded: None,
                 finish: Semaphore::new(0),
                 lose_connection,
@@ -842,6 +867,9 @@ mod tests {
                     text = self.publish_completed(ui)?;
                     self.observed.send(current.id).unwrap();
                     continue;
+                }
+                if let Some(waiting) = &self.waiting {
+                    waiting.send(current.id).unwrap();
                 }
                 let aborted = tokio::select! {
                     biased;
@@ -1245,6 +1273,40 @@ mod tests {
         assert!(runner.active.lock().unwrap().is_empty());
         assert!(cancellation.is_cancelled());
         assert_eq!(runner.permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_cancellation_reaches_an_active_turn() {
+        let (_directory, store) = fixture().await;
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        let turn = enqueue(&store, 20).await;
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task_runner = runner.clone();
+        let task = tokio::spawn(async move {
+            let mut presence = None;
+            task_runner.drain(THREAD, &task_cancellation, &mut presence).await
+        });
+        assert_eq!(received(&mut incoming).await, turn);
+        let active = runner.active.lock().unwrap().get(&THREAD).unwrap().cancellation.clone();
+
+        cancellation.cancel();
+
+        assert!(active.is_cancelled());
+        timeout(Duration::from_secs(3), task).await.unwrap().unwrap().unwrap();
+        assert!(runner.active.lock().unwrap().is_empty());
+        assert_eq!(runner.permits.available_permits(), 1);
+        assert_eq!(
+            store.next_outcome(THREAD, 0).await.unwrap().unwrap().status,
+            TurnStatus::Aborted
+        );
     }
 
     #[tokio::test]
@@ -2171,6 +2233,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exclusion_cancels_active_work_discards_queue_and_leaves_other_threads_running() {
+        let (directory, store) = fixture().await;
+        let other = ThreadId::new(11);
+        store.create_session(&NewSession {
+            thread_id: other,
+            guild_id: GuildId::new(1),
+            parent_channel_id: ChannelId::new(2),
+            trigger_message_id: MessageId::new(30),
+            cwd: directory.path().to_owned(),
+            created_by_user_id: UserId::new(4),
+        }).await.unwrap();
+        let first = enqueue(&store, 20).await;
+        let other_turn = match store.enqueue_turn(
+            other,
+            MessageId::new(30),
+            UserId::new(4),
+            "other",
+            TurnSource::Human,
+        ).await.unwrap() {
+            EnqueueResult::Enqueued(id) => id,
+            EnqueueResult::Duplicate => panic!("unexpected duplicate"),
+        };
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let (waiting, mut waits) = mpsc::unbounded_channel();
+        let mut transport = ControlledTransport::new(observed, false);
+        transport.waiting = Some(waiting);
+        let transport = Arc::new(transport);
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            transport.clone(),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            2,
+        );
+        let snapshots = runner.subscribe_presence();
+        runner.poke(THREAD).await;
+        assert_eq!(received(&mut incoming).await, first);
+        assert_eq!(received(&mut waits).await, first);
+        runner.poke(other).await;
+        assert_eq!(received(&mut incoming).await, other_turn);
+        assert_eq!(received(&mut waits).await, other_turn);
+        let queued = enqueue(&store, 21).await;
+        assert_eq!(store.counts(THREAD).await.unwrap().queued, 1);
+
+        store.exclude_thread(THREAD).await.unwrap();
+        assert!(runner.stop(THREAD).await.unwrap());
+        idle(&runner).await;
+
+        let first_outcome = store.next_outcome(THREAD, 0).await.unwrap().unwrap();
+        assert_eq!((first_outcome.id, first_outcome.status), (first, TurnStatus::Aborted));
+        let queued_outcome = store.next_outcome(THREAD, first).await.unwrap().unwrap();
+        assert_eq!((queued_outcome.id, queued_outcome.status), (queued, TurnStatus::Aborted));
+        let counts = store.counts(THREAD).await.unwrap();
+        assert_eq!((counts.queued, counts.running, counts.uncertain), (0, 0, 0));
+        assert!(runner.new_session(THREAD).await.is_err());
+        assert_eq!(store.session(THREAD).await.unwrap().unwrap().status, SessionStatus::Stopped);
+        runner.poke(THREAD).await;
+        assert!(!runner.draining.lock().await.contains_key(&THREAD));
+        assert!(incoming.try_recv().is_err());
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+        assert!(!store.is_thread_excluded(other).await.unwrap());
+        assert_eq!(store.counts(other).await.unwrap().running, 1);
+
+        transport.finish.add_permits(1);
+        timeout(Duration::from_secs(3), runner.wait_idle(other)).await.unwrap();
+        assert_eq!(
+            store.next_outcome(other, 0).await.unwrap().unwrap().status,
+            TurnStatus::Done
+        );
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
+    }
+
+    #[tokio::test]
     async fn failed_interruption_notice_does_not_suppress_the_completed_replacement() {
         let (_directory, store) = fixture().await;
         let (observed, mut incoming) = mpsc::unbounded_channel();
@@ -2301,6 +2436,61 @@ mod tests {
         assert_eq!((counts.queued, counts.running, counts.uncertain), (1, 0, 0));
         assert!(store.next_outcome(THREAD, 0).await.unwrap().is_none());
         messenger.wait_status("working").await;
+    }
+
+    #[tokio::test]
+    async fn exclusion_while_waiting_for_capacity_discards_input_without_dispatch() {
+        let (_directory, store) = fixture().await;
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        let mut snapshots = runner.subscribe_presence();
+        let permit = runner.permits.acquire().await.unwrap();
+        let turn = enqueue(&store, 20).await;
+        runner.poke(THREAD).await;
+        timeout(Duration::from_secs(3), snapshots.changed()).await.unwrap().unwrap();
+
+        store.exclude_thread(THREAD).await.unwrap();
+        assert!(!runner.stop(THREAD).await.unwrap());
+        idle(&runner).await;
+        drop(permit);
+        runner.poke(THREAD).await;
+
+        assert!(!runner.draining.lock().await.contains_key(&THREAD));
+        assert!(incoming.try_recv().is_err());
+        assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
+        let counts = store.counts(THREAD).await.unwrap();
+        assert_eq!((counts.queued, counts.running, counts.uncertain), (0, 0, 0));
+        let outcome = store.next_outcome(THREAD, 0).await.unwrap().unwrap();
+        assert_eq!((outcome.id, outcome.status), (turn, TurnStatus::Aborted));
+    }
+
+    #[tokio::test]
+    async fn excluded_unmapped_threads_can_be_stopped_but_never_started() {
+        let (_directory, store) = fixture().await;
+        let excluded = ThreadId::new(11);
+        store.exclude_thread(excluded).await.unwrap();
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+
+        assert!(!runner.stop(excluded).await.unwrap());
+        assert!(runner.new_session(excluded).await.is_err());
+        runner.poke(excluded).await;
+
+        assert!(!runner.draining.lock().await.contains_key(&excluded));
+        assert!(store.session(excluded).await.unwrap().is_none());
+        assert!(incoming.try_recv().is_err());
     }
 
     #[tokio::test]

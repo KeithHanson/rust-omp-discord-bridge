@@ -82,18 +82,18 @@ BRIDGE_BUILD_REVISION="$(git rev-parse HEAD)" RUST_VERSION=1.99.1 OMP_VERSION=18
 
 Run `docker compose run --rm bridge check` after every image, configuration, credential, or mount change before restarting the gateway.
 
-## Upgrade to 2026-11-13-3
+## Upgrade to 2026-11-14-2
 
-This release adds Discord ask/forms and periodic semantic thread titles.
-Existing configuration remains valid; optional `omp.title_model` selects a
-separate title-review model. OMP 18.20.0 remains the minimum supported version.
-There is no new database migration for these features.
+This release adds persistent per-thread bot exclusion with `@Bot kick`.
+Existing configuration remains valid and OMP 18.20.0 remains the minimum version.
+Startup adds an `excluded_threads` SQLite table. Preserve the data mount to retain
+exclusions across upgrades. Older bridge images do not enforce these exclusions.
 
 Build from the release tag in a clean checkout:
 
 ```bash
 git fetch origin --tags
-git checkout v2026-11-13-3
+git checkout v2026-11-14-2
 BRIDGE_BUILD_REVISION="$(git rev-parse HEAD)" docker compose build bridge
 docker compose run --rm bridge --version
 ```
@@ -105,8 +105,7 @@ Then run `docker compose run --rm bridge check` and `docker compose up -d bridge
 Use the same config/data mounts for the check and the service. Never run two
 gateways against the same SQLite database.
 
-Acceptance: ask for a choice and text field in an authorized thread, submit both,
-and check the returned values. For titles, keep work active beyond a minute:
-the topic/status should be inferred without blocking replies. Once delivery and
-the queue settle, the title should become `✅`; a new message reopens review.
-Discord rate limits may delay the visible change.
+Acceptance: in a disposable authorized thread, send `@Bot kick`. Mention the bot
+again and send `new`; it must not reply or rejoin. Restart the bridge cleanly and
+repeat. Other threads must remain usable. Only use a disposable thread: no chat
+command clears an exclusion. Gateway connectivity alone does not prove this path.

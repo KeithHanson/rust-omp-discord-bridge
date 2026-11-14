@@ -102,6 +102,7 @@ struct PromptRegistration<'a> {
     message_id: Option<MessageId>,
     receiver: oneshot::Receiver<Option<Value>>,
     http: Option<Arc<Http>>,
+    store: Option<Store>,
     finished: bool,
 }
 
@@ -109,11 +110,15 @@ impl Drop for PromptRegistration<'_> {
     fn drop(&mut self) {
         self.broker.pending.lock().expect("prompt broker poisoned").remove(&self.id);
         if !self.finished
-            && let (Some(http), Some(message), Ok(runtime)) =
-                (self.http.clone(), self.message_id, tokio::runtime::Handle::try_current())
+            && let (Some(http), Some(store), Some(message), Ok(runtime)) =
+                (self.http.clone(), self.store.clone(), self.message_id, tokio::runtime::Handle::try_current())
         {
             let thread = self.thread_id;
-            runtime.spawn(async move { close_card(&http, thread, message, "Cancelled; this question is no longer active.").await; });
+            runtime.spawn(async move {
+                if let Ok(_access) = thread_access(&store, thread).await {
+                    close_card(&http, thread, message, "Cancelled; this question is no longer active.").await;
+                }
+            });
         }
     }
 }
@@ -189,7 +194,7 @@ impl PromptBroker {
         self.pending.lock().expect("prompt broker poisoned").insert(id.clone(), PendingPrompt {
             thread_id, message_id: None, spec, page: 0, revision: 0, modal: None, sender,
         });
-        PromptRegistration { broker: self, id, thread_id, message_id: None, receiver, http: None, finished: false }
+        PromptRegistration { broker: self, id, thread_id, message_id: None, receiver, http: None, store: None, finished: false }
     }
 
     fn interact(
@@ -289,11 +294,13 @@ impl DiscordMessenger {
     pub(super) async fn prompt_inner(&self, thread_id: ThreadId, request: Value) -> Value {
         let mut response = json!({"type":"extension_ui_response", "id":request["id"], "cancelled":true});
         let result: Result<Option<Value>> = async {
+            let access = thread_access(&self.store, thread_id).await?;
             let spec = PromptSpec::parse(&request)?;
             let timeout = spec.timeout;
             let context = spec.context();
             let mut registration = self.prompts.register(thread_id, spec);
             registration.http = Some(Arc::clone(&self.http));
+            registration.store = Some(self.store.clone());
             // A file preserves every byte when Discord's message or menu labels would
             // truncate the title, descriptions, choices, or editor prefill.
             let mut context_message = CreateMessage::new().allowed_mentions(CreateAllowedMentions::new());
@@ -310,6 +317,7 @@ impl DiscordMessenger {
             let message = channel.send_message(&self.http, CreateMessage::new()
                 .content(content).components(components).allowed_mentions(CreateAllowedMentions::new())).await?;
             registration.bind(MessageId::new(message.id.get()));
+            drop(access);
             let (answer, status) = match tokio::time::timeout(timeout, &mut registration.receiver).await {
                 Ok(Ok(Some(answer))) => (Some(answer), "Answered; sent to OMP."),
                 Ok(_) => (None, "Cancelled; no answer sent."),
@@ -320,7 +328,9 @@ impl DiscordMessenger {
             };
             // Remove authorization before awaiting Discord cleanup.
             self.prompts.pending.lock().expect("prompt broker poisoned").remove(&registration.id);
-            close_card(&self.http, thread_id, MessageId::new(message.id.get()), status).await;
+            if let Ok(_access) = thread_access(&self.store, thread_id).await {
+                close_card(&self.http, thread_id, MessageId::new(message.id.get()), status).await;
+            }
             registration.finished = true;
             Ok(answer)
         }.await;
@@ -332,7 +342,7 @@ impl DiscordMessenger {
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(%thread_id, %error, "failed to present OMP question");
-                let _ = send_without_mentions(&self.http, thread_id, &format!("OMP question cancelled: {error}")).await;
+                let _ = self.send(thread_id, &format!("OMP question cancelled: {error}")).await;
             }
         }
         response
