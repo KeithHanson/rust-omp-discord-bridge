@@ -509,6 +509,25 @@ impl ThreadMessenger for DiscordMessenger {
         })?
     }
 
+    async fn thread_history(
+        &self,
+        session_thread_id: ThreadId,
+        target_thread_id: ThreadId,
+        days: u16,
+    ) -> Result<String> {
+        tokio::time::timeout(
+            Duration::from_secs(self.config.runtime.discord_history_timeout_seconds),
+            self.thread_history_inner(session_thread_id, target_thread_id, days),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Discord history request exceeded the configured {}-second timeout",
+                self.config.runtime.discord_history_timeout_seconds
+            )
+        })?
+    }
+
     async fn thread_participants(&self, thread_id: ThreadId) -> Result<String> {
         tokio::time::timeout(
             Duration::from_secs(self.config.runtime.discord_history_timeout_seconds),
@@ -692,7 +711,7 @@ impl DiscordMessenger {
         Ok(matches!(decision, Ok(Ok(true))))
     }
 
-    async fn channel_history_inner(&self, thread_id: ThreadId, days: u16) -> Result<String> {
+    async fn authorize_history(&self, thread_id: ThreadId, days: u16) -> Result<crate::domain::Session> {
         if days == 0 || days > self.config.runtime.discord_history_max_days {
             bail!(
                 "Discord history days must be between 1 and {}",
@@ -711,7 +730,38 @@ impl DiscordMessenger {
         if !policy.allowed_channels.contains(&session.parent_channel_id) {
             bail!("session parent channel is not authorized for history access");
         }
+        Ok(session)
+    }
 
+    async fn channel_history_inner(&self, thread_id: ThreadId, days: u16) -> Result<String> {
+        let session = self.authorize_history(thread_id, days).await?;
+        self.fetch_history(session.parent_channel_id, days).await
+    }
+
+    async fn thread_history_inner(
+        &self,
+        session_thread_id: ThreadId,
+        target_thread_id: ThreadId,
+        days: u16,
+    ) -> Result<String> {
+        let session = self.authorize_history(session_thread_id, days).await?;
+        let target_id = SerenityChannelId::new(target_thread_id.get());
+        let Channel::Guild(channel) = self.http.get_channel(target_id).await
+            .context("failed to read Discord thread metadata for history")?
+        else {
+            bail!("Discord history target must be a guild thread");
+        };
+        if channel.id != target_id
+            || channel.guild_id.get() != session.guild_id.get()
+            || channel.parent_id.map(|id| id.get()) != Some(session.parent_channel_id.get())
+            || !matches!(channel.kind, ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread)
+        {
+            bail!("Discord history target must be a thread in the session's guild and authorized parent channel");
+        }
+        self.fetch_history(ChannelId::new(target_thread_id.get()), days).await
+    }
+
+    async fn fetch_history(&self, history_channel_id: ChannelId, days: u16) -> Result<String> {
         let now_seconds: i64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock is before the Unix epoch")?
@@ -726,7 +776,7 @@ impl DiscordMessenger {
             .context("Discord history cutoff underflowed")?;
         let cutoff = Timestamp::from_unix_timestamp(cutoff_seconds)
             .context("Discord history cutoff is invalid")?;
-        let channel_id = SerenityChannelId::new(session.parent_channel_id.get());
+        let channel_id = SerenityChannelId::new(history_channel_id.get());
         let mut messages = Vec::new();
         let mut before = None;
 
@@ -741,7 +791,7 @@ impl DiscordMessenger {
                 .with_context(|| {
                     format!(
                         "failed to read Discord history for channel {}",
-                        session.parent_channel_id
+                        history_channel_id
                     )
                 })?;
             if page.is_empty() {
@@ -772,7 +822,7 @@ impl DiscordMessenger {
 
         messages.reverse();
         render_history(
-            session.parent_channel_id,
+            history_channel_id,
             days,
             &cutoff,
             &messages,
@@ -3553,6 +3603,125 @@ mod tests {
             broker.resolve(&custom_id, thread, MessageId::new(101), true),
             ApprovalResolution::Expired
         );
+    }
+
+    #[tokio::test]
+    async fn thread_history_reads_unregistered_threads_and_preserves_parent_history() {
+        for kind in [ChannelType::PublicThread, ChannelType::PrivateThread, ChannelType::NewsThread] {
+            let root = tempfile::tempdir().unwrap();
+            let mut target = routing_channel();
+            target.id = SerenityChannelId::new(4);
+            target.kind = kind;
+            let now = Timestamp::now().unix_timestamp();
+            let (http, requests) = discord_api(vec![
+                ("GET", "/channels/4", 200, serde_json::to_value(target).unwrap()),
+                ("GET", "/channels/4/messages?&limit=100", 200,
+                    serde_json::json!([history_message(10, now, "target history")])),
+                ("GET", "/channels/2/messages?&limit=100", 200,
+                    serde_json::json!([history_message(11, now, "parent history")])),
+            ]);
+            let messenger = participants_messenger(root.path(), http).await;
+            assert!(messenger.store.session(ThreadId::new(4)).await.unwrap().is_none());
+            let output = messenger.thread_history(ThreadId::new(3), ThreadId::new(4), 1).await.unwrap();
+            let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(document["channel_id"], 4);
+            assert_eq!(document["messages"][0]["content"], "target history");
+            let output = messenger.channel_history(ThreadId::new(3), 1).await.unwrap();
+            let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(document["channel_id"], 2);
+            assert_eq!(document["messages"][0]["content"], "parent history");
+            assert_eq!(requests.join().unwrap().len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_history_rejects_invalid_target_metadata_before_reading_messages() {
+        for case in ["guild", "parent", "missing_parent", "type", "id"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut target = routing_channel();
+            target.id = SerenityChannelId::new(4);
+            match case {
+                "guild" => target.guild_id = serenity::all::GuildId::new(9),
+                "parent" => target.parent_id = Some(SerenityChannelId::new(9)),
+                "missing_parent" => target.parent_id = None,
+                "type" => target.kind = ChannelType::Text,
+                _ => target.id = SerenityChannelId::new(5),
+            }
+            let (http, requests) = discord_api(vec![
+                ("GET", "/channels/4", 200, serde_json::to_value(target).unwrap()),
+            ]);
+            let mut messenger = participants_messenger(root.path(), http).await;
+            // Even another allowed parent is outside this session's scope.
+            Arc::make_mut(&mut messenger.config).discord.guilds[0].allowed_channels.insert(ChannelId::new(9));
+            let error = messenger.thread_history(ThreadId::new(3), ThreadId::new(4), 1).await.unwrap_err();
+            assert!(error.to_string().contains("session's guild and authorized parent"), "{case}: {error}");
+            assert_eq!(requests.join().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_history_validates_source_and_days_before_network_access() {
+        for case in ["unknown", "guild", "parent", "zero_days", "excess_days"] {
+            let root = tempfile::tempdir().unwrap();
+            let (http, requests) = discord_api(vec![]);
+            let mut messenger = participants_messenger(root.path(), http).await;
+            let mut source = ThreadId::new(3);
+            let mut days = 1;
+            match case {
+                "unknown" => source = ThreadId::new(8),
+                "guild" => Arc::make_mut(&mut messenger.config).discord.guilds.clear(),
+                "parent" => Arc::make_mut(&mut messenger.config).discord.guilds[0].allowed_channels.clear(),
+                "zero_days" => days = 0,
+                _ => days = 31,
+            }
+            let error = messenger.thread_history(source, ThreadId::new(4), days).await.unwrap_err();
+            assert!(error.to_string().contains(match case {
+                "unknown" => "unknown Discord thread",
+                "guild" => "unconfigured guild",
+                "parent" => "not authorized",
+                _ => "days must be between",
+            }), "{case}: {error}");
+            assert!(requests.join().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_history_paginates_and_enforces_shared_resource_limits() {
+        for limit in ["complete", "messages", "bytes"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut target = routing_channel();
+            target.id = SerenityChannelId::new(4);
+            let now = Timestamp::now().unix_timestamp();
+            let page: Vec<_> = (2..=101).rev()
+                .map(|id| history_message(id, now, "recent"))
+                .collect();
+            let (http, requests) = discord_api(vec![
+                ("GET", "/channels/4", 200, serde_json::to_value(target).unwrap()),
+                ("GET", "/channels/4/messages?&limit=100", 200, serde_json::json!(page)),
+                ("GET", "/channels/4/messages?&limit=100&before=2", 200,
+                    serde_json::json!([
+                        history_message(1, now, "oldest included"),
+                        history_message(999, now - 172_800, "outside window"),
+                    ])),
+            ]);
+            let mut messenger = participants_messenger(root.path(), http).await;
+            let runtime = &mut Arc::make_mut(&mut messenger.config).runtime;
+            runtime.discord_history_max_messages = if limit == "messages" { 100 } else { 101 };
+            if limit == "bytes" {
+                runtime.discord_history_max_bytes = 1;
+            }
+            let result = messenger.thread_history(ThreadId::new(3), ThreadId::new(4), 1).await;
+            if limit == "complete" {
+                let document: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+                assert_eq!(document["channel_id"], 4);
+                assert_eq!(document["messages"].as_array().unwrap().len(), 101);
+                assert_eq!(document["messages"][0]["content"], "oldest included");
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(if limit == "messages" { "100-message limit" } else { "1-byte output limit" }), "{error}");
+            }
+            assert_eq!(requests.join().unwrap().len(), 3);
+        }
     }
 
     fn history_message(id: u64, timestamp: i64, content: &str) -> Message {
