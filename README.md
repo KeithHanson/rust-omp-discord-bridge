@@ -409,6 +409,9 @@ RUST_LOG=info cargo run --release -- \
 
 `run` is the default subcommand and may be omitted. Use a service manager for unattended operation.
 
+For services-host file credentials without changing the installed bridge command,
+see [Infisical Agent deployment and rollback](docs/infisical.md).
+
 ### Boot service on this workstation
 
 `omp-discord-bridge.service` is configured for user `hephaestus` and this checkout.

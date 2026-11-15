@@ -1,0 +1,19 @@
+# Generate agent.yaml with generate-config.sh; do not install this example directly.
+infisical:
+  address: "@@ENDPOINT@@"
+  exit-after-auth: true
+  revoke-credentials-on-shutdown: true
+auth:
+  type: universal-auth
+  config:
+    client-id: /run/credentials/@@UNIT_NAME@@/client-id
+    client-secret: /run/credentials/@@UNIT_NAME@@/client-secret
+    remove_client_secret_on_read: false
+# No access-token sink or persistent cache.
+templates:
+  - template-content: '{{- with getSecretByName "@@DISCORD_PROJECT@@" "@@ENVIRONMENT@@" "@@DISCORD_PATH@@" "DISCORD_BOT_TOKEN" -}}{{ .Value }}{{- end -}}'
+    destination-path: "@@RUNTIME_DIR@@/discord-token"
+  - template-content: '{{- with getSecretByName "@@NOTEBOOK_PROJECT@@" "@@ENVIRONMENT@@" "@@NOTEBOOK_PATH@@" "NOTEBOOK_PASSWORD" -}}{{ .Value }}{{- end -}}'
+    destination-path: "@@RUNTIME_DIR@@/notebook-password"
+  - template-content: '{{- with getSecretByName "@@DECISION_PROJECT@@" "@@ENVIRONMENT@@" "@@DECISION_PATH@@" "DECISION_KEY" -}}{{ .Value }}{{- end -}}'
+    destination-path: "@@RUNTIME_DIR@@/decision-key"

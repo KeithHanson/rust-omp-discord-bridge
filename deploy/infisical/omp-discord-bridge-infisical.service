@@ -1,0 +1,33 @@
+[Unit]
+Description=Fetch OMP Discord Bridge file credentials with Infisical Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Match the selected services-host bridge account.
+User=services
+Group=services
+UMask=0077
+RuntimeDirectory=omp-discord-bridge
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+LoadCredential=client-id:/etc/omp-discord-bridge/credentials/client-id
+LoadCredential=client-secret:/etc/omp-discord-bridge/credentials/client-secret
+# Remove previous files before attempting auth; precreate private render targets.
+ExecStartPre=/usr/bin/rm -f /run/omp-discord-bridge/discord-token /run/omp-discord-bridge/notebook-password /run/omp-discord-bridge/decision-key
+ExecStartPre=/usr/bin/install -m 0600 /dev/null /run/omp-discord-bridge/discord-token
+ExecStartPre=/usr/bin/install -m 0600 /dev/null /run/omp-discord-bridge/notebook-password
+ExecStartPre=/usr/bin/install -m 0600 /dev/null /run/omp-discord-bridge/decision-key
+ExecStart=/usr/local/bin/infisical agent --config=/etc/omp-discord-bridge/infisical/agent.yaml
+ExecStartPost=/usr/bin/chmod 0600 /run/omp-discord-bridge/discord-token /run/omp-discord-bridge/notebook-password /run/omp-discord-bridge/decision-key
+ExecStartPost=/bin/sh -ec 'for f in /run/omp-discord-bridge/discord-token /run/omp-discord-bridge/notebook-password /run/omp-discord-bridge/decision-key; do test -f "$$f" && test ! -L "$$f" && test -s "$$f" || exit 1; done'
+# Also runs on failed pre-start, render, validation or timeout. Never keep a partial set.
+TimeoutStartSec=120
+ExecStopPost=/bin/sh -ec 'if [ "$$SERVICE_RESULT" != success ]; then rm -f /run/omp-discord-bridge/discord-token /run/omp-discord-bridge/notebook-password /run/omp-discord-bridge/decision-key; fi'
+TimeoutStopSec=15
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictSUIDSGID=yes
