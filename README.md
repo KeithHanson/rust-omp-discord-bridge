@@ -107,6 +107,15 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-15-1
+
+Adds optional TODO-driven Open Notebook retrieval: scoped semantic search, bounded
+LAN Coba relevance judgments, and full-note context delivery. Arriving references
+interrupt active OMP work and resume the original user request; cancellation does
+not roll back tool side effects. Requires explicit per-host notebook configuration
+and credentials; upgrading alone does not enable retrieval. Preserves the existing
+Discord thread-history tool and automatic idle-time binary updates.
+
 ### Release 2026-11-14-4
 
 Adds persistent per-thread provider/model selection through `models`,
