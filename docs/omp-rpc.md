@@ -47,17 +47,24 @@ A local OMP 18.20.0 smoke probe exercised the real HTML `ask` tool with a radio 
 The bridge does not pass `--approval-mode` or `--auto-approve`. OMP's project configuration in the session working directory governs `tools.approvalMode`; when the project does not set it, OMP's normal configuration layering and default apply. Read-only calls and approved actions retain their normal OMP capabilities.
 
 Before the first prompt in each process, the bridge registers `discord_channel_history`,
-`discord_thread_participants`, and `discord_upload_file` with `set_host_tools`, and
-requires OMP to acknowledge all three. The history tool accepts an integer `days` argument. The
-bridge—not the OMP process—uses the Discord token to page backward through the
-managed session's authorized parent channel, stopping at the requested cutoff.
-Results are chronological JSON containing message text, author data, embeds,
-and attachment metadata.
+`discord_thread_history`, `discord_thread_participants`, and `discord_upload_file`
+with `set_host_tools`, and requires OMP to acknowledge all four.
+Both history tools require integer `days` from 1 through
+`runtime.discord_history_max_days`. The channel tool reads the managed session's
+authorized parent channel. The thread tool additionally requires `thread_id` as
+a nonzero decimal u64 string (never a JSON number), for example
+`{"thread_id":"123456789012345678","days":7}`; unknown arguments are rejected.
+Discord channel metadata must identify a thread in the current session's guild
+and the same authorized parent channel. A target bridge session is not required.
+Non-thread channels, other guilds or parents, and inaccessible targets fail.
+The bridge—not the OMP process—uses the Discord token to page backward through
+the selected channel or thread, stopping at the requested cutoff. Results are
+chronological JSON containing message text, author data, embeds, and attachment metadata.
 
 The participants tool accepts no arguments and lists the current managed
 thread's members with their display names, usernames, bot flags, IDs, and
 explicit mentions. Membership is not online presence, access authorization, or
-proof of having read the thread. No bridge tool accepts an arbitrary channel ID.
+proof of having read the thread. Thread history's explicit ID does not grant arbitrary channel access.
 
 History enforces the configured maximum days, message count, encoded bytes,
 and request timeout. Participant lookup shares `discord_history_timeout_seconds`,

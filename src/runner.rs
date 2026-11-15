@@ -156,6 +156,12 @@ pub trait ThreadMessenger: Send + Sync {
     async fn prompt(&self, thread_id: ThreadId, request: Value) -> Value;
     async fn notify(&self, thread_id: ThreadId, message: &str);
     async fn channel_history(&self, thread_id: ThreadId, days: u16) -> Result<String>;
+    async fn thread_history(
+        &self,
+        session_thread_id: ThreadId,
+        target_thread_id: ThreadId,
+        days: u16,
+    ) -> Result<String>;
     async fn thread_participants(&self, thread_id: ThreadId) -> Result<String>;
     async fn upload_file(&self, thread_id: ThreadId, request: UploadRequest) -> Result<String>;
     /// Review a working session's topic/phase, or mark its current topic completed.
@@ -844,6 +850,13 @@ impl OmpUi for RunnerUi<'_> {
             .map_err(|error| error.to_string())
     }
 
+    async fn thread_history(&self, thread_id: ThreadId, days: u16) -> Result<String, String> {
+        self.messenger
+            .thread_history(self.thread_id, thread_id, days)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
+
     async fn thread_participants(&self) -> Result<String, String> {
         self.messenger
             .thread_participants(self.thread_id)
@@ -1223,6 +1236,15 @@ mod tests {
 
         async fn channel_history(&self, _thread_id: ThreadId, _days: u16) -> Result<String> {
             Ok("[]".to_owned())
+        }
+
+        async fn thread_history(
+            &self,
+            _session_thread_id: ThreadId,
+            _target_thread_id: ThreadId,
+            _days: u16,
+        ) -> Result<String> {
+            panic!("unexpected thread history request")
         }
 
         async fn thread_participants(&self, _thread_id: ThreadId) -> Result<String> {

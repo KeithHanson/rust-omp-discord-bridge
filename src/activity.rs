@@ -190,6 +190,15 @@ mod tests {
             unreachable!()
         }
 
+        async fn thread_history(
+            &self,
+            _: ThreadId,
+            _: ThreadId,
+            _: u16,
+        ) -> Result<String> {
+            unreachable!("activity must not request thread history")
+        }
+
         async fn thread_participants(&self, _: ThreadId) -> Result<String> {
             unreachable!()
         }

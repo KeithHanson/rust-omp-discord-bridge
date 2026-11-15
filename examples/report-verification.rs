@@ -70,6 +70,9 @@ impl OmpUi for Ui {
     async fn channel_history(&self, _: u16) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
+    async fn thread_history(&self, _: ThreadId, _: u16) -> Result<String, String> {
+        Err("Discord is deliberately unavailable in this local smoke test".into())
+    }
     async fn thread_participants(&self) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }

@@ -20,7 +20,7 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - duplicate Discord message rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
 - bounded attachment metadata and Discord-safe response chunking;
-- on-demand OMP access to bounded parent-channel message history.
+- on-demand OMP access to bounded parent-channel and same-parent thread message history.
 
 Attachment bytes are not downloaded by the bridge. OMP receives the Discord CDN URL, filename, content type, and byte count as untrusted prompt context.
 
@@ -311,7 +311,7 @@ cp config.example.toml ~/.config/omp-discord-bridge/config.toml
 
 Edit every guild, channel, user, and path ID. Access lists may not be empty: configuration is default-deny. Each guild working directory must already exist and resolve beneath `omp.allowed_root`.
 
-The Discord history tool accepts a per-call `days` value up to `runtime.discord_history_max_days`. A request fails rather than returning partial history if it exceeds `runtime.discord_history_max_messages`, `runtime.discord_history_max_bytes`, or `runtime.discord_history_timeout_seconds`.
+The Discord history tools require a per-call integer `days` value from 1 through `runtime.discord_history_max_days`. A request fails rather than returning partial history if it exceeds `runtime.discord_history_max_messages`, `runtime.discord_history_max_bytes`, or `runtime.discord_history_timeout_seconds`.
 
 Store the Discord token in the dedicated file referenced by `discord.token_file`. Enter it interactively so it does not appear in shell history:
 
@@ -505,6 +505,8 @@ interruption; the column is added automatically when opening an existing databas
 The bridge does not override OMP's approval mode, remove tools, or sandbox an approved call. OMP loads the project configuration from the configured working directory, including `tools.approvalMode`. When that policy asks for approval, the bridge translates OMP's one-shot request into Discord buttons. Persistent session-wide approval is intentionally unavailable through Discord.
 
 OMP can call `discord_channel_history` to read messages from the allowed parent channel that created the session. The tool accepts `days`, returns chronological JSON containing message text, author metadata, embeds, and attachment metadata, and never exposes the Discord token. Discord history is untrusted input. Requests outside the configured day window or resource limits fail explicitly; history is never silently truncated.
+
+OMP can call `discord_thread_history` with `{"thread_id":"123456789012345678","days":7}` to read a particular thread. Both arguments are required: `thread_id` must be a nonzero decimal u64 **string**, not a JSON number, and `days` must be an integer within the configured window. Extra arguments are rejected. Discord channel metadata must identify the target as a thread in the current session's guild and the same authorized parent channel; other parents, guilds, and non-thread channels are rejected. The target does not need its own bridge session. Results use the same chronological JSON, pagination, and resource limits as parent-channel history; inaccessible threads and Discord API errors fail explicitly.
 
 OMP can call `discord_thread_participants` without arguments to list members of
 the current managed thread, including display names, usernames, bot flags, IDs,
