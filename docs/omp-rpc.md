@@ -157,19 +157,37 @@ atomic, so a stale Discord handler cannot admit new work after `stop`.
 ## Optional notebook context
 
 `omp.note_retrieval` is disabled when omitted or when `notebook_ids` is empty.
-Disabled sessions make no notebook or Jev requests and need no extra credentials.
+Disabled sessions make no notebook or decision requests and need no extra credentials.
 Enabled sessions establish an initial `get_state.todoPhases` baseline, observe
 successful native TODO results and auto-clear events, and refresh canonical
 TODO state after completed tools (including eval/device calls).
 Unchanged snapshots and pure views do not start retrieval.
 
-Retrieval lists full notes through Open Notebook's REST `/api/notes` endpoint,
-whose response is an unpaginated array including note content. It deduplicates
-note IDs within that retrieval, then sends one `jev-1.14.0` Noul request per note,
-with at most four requests in flight. The state contains only `TODOS`,
-`NOTE_TITLE`, and `NOTE_CONTENT`; the question is “Is this note relevant to TODOS?”
-Every probability at or above `0.50` qualifies. There is no confidence gate,
-top-k selection, truncation, or deduplication across TODO changes.
+For each distinct task text, including completed tasks, retrieval calls
+`POST /api/search` with `type: "vector"`, the configured `notebook_ids`,
+`search_notes: true`, `search_sources: false`, and `limit: search_limit` (default
+10). Empty task lists and notebook scopes bypass I/O. The latter guard matters:
+Open Notebook interprets an empty search scope as all notebooks.
+
+Candidate IDs are deduplicated across searches; each original is fetched once via
+`GET /api/notes/{id}`. Search matches are not assumed to be complete note bodies.
+At most four candidate workers judge notes, assigned round-robin to configured
+`decision_endpoints`. No broad listing fallback, retry, or endpoint failover occurs.
+The note is judged only against tasks whose searches shortlisted it.
+
+`coba:150m-ternary` receives one task, full note title, and one overlapping body
+passage per request. The Noul question is “Is this passage useful for this TODO?”
+with criteria `false: "Not useful"` and `true: "Useful"`. The pinned tokenizer and
+Ollaya v0.18.0 marker layout count the complete input, including the question and
+options, against 512 tokens. All body text is covered unless a passage qualifies
+early; Unicode and literal mask text remain intact in the emitted state.
+Oversized task/title prefixes leaving fewer than 32 passage tokens fail explicitly.
+
+The first probability at or above `0.50` selects the entire original note and stops
+further judgments for it. That stored probability describes the qualifying passage,
+not a calibrated whole-note score. No confidence gate or cross-change deduplication
+applies. `search_notebook_ids` records the search scope, not asserted membership;
+`notebook_id` is included only if the fetched note supplies it.
 
 A changed TODO snapshot cancels older HTTP work and discards any undelivered
 result. A fresh state response fences delivery against buffered mutations.
@@ -185,11 +203,12 @@ slot. Results arriving after the original answer still reach the same session.
 The existing 1 MiB RPC frame ceiling applies; oversized context fails explicitly
 rather than being silently shortened.
 
-Verification: the targeted configuration (9), retrieval (6), and RPC transport
-(51) tests passed. These include local HTTP request/response fixtures, the
-inclusive threshold, stale-result fencing, late result delivery, and user
-interruption with a queued context prompt. This does not establish live Jev
-judgment quality, deployment, or Discord-client appearance.
+Verification: targeted configuration, tokenizer, retrieval, and RPC transport
+tests passed. These cover scoped shortlist requests, original-note deduplication,
+full-note injection from a late passage, inclusive thresholds, exact token budgets,
+Unicode/mask coverage, stale-result fencing, late delivery, and interruption with
+queued context. Release-script syntax was checked. Live Coba judgment quality,
+deployment, container builds, and Discord-client appearance were not verified.
 
 ## Cancellation and shutdown
 

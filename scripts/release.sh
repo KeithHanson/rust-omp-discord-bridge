@@ -135,6 +135,10 @@ install -m 755 "$binaries/omp-discord-bridge" "$binaries/bridge-local" "$work/$b
 for file in .env.example config.example.toml config.container.example.toml omp-discord-bridge.service README.md LICENSE; do
     install -m 644 "$work/source/$file" "$work/$bundle/"
 done
+mkdir -p -- "$work/$bundle/licenses/coba"
+for file in LICENSE NOTICE; do
+    install -m 644 "$work/source/assets/coba/$file" "$work/$bundle/licenses/coba/"
+done
 install -m 755 "$binaries/omp-discord-bridge" "$artifacts/$raw_asset"
 # Stable archive metadata; the executables still depend on the Rust toolchain.
 epoch=$(git show -s --format=%ct "$commit")

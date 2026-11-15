@@ -2292,7 +2292,9 @@ mod tests {
                         notebook_ids: vec!["notebook:test".to_owned()],
                         base_url: "http://127.0.0.1:1".to_owned(),
                         password_file: None,
-                        typesafe_key_file: PathBuf::from("/nonexistent/test-note-key"),
+                        decision_endpoints: vec!["http://127.0.0.1:1/v1/systemone".to_owned()],
+                        decision_key_file: PathBuf::from("/nonexistent/test-note-key"),
+                        search_limit: 10,
                     };
                     let mut notes = NoteContext::new(&config, &json!([]));
                     notes.pending = Some(Box::pin(async move { result.await.unwrap() }));
@@ -2453,13 +2455,15 @@ mod tests {
             notebook_ids: vec!["notebook:test".to_owned()],
             base_url: "http://127.0.0.1:1".to_owned(),
             password_file: None,
-            typesafe_key_file: PathBuf::from("/nonexistent/test-note-key"),
+            decision_endpoints: vec!["http://127.0.0.1:1/v1/systemone".to_owned()],
+            decision_key_file: PathBuf::from("/nonexistent/test-note-key"),
+            search_limit: 10,
         };
         let first = json!([{"name": "Work", "tasks": [{"content": "Build", "status": "in_progress"}]}]);
         let second = json!([{"name": "Work", "tasks": [{"content": "Build", "status": "completed"}]}]);
         let mut notes = NoteContext::new(&config, &first);
         notes.observe(&first);
-        assert!(!notes.is_pending(), "unchanged reads must not call Jev");
+        assert!(!notes.is_pending(), "unchanged reads must not retrieve notes");
         let (send, receive) = tokio::sync::oneshot::channel::<Option<String>>();
         notes.pending = Some(Box::pin(async move { Ok(receive.await.unwrap()) }));
         notes.ready = Some("stale note".to_owned());

@@ -19,11 +19,18 @@ allowed_root = "/workspace"
 # title_model = "openai-codex/gpt-5.6-sol"
 
 # Optional TODO-triggered note retrieval; omit this section or use [] to disable.
-# Sends full TODO state and every candidate note's full title/content to TypeSafe.
+# Semantic shortlist, then Coba passage judgments; matching notes enter OMP in full.
 # [omp.note_retrieval]
 # notebook_ids = ["notebook:example"]
 # base_url = "http://127.0.0.1:5055" # Default; use a container-reachable API URL.
-# typesafe_key_file = "/config/typesafe-key" # Read-only mount; chmod 600
+# search_limit = 10 # Per distinct TODO; 1–1000.
+# decision_endpoints = [
+#   "http://decision-host:11440/v1/systemone",
+#   "http://decision-host:11441/v1/systemone",
+#   "http://decision-host:11442/v1/systemone",
+#   "http://decision-host:11443/v1/systemone",
+# ]
+# decision_key_file = "/config/decision-key" # Bare key; read-only mount; chmod 600
 # password_file = "/config/notebook-password" # Optional; read-only mount; chmod 600
 
 [runtime]

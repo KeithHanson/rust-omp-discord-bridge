@@ -47,7 +47,7 @@ fn release_version(root: &Path) -> String {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=BRIDGE_BUILD_REVISION");
-    for path in ["build.rs", "Cargo.toml", "Cargo.lock", "VERSION", "src"] {
+    for path in ["build.rs", "Cargo.toml", "Cargo.lock", "VERSION", "src", "assets"] {
         println!("cargo:rerun-if-changed={path}");
     }
     let root = env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory");
@@ -73,7 +73,7 @@ fn main() {
             let mut revision = git(root, &["rev-parse", "HEAD"]);
             let dirty = git(root, &[
                 "status", "--porcelain", "--untracked-files=normal", "--",
-                "build.rs", "Cargo.toml", "Cargo.lock", "VERSION", "src",
+                "build.rs", "Cargo.toml", "Cargo.lock", "VERSION", "src", "assets",
             ]);
             if !dirty.is_empty() {
                 revision.push_str("-dirty");

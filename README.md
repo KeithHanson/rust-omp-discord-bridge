@@ -331,33 +331,47 @@ The bridge rejects empty token files, files larger than 4096 bytes, tokens conta
 ### Optional TODO-triggered Open Notebook retrieval
 
 Use direct TOML configuration and add `[omp.note_retrieval]` as shown in the
-example configs. Set `notebook_ids` to the notebooks to consult and
-`typesafe_key_file` to a file containing your TypeSafe API key. `base_url` defaults
-to `http://127.0.0.1:5055` (the Open Notebook API, not its UI); use an HTTP(S) URL
-without embedded credentials, query, or fragment. Containers need an API address
-reachable from inside their network, not the host's loopback address.
+example configs. Set `notebook_ids` (up to 50), `decision_endpoints` (one or more
+complete Coba `/v1/systemone` URLs), and `decision_key_file` (a file containing
+the Ollaya bearer key, not an `auth.env` assignment). `base_url` defaults to
+`http://127.0.0.1:5055`, the Open Notebook API rather than its UI. URLs must use
+HTTP(S) without embedded credentials, query, or fragment. Containers need
+addresses reachable from inside their network, not the host's loopback address.
 For authenticated Open Notebook, also set `password_file`. Protect both credential
 files with `chmod 600`, make them readable by the bridge account, and mount them
 read-only in containers. `~` paths expand to the bridge account's home directory.
 Credentials are loaded during retrieval, not while parsing configuration.
 
 Omitting the section, omitting `notebook_ids`, or setting `notebook_ids = []`
-skips the entire feature without requiring URLs or credentials. When enabled,
-every actual TODO state change lists all notes in the configured notebooks.
-One minimal Jev Noul decision is made per unique note for that change, using
-`TODOS`, `NOTE_TITLE`, and `NOTE_CONTENT`.
+skips the entire feature without requiring URLs or credentials. Empty task lists
+also skip retrieval. When enabled, each actual TODO state change:
 
-**Disclosure:** enabling this feature sends the complete current TODO state and
-each candidate note's full title and content to TypeSafe, including notes that
-are ultimately rejected. A note with `P(yes) >= 0.50` is injected in full into
-the OMP conversation (and therefore its model context). There is no additional
-confidence threshold and no cross-change deduplication: the same matching note
-can be injected again after subsequent TODO changes. Only enable notebooks whose
-entire contents you permit these services to receive.
+1. Searches the configured notebooks semantically for each distinct task text,
+   including completed tasks. `search_limit` defaults to 10 candidates per task
+   and accepts 1–1000. Search includes notes only, never sources.
+2. Deduplicates candidate IDs and fetches each original note once.
+3. Sends each candidate's full title and overlapping body passages to
+   `coba:150m-ternary`, paired with the task(s) that shortlisted it.
+4. Injects the entire original note when any passage has `P(useful) >= 0.50`,
+   stopping further judgments for that note.
 
-Configured retrieval failures are observable rather than silently treated as no
-matches. These examples do not enable, deploy, or restart any live service;
-activation requires your own configuration and normal deployment procedure.
+The bundled tokenizer and Ollaya v0.18.0 question layout budget each request to
+512 tokens, including the question and options. Oversized task/title prefixes
+that leave fewer than 32 passage tokens fail explicitly; they are not shortened.
+There are at most four candidate workers, assigned round-robin to the configured
+endpoints. There is no retry or endpoint failover.
+
+**Disclosure:** TODO queries reach Open Notebook's configured embedding backend.
+Coba receives candidate note titles and passages, including rejected notes.
+Selected notes enter OMP in full and therefore reach its model. No additional
+confidence threshold or cross-change deduplication applies: a matching note can
+be injected again after later TODO changes. Search requires indexed notes and
+can miss useful notes outside its shortlist; increasing `search_limit` favors recall.
+
+Configured retrieval failures are visible errors, not negative relevance answers.
+The existing 1 MiB OMP RPC frame limit still applies to the injected message.
+These examples do not enable, deploy, or restart any live service; activation
+requires your own configuration and normal deployment procedure.
 
 ## Validate and run
 The bridge launches the configured OMP executable and uses its normal authentication sources, including `~/.omp/agent/agent.db`, OMP `.env` files, and environment variables inherited from the bridge process. Leave `omp.model` unset to use OMP's configured default. If set, use an exact provider/model ID shown by `omp models`; `openai-codex` subscription authentication is separate from the API-key-based `openai` provider.

@@ -1,4 +1,5 @@
 mod activity;
+mod coba;
 pub mod config;
 pub mod discord;
 pub mod domain;

@@ -7,6 +7,7 @@ WORKDIR /build
 ARG BRIDGE_BUILD_REVISION
 COPY Cargo.toml Cargo.lock build.rs VERSION ./
 COPY src ./src
+COPY assets ./assets
 RUN BRIDGE_BUILD_REVISION="${BRIDGE_BUILD_REVISION}" cargo build --locked --release --bin omp-discord-bridge
 
 FROM debian:bookworm-slim AS omp-installer
@@ -40,6 +41,7 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/omp-discord-bridge /usr/local/bin/omp-discord-bridge
 COPY --from=omp-installer /opt/omp/omp /usr/local/bin/omp
+COPY assets/coba/LICENSE assets/coba/NOTICE /usr/share/doc/omp-discord-bridge/coba/
 
 ENV HOME=/data \
     OMP_DISCORD_BRIDGE_CONFIG=/config/config.toml \

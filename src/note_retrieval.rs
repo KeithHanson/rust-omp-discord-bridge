@@ -1,6 +1,6 @@
 //! TODO-triggered reference retrieval. API failures are errors, never negative judgments.
 
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path, time::Duration};
+use std::{collections::{BTreeMap, HashSet}, fs::File, io::Read, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{StreamExt, TryStreamExt, stream};
@@ -10,10 +10,6 @@ use serde_json::{Value, json};
 
 use crate::config::NoteRetrievalConfig;
 
-const JEV_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
-const MODEL: &str = "jev-1.14.0";
-const QUESTION: &str = "Is this note relevant to TODOS?";
-const THRESHOLD: f64 = 0.50;
 const CONCURRENCY: usize = 4;
 
 #[derive(Deserialize)]
@@ -24,6 +20,8 @@ struct Note {
     title: Option<String>,
     #[serde(deserialize_with = "deserialize_nullable_string")]
     content: Option<String>,
+    #[serde(default)]
+    notebook_id: Option<String>,
 }
 
 fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -33,25 +31,78 @@ where
     Option::<String>::deserialize(deserializer)
 }
 
-struct Candidate {
-    notebook_id: String,
-    title: Option<String>,
-    content: Option<String>,
+#[derive(Deserialize)]
+struct SearchResponse {
+    results: Vec<SearchHit>,
+    total_count: usize,
+    search_type: String,
+}
+
+#[derive(Deserialize)]
+struct SearchHit {
+    id: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TodoPhase<'a> {
+    name: &'a str,
+    #[serde(borrow)]
+    tasks: Vec<TodoTask<'a>>,
+}
+
+#[derive(Deserialize)]
+struct TodoTask<'a> {
+    content: &'a str,
+    status: TodoStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+fn task_texts(todos: &Value) -> Result<Vec<&str>> {
+    let phases = Vec::<TodoPhase>::deserialize(todos)
+        .context("invalid TODO snapshot: expected phases with name and tasks containing content/status")?;
+    let mut seen = HashSet::new();
+    let mut tasks = Vec::new();
+    for phase in phases {
+        let _ = phase.name;
+        for task in phase.tasks {
+            let _ = task.status;
+            if !task.content.trim().is_empty() && seen.insert(task.content) {
+                tasks.push(task.content);
+            }
+        }
+    }
+    Ok(tasks)
 }
 
 #[derive(Serialize)]
-struct ReferenceNote {
+struct ReferenceNote<'a> {
     note_id: String,
-    notebook_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notebook_id: Option<String>,
+    search_notebook_ids: &'a [String],
     title: Option<String>,
     content: Option<String>,
+    // P(useful) for the first qualifying passage, not a whole-note probability.
     probability: f64,
 }
 
-/// Return every relevant note in full, independently on each invocation.
-/// Empty notebook lists bypass all I/O, including credential loading.
+/// Search each distinct task, judge only shortlisted original notes, and return matches in full.
+/// Empty notebook scopes and empty task lists bypass credentials and network I/O.
 pub async fn retrieve(config: &NoteRetrievalConfig, todos: &Value) -> Result<Option<String>> {
     if config.notebook_ids.is_empty() {
+        return Ok(None);
+    }
+    let tasks = task_texts(todos)?;
+    if tasks.is_empty() {
         return Ok(None);
     }
     let client = http_client()?;
@@ -60,14 +111,13 @@ pub async fn retrieve(config: &NoteRetrievalConfig, todos: &Value) -> Result<Opt
         .as_deref()
         .map(|path| load_authorization(path, "Open Notebook password"))
         .transpose()?;
-    let api_key = load_authorization(&config.typesafe_key_file, "TypeSafe API key")?;
+    let api_key = load_authorization(&config.decision_key_file, "decision API key")?;
     retrieve_with_client(
         &client,
         config,
-        todos,
+        &tasks,
         password.as_ref(),
         &api_key,
-        JEV_ENDPOINT,
     )
     .await
 }
@@ -116,89 +166,115 @@ fn load_authorization(path: &Path, label: &str) -> Result<HeaderValue> {
 async fn retrieve_with_client(
     client: &Client,
     config: &NoteRetrievalConfig,
-    todos: &Value,
+    todos: &[&str],
     password: Option<&HeaderValue>,
     api_key: &HeaderValue,
-    jev_endpoint: &str,
 ) -> Result<Option<String>> {
-    let mut notes_url = Url::parse(&config.base_url).context("invalid Open Notebook base URL")?;
+    // An empty scope means ALL notebooks to the REST API, so guard here as well.
+    if config.notebook_ids.is_empty() || todos.is_empty() {
+        return Ok(None);
+    }
+    ensure!(!config.decision_endpoints.is_empty(), "no decision endpoints configured");
+    let mut base = Url::parse(&config.base_url).context("invalid Open Notebook base URL")?;
     ensure!(
-        matches!(notes_url.scheme(), "http" | "https")
-            && notes_url.username().is_empty()
-            && notes_url.password().is_none()
-            && notes_url.query().is_none()
-            && notes_url.fragment().is_none(),
+        matches!(base.scheme(), "http" | "https")
+            && base.username().is_empty()
+            && base.password().is_none()
+            && base.query().is_none()
+            && base.fragment().is_none(),
         "Open Notebook base URL must be HTTP(S) without credentials, query, or fragment"
     );
-    notes_url.set_path(&format!("{}/api/notes", notes_url.path().trim_end_matches('/')));
-
-    // The REST endpoint returns the entire array, including content. Unlike the
-    // MCP list tool, its contract has no limit, offset, or cursor parameters.
-    let mut candidates = BTreeMap::new();
-    for notebook_id in &config.notebook_ids {
-        let mut request = client.get(notes_url.clone()).query(&[("notebook_id", notebook_id)]);
+    base.set_path(&format!("{}/api/", base.path().trim_end_matches('/')));
+    let search_url = base.join("search")?;
+    // Sorted IDs keep output and endpoint assignment independent of completion order.
+    let mut candidates: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (todo_index, todo) in todos.iter().enumerate() {
+        let mut request = client.post(search_url.clone()).json(&json!({
+            "query": todo,
+            "type": "vector",
+            "notebook_ids": config.notebook_ids,
+            "search_notes": true,
+            "search_sources": false,
+            "limit": config.search_limit,
+        }));
         if let Some(password) = password {
             request = request.header(reqwest::header::AUTHORIZATION, password);
         }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("failed to list Open Notebook notes for {notebook_id}"))?;
-        ensure!(
-            response.status().is_success(),
-            "Open Notebook note listing for {notebook_id} returned HTTP {}",
-            response.status()
-        );
-        let notes: Vec<Note> = response
-            .json()
-            .await
-            .with_context(|| format!("invalid Open Notebook notes response for {notebook_id}"))?;
-        for note in notes {
-            ensure!(!note.id.is_empty(), "Open Notebook returned an empty note ID");
-            candidates.entry(note.id).or_insert_with(|| Candidate {
-                notebook_id: notebook_id.clone(),
-                title: note.title,
-                content: note.content,
-            });
+        let response = request.send().await.context("Open Notebook search request failed")?;
+        ensure!(response.status().is_success(),
+            "Open Notebook search returned HTTP {}", response.status());
+        let search: SearchResponse = response.json().await
+            .context("invalid Open Notebook search response")?;
+        ensure!(search.search_type == "vector", "Open Notebook returned a non-vector search");
+        ensure!(search.total_count >= search.results.len(),
+            "Open Notebook search count is smaller than its results");
+        ensure!(search.results.len() <= config.search_limit,
+            "Open Notebook search exceeded the requested limit");
+        for hit in search.results {
+            let note_id = hit.parent_id.as_deref().unwrap_or(&hit.id);
+            ensure!(note_id.starts_with("note:") && note_id.len() > "note:".len(),
+                "Open Notebook search returned a non-note ID");
+            ensure!(hit.id.starts_with("note:") || hit.id.starts_with("note_embedding:"),
+                "Open Notebook search returned a non-note result");
+            let matched = candidates.entry(note_id.to_owned()).or_default();
+            if matched.last() != Some(&todo_index) {
+                matched.push(todo_index);
+            }
         }
     }
 
-    let selected: Vec<Option<ReferenceNote>> = stream::iter(candidates)
-        .map(|(note_id, note)| async move {
-            let payload = json!({
-                "model": MODEL,
-                "state": {
-                    "TODOS": todos,
-                    "NOTE_TITLE": note.title,
-                    "NOTE_CONTENT": note.content,
-                },
-                "questions": {
-                    "relevant": {"type": "noul", "instructions": QUESTION}
+    let selected: Vec<Option<ReferenceNote>> = stream::iter(candidates.into_iter().enumerate())
+        .map(|(index, (note_id, matched))| {
+            let base = &base;
+            async move {
+                let mut note_url = base.join("notes/")?;
+                note_url.path_segments_mut().map_err(|_| anyhow::anyhow!("invalid notes URL"))?
+                    .pop_if_empty().push(&note_id);
+                let mut request = client.get(note_url);
+                if let Some(password) = password {
+                    request = request.header(reqwest::header::AUTHORIZATION, password);
                 }
-            });
-            let response = client
-                .post(jev_endpoint)
-                .header(reqwest::header::AUTHORIZATION, api_key)
-                .json(&payload)
-                .send()
-                .await
-                .with_context(|| format!("TypeSafe relevance request failed for note {note_id}"))?;
-            ensure!(
-                response.status().is_success(),
-                "TypeSafe relevance request for note {note_id} returned HTTP {}",
-                response.status()
-            );
-            let body: Value = response.json().await
-                .with_context(|| format!("invalid TypeSafe JSON for note {note_id}"))?;
-            let probability = relevance_probability(&body)
-                .with_context(|| format!("invalid TypeSafe relevance answer for note {note_id}"))?;
-            Ok::<_, anyhow::Error>((probability >= THRESHOLD).then_some(ReferenceNote {
-                note_id,
-                notebook_id: note.notebook_id,
-                title: note.title,
-                content: note.content,
-                probability,
-            }))
+                let response = request.send().await.context("Open Notebook note request failed")?;
+                ensure!(response.status().is_success(),
+                    "Open Notebook note request returned HTTP {}", response.status());
+                let note: Note = response.json().await.context("invalid Open Notebook note response")?;
+                ensure!(note.id == note_id, "Open Notebook returned a different note ID");
+                if let Some(notebook_id) = &note.notebook_id {
+                    ensure!(config.notebook_ids.contains(notebook_id),
+                        "Open Notebook returned a note outside the requested notebook scope");
+                }
+                let endpoint = &config.decision_endpoints[index % config.decision_endpoints.len()];
+                let mut qualifying_probability = None;
+                'tasks: for todo_index in matched {
+                    let passages = crate::coba::NotePassages::new(
+                        todos[todo_index],
+                        note.title.as_deref().unwrap_or_default(),
+                        note.content.as_deref().unwrap_or_default(),
+                    )?;
+                    for state in passages {
+                        let response = client.post(endpoint)
+                            .header(reqwest::header::AUTHORIZATION, api_key)
+                            .json(&crate::coba::request(state?))
+                            .send().await.context("Coba relevance request failed")?;
+                        ensure!(response.status().is_success(),
+                            "Coba relevance request returned HTTP {}", response.status());
+                        let body: Value = response.json().await.context("invalid Coba JSON")?;
+                        let probability = relevance_probability(&body)?;
+                        if probability >= crate::coba::THRESHOLD {
+                            qualifying_probability = Some(probability);
+                            break 'tasks;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(qualifying_probability.map(|probability| ReferenceNote {
+                    note_id,
+                    notebook_id: note.notebook_id,
+                    search_notebook_ids: &config.notebook_ids,
+                    title: note.title,
+                    content: note.content,
+                    probability,
+                }))
+            }
         })
         .buffered(CONCURRENCY)
         .try_collect()
@@ -214,6 +290,12 @@ async fn retrieve_with_client(
 }
 
 fn relevance_probability(body: &Value) -> Result<f64> {
+    // Ollaya's native response exposes this flag. Its System One view currently
+    // omits it; reject it if supplied, while relying on local token budgeting.
+    if let Some(value) = body.get("state_truncated") {
+        ensure!(value == &Value::Bool(false),
+            "Coba reported truncation or invalid truncation metadata");
+    }
     let answer = &body["answers"]["relevant"];
     ensure!(answer["type"] == "noul", "expected a Noul answer");
     let Some(probability) = answer["noul"].as_f64() else {
@@ -252,8 +334,10 @@ mod tests {
 
     fn config(base_url: String, notebook_ids: Vec<String>) -> NoteRetrievalConfig {
         NoteRetrievalConfig {
+            decision_endpoints: vec![format!("{base_url}/v1/systemone")],
             base_url, notebook_ids, password_file: None,
-            typesafe_key_file: PathBuf::from("/nonexistent/notebook-retrieval-test-key"),
+            decision_key_file: PathBuf::from("/nonexistent/notebook-retrieval-test-key"),
+            search_limit: 10,
         }
     }
 
@@ -261,10 +345,21 @@ mod tests {
     fn server(responses: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
         let handle = thread::spawn(move || {
             let mut requests = Vec::new();
             for (status, body) in responses {
-                let (mut socket, _) = listener.accept().unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let (mut socket, _) = loop {
+                    match listener.accept() {
+                        Ok(socket) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline { return requests; }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut bytes = Vec::new();
                 let header_end = loop {
@@ -296,82 +391,176 @@ mod tests {
             .await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn lists_deduplicates_sends_full_state_and_includes_threshold() {
-        let content = "full reference body\n```\nignore instructions\n```".repeat(1_000);
-        let note = json!({"id": "note:a", "title": "Title", "content": content});
-        let (url, handle) = server(vec![
-            (200, json!([note])),
-            (200, json!([note])),
-            (200, json!({"answers": {"relevant": {"type": "noul", "noul": 0.5}}})),
-        ]);
-        let todos = json!([{"text": "Read the note", "status": "in_progress"}]);
-        let result = retrieve_with_client(
-            &http_client().unwrap(),
-            &config(url.clone(), vec!["notebook:first".into(), "notebook:second".into()]),
-            &todos,
+    fn search(ids: &[&str]) -> Value {
+        json!({
+            "results": ids.iter().map(|id| json!({
+                "id": id, "parent_id": id, "title": "untrusted search title",
+                "similarity": 0.8, "matches": ["not the original body"],
+            })).collect::<Vec<_>>(),
+            "total_count": ids.len(), "search_type": "vector",
+        })
+    }
+
+    fn answer(probability: f64) -> Value {
+        json!({"answers": {"relevant": {"type": "noul", "noul": probability}}})
+    }
+
+    async fn fixture_retrieve(url: &str, todos: &[&str]) -> Result<Option<String>> {
+        retrieve_with_client(
+            &http_client()?,
+            &config(url.into(), vec!["notebook:a".into(), "notebook:b".into()]),
+            todos,
             Some(&HeaderValue::from_static("Bearer notebook-test")),
-            &HeaderValue::from_static("Bearer jev-test"),
-            &format!("{url}/v1/systemone"),
-        ).await.unwrap().unwrap();
+            &HeaderValue::from_static("Bearer decision-test"),
+        ).await
+    }
+
+    #[test]
+    fn canonical_tasks_include_every_status_but_not_phase_titles() {
+        let todos = json!([{"name":"Not a task", "tasks":[
+            {"content":"first", "status":"pending"},
+            {"content":"second", "status":"in_progress"},
+            {"content":"third", "status":"completed"},
+            {"content":"first", "status":"completed"},
+            {"content":" \n", "status":"pending"}
+        ]}]);
+        assert_eq!(task_texts(&todos).unwrap(), ["first", "second", "third"]);
+        for malformed in [
+            json!({}), json!([{"name":"phase"}]),
+            json!([{"name":"phase", "tasks":[{"content":"a", "status":"unknown"}]}]),
+            json!([{"name":"phase", "tasks":[{"text":"a", "status":"pending"}]}]),
+        ] {
+            assert!(task_texts(&malformed).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_tasks_bypass_credentials_and_network() {
+        let config = config("not a URL".into(), vec!["notebook:a".into()]);
+        for todos in [json!([]), json!([{"name":"phase", "tasks":[]}]),
+            json!([{"name":"phase", "tasks":[{"content":" ", "status":"completed"}]}])] {
+            assert!(retrieve(&config, &todos).await.unwrap().is_none());
+        }
+        assert!(retrieve(&config, &json!({})).await.unwrap_err()
+            .to_string().contains("invalid TODO snapshot"));
+    }
+
+    #[tokio::test]
+    async fn scoped_shortlist_deduplicates_fetches_once_and_judges_only_matched_tasks() {
+        let content = "original body";
+        let (url, handle) = server(vec![
+            (200, search(&["note:a", "note:a"])),
+            (200, search(&[])),
+            (200, search(&["note:a"])),
+            (200, json!({"id":"note:a", "title":"Original title", "content":content})),
+            (200, answer(0.49)),
+            (200, answer(0.50)),
+        ]);
+        let result = fixture_retrieve(&url, &["first", "not shortlisted", "last"])
+            .await.unwrap().unwrap();
+        assert!(result.starts_with("Open Notebook reference data (JSON;"));
         let references: Value = serde_json::from_str(result.split_once('\n').unwrap().1).unwrap();
         assert_eq!(references.as_array().unwrap().len(), 1);
-        assert_eq!(references[0]["note_id"], "note:a");
-        assert_eq!(references[0]["notebook_id"], "notebook:first");
         assert_eq!(references[0]["content"], content);
-        assert_eq!(references[0]["probability"], 0.5);
+        assert_eq!(references[0]["probability"], 0.50);
+        assert!(references[0].get("notebook_id").is_none());
+        assert_eq!(references[0]["search_notebook_ids"], json!(["notebook:a", "notebook:b"]));
         let requests = handle.join().unwrap();
-        assert!(requests[0].starts_with("GET /api/notes?notebook_id=notebook%3Afirst "));
-        assert!(requests[1].starts_with("GET /api/notes?notebook_id=notebook%3Asecond "));
+        assert_eq!(requests.len(), 6);
+        for (index, todo) in ["first", "not shortlisted", "last"].iter().enumerate() {
+            assert!(requests[index].starts_with("POST /api/search "));
+            let body: Value = serde_json::from_str(requests[index].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body, json!({"query":todo, "type":"vector",
+                "notebook_ids":["notebook:a","notebook:b"],
+                "search_notes":true, "search_sources":false, "limit":10}));
+        }
+        assert!(requests[3].starts_with("GET /api/notes/note:a "));
         assert!(requests[0].contains("authorization: Bearer notebook-test\r\n"));
-        for request in &requests[2..] {
+        assert!(requests[3].contains("authorization: Bearer notebook-test\r\n"));
+        for (request, todo) in requests[4..].iter().zip(["first", "last"]) {
             assert!(request.starts_with("POST /v1/systemone "));
-            assert!(request.contains("authorization: Bearer jev-test\r\n"));
+            assert!(request.contains("authorization: Bearer decision-test\r\n"));
             assert!(!request.contains("Bearer notebook-test"));
-            let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-            assert_eq!(body["model"], MODEL);
-            assert_eq!(body["questions"], json!({"relevant": {"type": "noul", "instructions": QUESTION}}));
-            assert_eq!(body["state"]["TODOS"], todos);
-            assert_eq!(body["state"]["NOTE_TITLE"], "Title");
-            assert_eq!(body["state"]["NOTE_CONTENT"], content);
+            let payload: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let expected = crate::coba::NotePassages::new(todo, "Original title", content)
+                .unwrap().next().unwrap().unwrap();
+            assert_eq!(payload, crate::coba::request(expected));
+            assert!(!request.contains("untrusted search title"));
         }
     }
 
     #[tokio::test]
-    async fn below_threshold_is_empty_but_malformed_jev_is_an_error() {
-        for (answer, valid) in [
-            (json!({"type": "noul", "noul": 0.49}), true),
-            (json!({"type": "noul", "noul": "invalid"}), false),
+    async fn late_passage_qualifies_and_injects_full_original() {
+        let content = "Unicode reference 世界 with useful context. ".repeat(1_000);
+        let count = crate::coba::NotePassages::new("task", "Title", &content)
+            .unwrap().collect::<Result<Vec<_>>>().unwrap().len();
+        assert!(count > 1);
+        let mut responses = vec![
+            (200, search(&["note:a"])),
+            (200, json!({"id":"note:a", "title":"Title", "content":content, "notebook_id":"notebook:b"})),
+        ];
+        responses.extend((0..count).map(|index| (200, answer(if index + 1 == count {0.50} else {0.49}))));
+        let (url, handle) = server(responses);
+        let result = fixture_retrieve(&url, &["task"]).await.unwrap().unwrap();
+        let references: Value = serde_json::from_str(result.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(references[0]["content"], content);
+        assert_eq!(references[0]["notebook_id"], "notebook:b");
+        assert_eq!(handle.join().unwrap().len(), count + 2);
+    }
+
+    #[tokio::test]
+    async fn below_threshold_is_empty_but_invalid_or_truncated_answer_is_error() {
+        for (body, valid) in [
+            (answer(0.49), true),
+            (json!({"answers":{"relevant":{"type":"noul","noul":"invalid"}}}), false),
+            (json!({"answers":{"relevant":{"type":"noul","noul":0.99}}, "state_truncated":true}), false),
+            (json!({"answers":{"relevant":{"type":"noul","noul":0.99}}, "state_truncated":"false"}), false),
         ] {
             let (url, handle) = server(vec![
-                (200, json!([{"id": "note:a", "title": null, "content": null}])),
-                (200, json!({"answers": {"relevant": answer}})),
+                (200, search(&["note:a"])),
+                (200, json!({"id":"note:a", "title":null, "content":"body"})),
+                (200, body),
             ]);
-            let result = retrieve_with_client(
-                &http_client().unwrap(), &config(url.clone(), vec!["notebook:a".into()]),
-                &json!([]), None, &HeaderValue::from_static("Bearer test"),
-                &format!("{url}/v1/systemone"),
-            ).await;
-            if valid {
-                assert!(result.unwrap().is_none());
-            } else {
-                assert!(result.is_err());
-            }
-            handle.join().unwrap();
+            let result = fixture_retrieve(&url, &["task"]).await;
+            if valid { assert!(result.unwrap().is_none()); } else { assert!(result.is_err()); }
+            assert_eq!(handle.join().unwrap().len(), 3);
         }
     }
 
     #[tokio::test]
-    async fn http_failures_and_redirects_are_errors_not_empty_results() {
+    async fn empty_shortlist_never_fetches_or_judges() {
+        let (url, handle) = server(vec![(200, search(&[]))]);
+        assert!(fixture_retrieve(&url, &["task"]).await.unwrap().is_none());
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_errors_redirects_and_malformed_search_or_notes_are_not_negative() {
         for status in [302, 401, 500] {
-            let (url, handle) = server(vec![(status, json!({}))]);
-            let result = retrieve_with_client(
-                &http_client().unwrap(), &config(url.clone(), vec!["notebook:a".into()]),
-                &json!([]), None, &HeaderValue::from_static("Bearer test"),
-                &format!("{url}/v1/systemone"),
-            ).await;
-            assert!(result.unwrap_err().to_string().contains(&format!("HTTP {status}")));
-            handle.join().unwrap();
+            for stage in 0..3 {
+                let mut responses = vec![(200, search(&["note:a"])),
+                    (200, json!({"id":"note:a", "title":null, "content":"body"}))];
+                responses.truncate(stage);
+                responses.push((status, json!({})));
+                let (url, handle) = server(responses);
+                assert!(fixture_retrieve(&url, &["task"]).await.unwrap_err()
+                    .to_string().contains(&format!("HTTP {status}")));
+                assert_eq!(handle.join().unwrap().len(), stage + 1);
+            }
+        }
+        for response in [json!({}), search(&["source:a"]),
+            json!({"results":[{"id":"source:a", "parent_id":"note:a"}],
+                "total_count":1, "search_type":"vector"})] {
+            let (url, handle) = server(vec![(200, response)]);
+            assert!(fixture_retrieve(&url, &["task"]).await.is_err());
+            assert_eq!(handle.join().unwrap().len(), 1);
+        }
+        for note in [json!({"id":"note:wrong", "title":null, "content":"body"}),
+            json!({"id":"note:a", "content":"body"}),
+            json!({"id":"note:a", "title":null, "content":"body", "notebook_id":"notebook:outside"})] {
+            let (url, handle) = server(vec![(200, search(&["note:a"])), (200, note)]);
+            assert!(fixture_retrieve(&url, &["task"]).await.is_err());
+            assert_eq!(handle.join().unwrap().len(), 2);
         }
     }
 

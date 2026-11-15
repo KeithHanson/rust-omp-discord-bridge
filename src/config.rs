@@ -52,7 +52,9 @@ pub struct NoteRetrievalConfig {
     pub notebook_ids: Vec<String>,
     pub base_url: String,
     pub password_file: Option<PathBuf>,
-    pub typesafe_key_file: PathBuf,
+    pub decision_endpoints: Vec<String>,
+    pub decision_key_file: PathBuf,
+    pub search_limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +119,32 @@ struct RawNoteRetrievalConfig {
     notebook_ids: Vec<String>,
     base_url: Option<String>,
     password_file: Option<PathBuf>,
-    typesafe_key_file: Option<PathBuf>,
+    #[serde(default)]
+    decision_endpoints: Vec<String>,
+    decision_key_file: Option<PathBuf>,
+    #[serde(default = "default_note_search_limit")]
+    search_limit: usize,
+}
+
+fn default_note_search_limit() -> usize {
+    10
+}
+
+fn validate_retrieval_url(value: &str, field: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("omp.note_retrieval.{field} must be an HTTP(S) URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!(
+            "omp.note_retrieval.{field} must be HTTP(S) without embedded credentials, query, or fragment"
+        );
+    }
+    Ok(url)
 }
 
 impl RawNoteRetrievalConfig {
@@ -128,26 +155,29 @@ impl RawNoteRetrievalConfig {
         if self.notebook_ids.iter().any(|id| id.trim().is_empty()) {
             bail!("omp.note_retrieval.notebook_ids must not contain empty IDs");
         }
+        if self.notebook_ids.len() > 50 {
+            bail!("omp.note_retrieval.notebook_ids supports at most 50 notebooks");
+        }
+        if !(1..=1000).contains(&self.search_limit) {
+            bail!("omp.note_retrieval.search_limit must be between 1 and 1000");
+        }
         let base_url = self
             .base_url
             .unwrap_or_else(|| "http://127.0.0.1:5055".to_owned());
-        let url = reqwest::Url::parse(&base_url)
-            .map_err(|_| anyhow::anyhow!("omp.note_retrieval.base_url must be an HTTP(S) URL"))?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            bail!(
-                "omp.note_retrieval.base_url must be HTTP(S) without embedded credentials, query, or fragment"
-            );
-        }
-        let typesafe_key_file = self
-            .typesafe_key_file
+        validate_retrieval_url(&base_url, "base_url")?;
+        let decision_key_file = self
+            .decision_key_file
             .filter(|path| !path.as_os_str().is_empty())
-            .context("omp.note_retrieval.typesafe_key_file is required when notebook_ids is nonempty")?;
+            .context("omp.note_retrieval.decision_key_file is required when notebook_ids is nonempty")?;
+        if self.decision_endpoints.is_empty() {
+            bail!("omp.note_retrieval.decision_endpoints must contain at least one Coba endpoint");
+        }
+        for endpoint in &self.decision_endpoints {
+            let url = validate_retrieval_url(endpoint, "decision_endpoints")?;
+            if !url.path().ends_with("/v1/systemone") {
+                bail!("omp.note_retrieval.decision_endpoints must end in /v1/systemone");
+            }
+        }
         if self.password_file.as_ref().is_some_and(|path| path.as_os_str().is_empty()) {
             bail!("omp.note_retrieval.password_file must not be empty");
         }
@@ -155,7 +185,9 @@ impl RawNoteRetrievalConfig {
             notebook_ids: self.notebook_ids,
             base_url,
             password_file: self.password_file.as_deref().map(expand_home).transpose()?,
-            typesafe_key_file: expand_home(&typesafe_key_file)?,
+            decision_endpoints: self.decision_endpoints,
+            decision_key_file: expand_home(&decision_key_file)?,
+            search_limit: self.search_limit,
         }))
     }
 }
@@ -585,12 +617,12 @@ mod tests {
 
         let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
         raw.omp.note_retrieval = Some(toml::from_str(
-            "notebook_ids = ['notebook:example']\ntypesafe_key_file = '~/missing-key'\npassword_file = '~/missing-password'",
+            "notebook_ids = ['notebook:example']\ndecision_endpoints = ['http://127.0.0.1:11440/v1/systemone']\ndecision_key_file = '~/missing-key'\npassword_file = '~/missing-password'",
         ).unwrap());
         let config = AppConfig::from_raw(raw).expect("credentials are not read at parse time");
         let retrieval = config.omp.note_retrieval.unwrap();
         assert_eq!(retrieval.base_url, "http://127.0.0.1:5055");
-        assert_eq!(retrieval.typesafe_key_file, expand_home(Path::new("~/missing-key")).unwrap());
+        assert_eq!(retrieval.decision_key_file, expand_home(Path::new("~/missing-key")).unwrap());
         assert_eq!(retrieval.password_file, Some(expand_home(Path::new("~/missing-password")).unwrap()));
     }
 
@@ -598,10 +630,13 @@ mod tests {
     fn rejects_invalid_enabled_note_retrieval() {
         let root = tempfile::tempdir().expect("tempdir");
         for (section, expected) in [
-            ("notebook_ids = ['notebook:example']", "typesafe_key_file"),
-            ("notebook_ids = [' ']\ntypesafe_key_file = '/missing-key'", "notebook_ids"),
-            ("notebook_ids = ['notebook:example']\ntypesafe_key_file = ''", "typesafe_key_file"),
-            ("notebook_ids = ['notebook:example']\ntypesafe_key_file = '/missing-key'\npassword_file = ''", "password_file"),
+            ("notebook_ids = ['notebook:example']", "decision_key_file"),
+            ("notebook_ids = [' ']\ndecision_key_file = '/missing-key'", "notebook_ids"),
+            ("notebook_ids = ['notebook:example']\ndecision_key_file = ''", "decision_key_file"),
+            ("notebook_ids = ['notebook:example']\ndecision_key_file = '/missing-key'", "decision_endpoints"),
+            ("notebook_ids = ['notebook:example']\ndecision_key_file = '/missing-key'\ndecision_endpoints = ['http://localhost/v1/systemone']\npassword_file = ''", "password_file"),
+            ("notebook_ids = ['notebook:example']\nsearch_limit = 0", "search_limit"),
+            ("notebook_ids = ['notebook:example']\nsearch_limit = 1001", "search_limit"),
         ] {
             let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
             raw.omp.note_retrieval = Some(toml::from_str(section).unwrap());
@@ -614,10 +649,30 @@ mod tests {
         ] {
             let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
             raw.omp.note_retrieval = Some(toml::from_str(&format!(
-                "notebook_ids = ['notebook:example']\ntypesafe_key_file = '/missing-key'\nbase_url = {url:?}"
+                "notebook_ids = ['notebook:example']\ndecision_key_file = '/missing-key'\nbase_url = {url:?}"
             )).unwrap());
             assert!(AppConfig::from_raw(raw).unwrap_err().to_string().contains("base_url"));
         }
+        for endpoint in [
+            "not a URL", "file:///v1/systemone", "https://user:secret@example.com/v1/systemone",
+            "https://example.com/v1/systemone?key=value", "http://localhost/api/decide",
+        ] {
+            let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+            raw.omp.note_retrieval = Some(toml::from_str(&format!(
+                "notebook_ids = ['notebook:example']\ndecision_key_file = '/missing-key'\ndecision_endpoints = [{endpoint:?}]"
+            )).unwrap());
+            assert!(AppConfig::from_raw(raw).unwrap_err().to_string().contains("decision_endpoints"));
+        }
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.omp.note_retrieval = Some(RawNoteRetrievalConfig {
+            notebook_ids: vec!["notebook:example".into(); 51],
+            base_url: None,
+            password_file: None,
+            decision_endpoints: vec![],
+            decision_key_file: None,
+            search_limit: 10,
+        });
+        assert!(AppConfig::from_raw(raw).unwrap_err().to_string().contains("at most 50"));
         assert!(toml::from_str::<RawNoteRetrievalConfig>(
             "notebook_ids = []\nunknown_option = true"
         ).is_err());

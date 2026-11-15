@@ -1,0 +1,28 @@
+{
+  "engine": "onnx",
+  "family": "laya",
+  "layout": "laya-markers-v1",
+  "encoder": "encoder",
+  "max_len": 512,
+  "head_max_len": 192,
+  "special_tokens": {
+    "cls": 50281,
+    "sep": 50282,
+    "mask": 50284,
+    "pad": 50283,
+    "mask_text": "[MASK]"
+  },
+  "inputs": [
+    "input_ids",
+    "attention_mask",
+    "marker_pos",
+    "marker_mask",
+    "qtype"
+  ],
+  "outputs": [
+    "logits",
+    "act_logits"
+  ],
+  "min_markers": 2,
+  "opset": 23
+}
