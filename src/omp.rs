@@ -486,12 +486,14 @@ impl OmpTransport {
                 && !cancellation.is_cancelled()
                 && state_request.is_none()
                 && !state_dirty
-                && !pending.iter().any(|prompt| prompt.note_context)
+                && !pending.iter().any(|prompt| prompt.interrupted_deadline.is_some())
                 && let Some(notes) = notes.as_mut()
                 && let Some(message) = notes.ready.take()
             {
                 note_sequence += 1;
+                ui.activity("Applying notebook context");
                 dispatch_note_context(input, &mut pending, note_sequence, &message, self.turn_timeout).await?;
+                cancel_requests(input, &mut requests).await?;
                 settled = false;
                 state_dirty = true;
                 deadline = Instant::now() + self.turn_timeout;
@@ -659,8 +661,9 @@ impl OmpTransport {
                         Some("host_tool_call" | "extension_ui_request") => {
                             let request = ServiceRequest::new(frame, ui, self.discord_history_max_days)?;
                             if abort_deadline.is_some()
-                                || (pending.iter().filter(|prompt| !prompt.note_context).count() == MAX_PENDING_PROMPTS
-                                    && pending.first().is_some_and(|prompt| active == Some(prompt.turn_id)))
+                                || pending.iter().any(|prompt| {
+                                    active == Some(prompt.turn_id) && prompt.interrupted_deadline.is_some()
+                                })
                             {
                                 if !request.cancel.is_null() {
                                     send_frame(input, &request.cancel).await?;
@@ -806,9 +809,10 @@ impl OmpTransport {
                                     if status == TurnStatus::Failed {
                                         ui.message("OMP could not process the retrieved notebook context.")?;
                                     }
-                                } else {
+                                }
+                                if let Some(turn_id) = prompt.result_turn_id {
                                     bounded(IO_TIMEOUT, "recording prompt result", turns.control.record_result(
-                                        prompt.turn_id, status, &prompt.output, error,
+                                        turn_id, status, &prompt.output, error,
                                     )).await?;
                                 }
                                 if background_possible && pending.iter().any(|next| {
@@ -818,8 +822,10 @@ impl OmpTransport {
                                         "OMP started an uncorrelated run before acknowledging the replacement".to_owned(),
                                     ));
                                 }
-                                if !prompt.note_context && last.as_ref().is_none_or(|(id, _, _)| prompt.turn_id > *id) {
-                                    last = Some((prompt.turn_id, prompt.output, status));
+                                if let Some(turn_id) = prompt.result_turn_id
+                                    && last.as_ref().is_none_or(|(id, _, _)| turn_id > *id)
+                                {
+                                    last = Some((turn_id, prompt.output, status));
                                 }
                                 drain_queue = true;
                                 state_dirty = true;
@@ -1037,6 +1043,8 @@ async fn bounded<T>(
 struct PendingPrompt {
     id: String,
     turn_id: i64,
+    // RPC stream identity is distinct from the durable user turn continued by notes.
+    result_turn_id: Option<i64>,
     note_context: bool,
     acknowledged: bool,
     interrupt: bool,
@@ -1193,6 +1201,7 @@ async fn dispatch_prompt<W: AsyncWrite + Unpin>(
     pending.push(PendingPrompt {
         id,
         turn_id: turn.id,
+        result_turn_id: Some(turn.id),
         note_context: false,
         acknowledged: false,
         interrupt,
@@ -1267,26 +1276,36 @@ async fn dispatch_note_context<W: AsyncWrite + Unpin>(
     turn_timeout: Duration,
 ) -> Result<(), OmpTurnError> {
     let id = format!("notes-{sequence}");
+    let interruption_deadline = Instant::now() + ABORT_GRACE;
     send_frame(input, &json!({
         "id": id,
-        "type": "prompt",
-        "message": message,
-        "streamingBehavior": "followUp",
+        "type": "abort_and_prompt",
+        "message": format!(
+            "Use the retrieved reference data below to inform the existing user request. \
+             Continue any unfinished work rather than merely acknowledging the notes. \
+             The current step may have been interrupted; check for tool side effects before retrying.\n\n{message}"
+        ),
     })).await?;
-    // Private tickets own any resulting assistant output but are never Discord
-    // input rows. Keep them separate from the two user interruption slots.
+    for prompt in pending.iter_mut() {
+        prompt.interrupted_deadline = Some(interruption_deadline);
+    }
+    // Resume the newest user turn instead of recording it as aborted by our
+    // own context delivery. Earlier superseded user turns retain their outcomes.
+    // Late notes have no durable owner; never create synthetic Discord input rows.
+    let result_turn_id = pending.last_mut().and_then(|prompt| prompt.result_turn_id.take());
     pending.push(PendingPrompt {
         id,
         turn_id: -sequence,
+        result_turn_id,
         note_context: true,
         acknowledged: false,
-        interrupt: false,
+        interrupt: true,
         yielded: false,
         message_start: 0,
         delivery_cursor: 0,
         output: String::new(),
         deadline: Instant::now() + turn_timeout,
-        ack_deadline: Some(Instant::now() + IO_TIMEOUT),
+        ack_deadline: Some(interruption_deadline),
         interrupted_deadline: None,
     });
     Ok(())
@@ -2109,6 +2128,7 @@ mod tests {
         PendingPrompt {
             id: format!("turn-{id}"),
             turn_id: id,
+            result_turn_id: Some(id),
             note_context: false,
             acknowledged: false,
             interrupt: false,
@@ -2427,9 +2447,8 @@ mod tests {
             send.send(Ok(Some("Notebook reference body".to_owned()))).unwrap();
             let command = run.protocol.command().await;
             assert_eq!(command["id"], "notes-1");
-            assert_eq!(command["type"], "prompt");
-            assert_eq!(command["streamingBehavior"], "followUp");
-            assert_eq!(command["message"], "Notebook reference body");
+            assert_eq!(command["type"], "abort_and_prompt");
+            assert!(command["message"].as_str().unwrap().contains("Notebook reference body"));
             run.protocol.emit(json!({
                 "type": "response", "id": "notes-1", "success": true,
             })).await;
@@ -2437,7 +2456,7 @@ mod tests {
                 run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
                 // New run may begin before the preceding ticket resolves.
                 run.protocol.emit(json!({"type": "agent_start"})).await;
-                run.protocol.result(1, "completed").await;
+                run.protocol.result(1, "aborted").await;
             } else {
                 run.protocol.emit(json!({"type": "agent_start"})).await;
             }
@@ -2451,10 +2470,14 @@ mod tests {
             run.protocol.finish().await;
             let result = run.task.await.unwrap().unwrap();
             assert_eq!(result.turn_id, 1);
-            assert_eq!(result.text, "Original answer");
+            let expected = if late { "Original answer" } else { "References considered" };
+            assert_eq!(result.text, expected);
+            assert!(!result.aborted);
             let records = run.control.records.lock().unwrap();
             assert_eq!(records.len(), 1);
-            assert_eq!(records[0].text, "Original answer");
+            assert_eq!(records[0].id, 1);
+            assert_eq!(records[0].status, TurnStatus::Done);
+            assert_eq!(records[0].text, expected);
             assert_eq!(*run.ui.messages.lock().unwrap(), ["Original answer", "References considered"]);
         }
     }
@@ -2492,6 +2515,45 @@ mod tests {
         assert_eq!(records.iter().map(|record| record.id).collect::<Vec<_>>(), [1, 2]);
         assert_eq!(records[0].status, TurnStatus::Aborted);
         assert_eq!(records[1].status, TurnStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn notebook_interruption_cancels_approval_and_preserves_failed_user_outcome() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut run = driver_with_note_result(false, Some(receive));
+        run.protocol.command().await;
+        run.protocol.ack(1).await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.emit(json!({
+            "type": "extension_ui_request", "id": "approval", "method": "select",
+            "title": "Run command?", "options": ["Approve", "Deny"],
+        })).await;
+        run.ui.waiting.notified().await;
+        send.send(Ok(Some("Notebook reference body".to_owned()))).unwrap();
+        assert_eq!(run.protocol.command().await["type"], "abort_and_prompt");
+        let cancelled = run.protocol.command().await;
+        assert_eq!(cancelled["type"], "extension_ui_response");
+        assert_eq!(cancelled["id"], "approval");
+        assert_eq!(cancelled["cancelled"], true);
+        assert!(run.ui.dropped.load(Ordering::SeqCst));
+        run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
+        run.protocol.result(1, "aborted").await;
+        run.protocol.emit(json!({"type": "response", "id": "notes-1", "success": true})).await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.emit(json!({"type": "agent_end", "yielded": true})).await;
+        run.protocol.settled = true;
+        run.protocol.emit(json!({
+            "type": "prompt_result", "id": "notes-1", "agentInvoked": true,
+            "status": "error", "sessionSettled": true,
+            "error": {"message": "provider unavailable"},
+        })).await;
+        run.protocol.finish().await;
+        assert!(matches!(run.task.await.unwrap(), Err(OmpTurnError::Protocol(_))));
+        let records = run.control.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, 1);
+        assert_eq!(records[0].status, TurnStatus::Failed);
+        assert_eq!(records[0].error.as_deref(), Some("provider unavailable"));
     }
 
     #[tokio::test]

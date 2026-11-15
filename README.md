@@ -355,6 +355,14 @@ also skip retrieval. When enabled, each actual TODO state change:
 4. Injects the entire original note when any passage has `P(useful) >= 0.50`,
    stopping further judgments for that note.
 
+When a retrieval batch is ready and its TODO snapshot is still current, the bridge
+interrupts OMP's active step with `abort_and_prompt` and resumes unfinished work
+with those notes. It does not wait for the current tool or turn to finish.
+Interrupted tools may already have made changes: cancellation is not rollback,
+and the continuation is instructed to inspect side effects before retrying.
+Already-published messages are preserved; the continued answer completes the
+original user turn. Later batches can interrupt that continuation too.
+
 The bundled tokenizer and Ollaya v0.18.0 question layout budget each request to
 512 tokens, including the question and options. Oversized task/title prefixes
 that leave fewer than 32 passage tokens fail explicitly; they are not shortened.

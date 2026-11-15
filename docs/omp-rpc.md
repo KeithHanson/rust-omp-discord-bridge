@@ -202,20 +202,33 @@ User interruption and stop also cancel pending retrieval. Configured retrieval
 errors produce a visible notice; they are not negative relevance answers.
 
 Matching notes enter the same OMP process as one reference-data message through
-`prompt` with `streamingBehavior: "followUp"`. Running tools are not interrupted.
-The bridge tracks this private prompt's acknowledgement and terminal result,
-delivers any resulting assistant messages, and waits for it before closing OMP.
-It does not create a synthetic Discord input row or consume a user interruption
-slot. Results arriving after the original answer still reach the same session.
+`abort_and_prompt` as soon as retrieval and its canonical-state fence complete.
+The bridge cancels outstanding UI/host-tool waits instead of waiting for the
+current step or turn to finish. OMP aborts the active work and then resumes with
+the notes plus a directive to continue unfinished work and check interrupted
+tool side effects before retrying. Cancellation is not rollback.
+
+The private replacement ticket inherits the latest unfinished user turn's durable
+result ownership. Its eventual answer/status completes that user turn; the
+context interruption does not falsely mark it aborted. Already-delivered messages
+remain delivered; the durable response is the continuation's output, while OMP's
+transcript retains the interrupted work. No synthetic Discord input row is created.
+A later batch can interrupt a running context continuation once the previous
+interruption has settled. User messages and stop still take priority. Replacement
+acknowledgement and interrupted predecessors use the existing 15-second deadline;
+missing confirmation is uncertain, never a fabricated successful cancellation.
+Late results still reach the same session without reopening a completed user row.
 The existing 1 MiB RPC frame ceiling applies; oversized context fails explicitly
 rather than being silently shortened.
 
-Verification: targeted configuration, tokenizer, retrieval, and RPC transport
-tests passed. These cover scoped shortlist requests, original-note deduplication,
-full-note injection from a late passage, inclusive thresholds, exact token budgets,
-Unicode/mask coverage, stale-result fencing, late delivery, and interruption with
-queued context. Release-script syntax was checked. Live Coba judgment quality,
-deployment, container builds, and Discord-client appearance were not verified.
+Verification: the 54 RPC transport tests passed, including active and late note
+delivery, resumed user-result ownership, user interruption, approval cancellation,
+continuation failure, and stale-result fencing. An isolated live OMP 18.20.2 probe
+used two synthetic reference batches to interrupt two foreground 90-second shell
+commands. Both commands started and neither reached its final marker. Abort
+acknowledgements arrived in 0.013 and 0.005 seconds; the final answer used the second
+batch's token. This exercises real RPC cancellation, not live retrieval or a
+deployed Discord bridge. Existing shortlist/tokenizer checks are unchanged.
 
 ## Cancellation and shutdown
 
