@@ -1,10 +1,9 @@
-# Services-host Infisical file credentials
+# Infisical file credentials for system and user services
 
-These are deployment assets, not an installer. Hephaestus owns repository changes;
-services-bot owns provisioning, installation, configuration, restart and runtime
-proof on services. Nothing here deploys, enables or restarts automatically. The
-note-retrieval worktree at `decb147` matches installed release `2026-11-15-1`;
-local `main` is older and must not be substituted for that release.
+These are deployment assets, not an installer. The coordinator provisions scoped
+identities; each host owner installs, configures, activates and verifies its own
+services. Nothing here deploys, enables or restarts automatically. Keep the
+installed bridge binary: these assets require no Rust rebuild or version downgrade.
 
 ## Contract and selected files
 
@@ -48,7 +47,7 @@ automatic failure restarts. It has no `RemainAfterExit` and must not be enabled 
 a separate boot service or started concurrently by a rotation timer. The existing
 bridge `ExecStart` and other pre-start commands are preserved. Fresh fetch removes
 all old targets, precreates each 0600, renders with umask 0077, enforces 0600 and
-requires all three regular, non-symlink files to be nonempty. A failed render,
+requires each configured regular, non-symlink file to be nonempty. A failed render,
 validation or timeout fails bridge startup; failure cleanup removes partial
 outputs. A setup failure also blocks startup, even if an old runtime file remains
 inaccessible to cleanup. There is no fallback to old local files. Agent exits
@@ -60,7 +59,7 @@ controlled bridge restart, not by editing files under a running bridge.
 
 ## Bootstrap and explicit mappings
 
-Services provisions a dedicated Universal Auth machine identity with organization
+Provision a dedicated Universal Auth machine identity with organization
 No Access and read-only Viewer membership on only the required projects. This
 instance's built-in Viewer role spans all environments in each assigned project;
 selecting `dev` in a template does not enforce a `dev`-only access boundary.
@@ -111,6 +110,56 @@ names are the three exact names in the table. `--environment` defaults to `dev`.
 `omp-discord-bridge-infisical.service` and selects the systemd credential directory.
 The generator validates nonsecret substitutions and prints deterministic YAML
 only; it never contacts Infisical, fetches/stores secrets or installs anything.
+
+## Token-only bridges
+
+When notebook retrieval is absent, do not enable it merely to migrate credentials.
+Generate with `--discord-only --discord-project OWN_BOT_PROJECT_ID`; no retrieval
+project membership is required. Change only `discord.token_file` in the selected
+TOML. For the system helper, add this helper-unit drop-in:
+
+```ini
+[Service]
+Environment="BRIDGE_CREDENTIAL_FILES=discord-token"
+```
+
+The default system helper retains the three-file services-host contract. Its
+file selection must match the generated YAML. The user helper defaults to
+`discord-token` alone. Neither variant rotates existing credentials.
+
+## User-manager hosts without sudo
+
+Use `deploy/infisical/user/omp-discord-bridge-infisical.service` and
+`deploy/infisical/user/20-infisical.conf`, not the system-unit examples.
+
+- Install the helper under `~/.config/systemd/user/` and the bridge drop-in under
+  `~/.config/systemd/user/omp-discord-bridge.service.d/`.
+- Install the checksum-verified CLI at `~/.local/bin/infisical`, or adapt the
+  helper's absolute executable path. No `User`, `Group`, sudo, or privileged
+  `+` command prefix belongs in this user-manager configuration.
+- Store client ID/secret at `~/.config/omp-discord-bridge/credentials/` with
+  directory 0700 and files 0600. These bootstrap files are readable by the
+  owning Unix user; this does not isolate secrets from other processes of that
+  same user.
+- Save generated YAML at `~/.config/omp-discord-bridge/infisical/agent.yaml`.
+  Generate with `--runtime-dir "/run/user/$(id -u)/omp-discord-bridge"`.
+  The generator derives the matching user-manager credential directory, while
+  the unit uses systemd `%t` for the runtime root.
+- For token-only hosts also pass `--discord-only`; point the existing TOML
+  token setting at the absolute `/run/user/UID/omp-discord-bridge/discord-token`.
+- If retrieval is already enabled, omit `--discord-only`, supply its mappings,
+  and set the helper's `BRIDGE_CREDENTIAL_FILES` to
+  `discord-token notebook-password decision-key`.
+- Use `systemctl --user` and `systemd-analyze --user verify`; preserve the
+  bridge's existing boot/linger configuration. The helper is started by the
+  bridge hook and must not be independently enabled.
+
+Apply the same isolated proof, failure cleanup and idle-safe activation below,
+but use a distinct `/run/user/UID/` proof directory and the user manager. Never
+run a second bridge to test credentials. Collector migration is separate:
+its selected Agent/configuration must read the canonical ingestion token and
+retain that host's existing identity, durable queue and checkpoints.
+
 
 ## Isolated proof, then idle-safe activation
 
@@ -192,5 +241,13 @@ read-only identity fetched all three values exactly, with files 0600 and directo
 rendered credential set. Bootstrap credential files were inaccessible after the
 oneshot stopped. No live bridge was restarted. This proves the loading mechanism,
 not services-bot's new identity or deployment.
+
+Fleet proof on 2026-11-16: actual system-manager three-file and token-only
+fetches passed; actual user-manager token-only fetch passed. All fetched bytes
+matched existing credentials, with 0700 runtime directories and 0600 files.
+User-manager missing-secret and unreachable-endpoint starts failed and removed
+the rendered set; bootstrap mounts contained no secret file after exit. Invalid
+user-runtime input was rejected. All isolated units and runtime files were
+removed; no production bridge or database was opened.
 
 Reference: [Infisical Agent configuration and templates](https://infisical.com/docs/integrations/platforms/infisical-agent).

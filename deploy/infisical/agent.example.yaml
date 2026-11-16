@@ -6,13 +6,14 @@ infisical:
 auth:
   type: universal-auth
   config:
-    client-id: /run/credentials/@@UNIT_NAME@@/client-id
-    client-secret: /run/credentials/@@UNIT_NAME@@/client-secret
+    client-id: "@@RUNTIME_ROOT@@/credentials/@@UNIT_NAME@@/client-id"
+    client-secret: "@@RUNTIME_ROOT@@/credentials/@@UNIT_NAME@@/client-secret"
     remove_client_secret_on_read: false
 # No access-token sink or persistent cache.
 templates:
   - template-content: '{{- with getSecretByName "@@DISCORD_PROJECT@@" "@@ENVIRONMENT@@" "@@DISCORD_PATH@@" "DISCORD_BOT_TOKEN" -}}{{ .Value }}{{- end -}}'
     destination-path: "@@RUNTIME_DIR@@/discord-token"
+# Optional notebook retrieval
   - template-content: '{{- with getSecretByName "@@NOTEBOOK_PROJECT@@" "@@ENVIRONMENT@@" "@@NOTEBOOK_PATH@@" "NOTEBOOK_PASSWORD" -}}{{ .Value }}{{- end -}}'
     destination-path: "@@RUNTIME_DIR@@/notebook-password"
   - template-content: '{{- with getSecretByName "@@DECISION_PROJECT@@" "@@ENVIRONMENT@@" "@@DECISION_PATH@@" "DECISION_KEY" -}}{{ .Value }}{{- end -}}'

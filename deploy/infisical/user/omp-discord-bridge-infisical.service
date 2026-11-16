@@ -1,0 +1,23 @@
+[Unit]
+Description=Fetch OMP Discord Bridge file credentials with Infisical Agent
+
+[Service]
+Type=oneshot
+UMask=0077
+RuntimeDirectory=omp-discord-bridge
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+LoadCredential=client-id:%h/.config/omp-discord-bridge/credentials/client-id
+LoadCredential=client-secret:%h/.config/omp-discord-bridge/credentials/client-secret
+# Add notebook-password and decision-key only when retrieval is configured.
+Environment="BRIDGE_CREDENTIAL_FILES=discord-token"
+ExecStartPre=/usr/bin/rm -f %t/omp-discord-bridge/discord-token %t/omp-discord-bridge/notebook-password %t/omp-discord-bridge/decision-key
+ExecStartPre=/bin/sh -ec 'for f in $$BRIDGE_CREDENTIAL_FILES; do case "$$f" in discord-token|notebook-password|decision-key) ;; *) exit 1;; esac; install -m 0600 /dev/null "%t/omp-discord-bridge/$$f"; done'
+# Install the checksum-verified CLI here, or select its actual absolute path.
+ExecStart=%h/.local/bin/infisical agent --config=%h/.config/omp-discord-bridge/infisical/agent.yaml
+ExecStartPost=/bin/sh -ec 'for f in $$BRIDGE_CREDENTIAL_FILES; do chmod 0600 "%t/omp-discord-bridge/$$f"; test -f "%t/omp-discord-bridge/$$f" && test ! -L "%t/omp-discord-bridge/$$f" && test -s "%t/omp-discord-bridge/$$f" || exit 1; done'
+TimeoutStartSec=120
+ExecStopPost=/bin/sh -ec 'if [ "$$SERVICE_RESULT" != success ]; then rm -f %t/omp-discord-bridge/discord-token %t/omp-discord-bridge/notebook-password %t/omp-discord-bridge/decision-key; fi'
+TimeoutStopSec=15
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
