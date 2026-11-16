@@ -338,7 +338,7 @@ The bridge rejects empty token files, files larger than 4096 bytes, tokens conta
 
 ### Integrated Threadwatch reporting
 
-The optional `[threadwatch]` table runs reporting inside the bridge process. It reads the bridge's configured SQLite database and OMP session directory, then sends sanitized records and heartbeats to the Threadwatch server through a durable queue:
+The optional `[threadwatch]` table runs bidirectional reporting inside the bridge process. It reads the bridge's configured SQLite database and OMP session directory, sends sanitized records and heartbeats through a durable queue, and polls for operator chat commands addressed to this bridge:
 
 ```toml
 [threadwatch]
@@ -351,7 +351,7 @@ collect_interval_ms = 2000
 heartbeat_interval_ms = 10000
 ```
 
-`server_url` must be a plain HTTP origin. `bot_id` is a stable ASCII identifier; never reuse one for a different bridge. The ingestion token file follows the same protected-file rules as the Discord token and must contain at least 32 non-whitespace characters. `check` validates this configuration and credential without contacting Threadwatch. A reporting outage is logged and retried without taking Discord offline.
+`server_url` must be a plain HTTP origin. `bot_id` is a stable ASCII identifier; never reuse one for a different bridge. The ingestion token file follows the same protected-file rules as the Discord token and must contain at least 32 non-whitespace characters. It authenticates both reporting and command polling; browser operators use a separate Threadwatch control token. Accepted commands enter the same durable turn queue as authorized human Discord messages, including interruption and queue-limit semantics. `check` validates this configuration and credential without contacting Threadwatch. Reporting and command-polling outages are logged and retried without taking Discord offline.
 
 For migration from a standalone Threadwatch collector:
 

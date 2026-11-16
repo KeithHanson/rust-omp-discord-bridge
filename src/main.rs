@@ -49,7 +49,10 @@ async fn main() -> ExitCode {
     }
 }
 
-fn collector_config(config: &AppConfig) -> Result<Option<threadwatch::Config>> {
+fn collector_config(
+    config: &AppConfig,
+    command_sender: tokio::sync::mpsc::Sender<threadwatch::ControlCommand>,
+) -> Result<Option<threadwatch::Config>> {
     let Some(reporting) = &config.threadwatch else {
         return Ok(None);
     };
@@ -72,13 +75,15 @@ fn collector_config(config: &AppConfig) -> Result<Option<threadwatch::Config>> {
         collect_interval: Duration::from_millis(reporting.collect_interval_ms),
         heartbeat_interval: Duration::from_millis(reporting.heartbeat_interval_ms),
         request_timeout: Duration::from_secs(10),
+        command_sender,
     }))
 }
 async fn execute(cli: Cli) -> Result<()> {
 
     let config_path = expand_cli_home(cli.config)?;
     let config = AppConfig::load(&config_path)?;
-    let collector = collector_config(&config)?;
+    let (command_sender, command_receiver) = tokio::sync::mpsc::channel(32);
+    let collector = collector_config(&config, command_sender)?;
     if matches!(cli.command, Some(Command::CheckUpdate)) {
         drop(config.discord.load_token()?);
         let transport = OmpTransport::new(
@@ -111,7 +116,7 @@ async fn execute(cli: Cli) -> Result<()> {
                     }
                 })
             });
-            let result = discord::run(config, store, &config_path).await;
+            let result = discord::run(config, store, command_receiver, &config_path).await;
             if let Some(task) = reporting {
                 task.abort();
             }
