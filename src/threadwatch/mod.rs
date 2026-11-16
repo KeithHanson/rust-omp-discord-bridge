@@ -5,6 +5,14 @@ mod sanitize;
 pub use bridge::Bridge;
 pub use collector::{Config, run};
 
+#[derive(Debug)]
+pub struct ControlCommand {
+    pub id: String,
+    pub thread_id: String,
+    pub text: String,
+    pub response: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
 pub fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
     bridge::protected_token(path)
 }

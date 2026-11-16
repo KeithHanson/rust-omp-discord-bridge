@@ -14,6 +14,7 @@ use serde::{
     Serialize,
     ser::{SerializeSeq, Serializer},
 };
+use sha2::{Digest, Sha256};
 use serenity::{
     all::{
         Attachment, AutoArchiveDuration, ButtonStyle, Channel, ChannelId as SerenityChannelId,
@@ -28,7 +29,7 @@ use serenity::{
     http::{LightMethod, Request, Route},
 };
 use tokio::{
-    sync::{oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     time::Instant,
 };
 
@@ -40,6 +41,7 @@ use crate::{
     render::{chunk_message, thread_name},
     runner::{ThreadMessenger, ThreadQueueRunner},
     store::{CreateSessionResult, EnqueueResult, Store, TurnSource},
+    threadwatch::ControlCommand,
     titles::{ReviewedTitle, TitleReviewer},
 };
 
@@ -69,7 +71,12 @@ impl ReviewTitle for TitleReviewer {
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run(config: AppConfig, store: Store, config_path: &std::path::Path) -> Result<()> {
+pub async fn run(
+    config: AppConfig,
+    store: Store,
+    command_receiver: mpsc::Receiver<ControlCommand>,
+    config_path: &std::path::Path,
+) -> Result<()> {
     let token = config.discord.load_token()?;
     let config = Arc::new(config);
     let http = Arc::new(Http::new(&token));
@@ -123,6 +130,9 @@ pub async fn run(config: AppConfig, store: Store, config_path: &std::path::Path)
         runner.poke(thread_id).await;
     }
 
+    let control = receive_control_commands(command_receiver, store.clone(), Arc::clone(&runner));
+    tokio::pin!(control);
+
     let shard_manager = Arc::clone(&client.shard_manager);
     tokio::select! {
         _ = gateway_presence(presence, presence_targets, send_gateway_presence) => {
@@ -130,11 +140,58 @@ pub async fn run(config: AppConfig, store: Store, config_path: &std::path::Path)
         }
         result = client.start() => result.context("Discord client stopped"),
         result = auto_update(config_path, &runner, &admission) => result,
+        result = &mut control => result,
         signal = shutdown_signal() => {
             signal?;
             shard_manager.shutdown_all().await;
             Ok(())
         }
+    }
+}
+
+async fn receive_control_commands(
+    mut commands: mpsc::Receiver<ControlCommand>,
+    store: Store,
+    runner: Arc<ThreadQueueRunner>,
+) -> Result<()> {
+    loop {
+        let Some(command) = commands.recv().await else {
+            std::future::pending::<()>().await;
+            unreachable!();
+        };
+        let result = async {
+            let raw_thread = command
+                .thread_id
+                .parse::<u64>()
+                .context("Threadwatch command target is invalid")?;
+            let thread_id = ThreadId::new(raw_thread);
+            let session = store
+                .session(thread_id)
+                .await?
+                .context("Threadwatch command target is unavailable")?;
+            let digest = Sha256::digest(command.id.as_bytes());
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(&digest[..8]);
+            let message_id = MessageId::new(u64::from_be_bytes(bytes) | (1_u64 << 63));
+            if matches!(
+                store
+                    .enqueue_turn(
+                        thread_id,
+                        message_id,
+                        session.created_by_user_id,
+                        &command.text,
+                        TurnSource::Human,
+                    )
+                    .await?,
+                EnqueueResult::Enqueued(_)
+            ) {
+                runner.poke(thread_id).await;
+            }
+            Result::<()>::Ok(())
+        }
+        .await
+        .map_err(|error| format!("{error:#}"));
+        let _ = command.response.send(result);
     }
 }
 
@@ -3270,6 +3327,59 @@ mod tests {
             presence_target: watch::channel(None).0,
             admission: Arc::new(tokio::sync::RwLock::new(())),
         }
+    }
+
+    #[tokio::test]
+    async fn threadwatch_command_is_queued_once_for_the_target_session() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![]);
+        let handler = routing_handler(root.path(), http).await;
+        handler
+            .store
+            .create_session(&NewSession {
+                thread_id: ThreadId::new(3),
+                guild_id: GuildId::new(1),
+                parent_channel_id: ChannelId::new(2),
+                trigger_message_id: MessageId::new(99),
+                cwd: root.path().to_path_buf(),
+                created_by_user_id: UserId::new(7),
+            })
+            .await
+            .unwrap();
+        let (sender, receiver) = mpsc::channel(2);
+        let worker = tokio::spawn(receive_control_commands(
+            receiver,
+            handler.store.clone(),
+            Arc::clone(&handler.runner),
+        ));
+
+        for _ in 0..2 {
+            let (response, result) = tokio::sync::oneshot::channel();
+            sender
+                .send(ControlCommand {
+                    id: "command-1".into(),
+                    thread_id: "3".into(),
+                    text: "Run the focused verification.".into(),
+                    response,
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.await.unwrap(), Ok(()));
+        }
+
+        assert_eq!(
+            handler.store.counts(ThreadId::new(3)).await.unwrap().queued,
+            1
+        );
+        let turn = handler
+            .store
+            .claim_next(ThreadId::new(3))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.content, "Run the focused verification.");
+        worker.abort();
+        assert!(requests.join().unwrap().is_empty());
     }
 
     #[tokio::test]
