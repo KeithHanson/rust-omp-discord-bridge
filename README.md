@@ -107,6 +107,14 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-16-1
+
+Moves Threadwatch collection into the bridge process with a durable queue,
+checkpoint compatibility, heartbeats, Discord metadata lookup, and reporting
+failure isolation. Existing standalone collector state directories and bot IDs
+remain the migration boundary; stop the standalone collector before enabling
+integrated reporting.
+
 ### Release 2026-11-14-4
 
 Adds persistent per-thread provider/model selection through `models`,
