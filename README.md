@@ -328,6 +328,33 @@ chmod 600 ~/.config/omp-discord-bridge/discord-token
 
 The bridge rejects empty token files, files larger than 4096 bytes, tokens containing whitespace, and—on Unix—files that grant group or other access. Keep the token file outside the repository; never put the token itself in TOML or a command-line argument.
 
+### Integrated Threadwatch reporting
+
+The optional `[threadwatch]` table runs reporting inside the bridge process. It reads the bridge's configured SQLite database and OMP session directory, then sends sanitized records and heartbeats to the Threadwatch server through a durable queue:
+
+```toml
+[threadwatch]
+server_url = "http://192.168.192.183:8787"
+ingest_token_file = "~/.config/omp-discord-bridge/threadwatch-ingest-token"
+bot_id = "hephaestus"
+bot_name = "Hephaestus"
+data_dir = "~/.local/state/threadwatch-collector"
+collect_interval_ms = 2000
+heartbeat_interval_ms = 10000
+```
+
+`server_url` must be a plain HTTP origin. `bot_id` is a stable ASCII identifier; never reuse one for a different bridge. The ingestion token file follows the same protected-file rules as the Discord token and must contain at least 32 non-whitespace characters. `check` validates this configuration and credential without contacting Threadwatch. A reporting outage is logged and retried without taking Discord offline.
+
+For migration from a standalone Threadwatch collector:
+
+1. Preserve its collector state directory, bot ID, and shared ingestion token.
+2. Stop and disable `threadwatch-collector` before starting an integrated reporter; never let both own the same state.
+3. Set `threadwatch.data_dir` to that existing state directory. This preserves checkpoints, pending batches, and stable delivery IDs.
+4. Give the bridge's startup identity read access to the ingestion token. With Infisical, grant the bridge identity only the required Threadwatch token and render it as a mode-600 runtime file.
+5. Start or roll over the bridge using the normal idle-safe procedure. Verify a fresh ready heartbeat and zero queued batches before deleting the retired collector unit/configuration.
+
+Rollback reverses configuration, not data: stop the bridge reporter, restore the standalone collector against the same authoritative state directory, and never restore a stale queue snapshot. The bridge's existing Discord token supplies optional read-only title/avatar lookup; no separate collector Discord credential or bridge JSON file is used.
+
 ## Validate and run
 The bridge launches the configured OMP executable and uses its normal authentication sources, including `~/.omp/agent/agent.db`, OMP `.env` files, and environment variables inherited from the bridge process. Leave `omp.model` unset to use OMP's configured default. If set, use an exact provider/model ID shown by `omp models`; `openai-codex` subscription authentication is separate from the API-key-based `openai` provider.
 

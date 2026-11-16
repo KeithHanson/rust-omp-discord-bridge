@@ -30,3 +30,14 @@ discord_history_max_messages = 5000
 discord_history_max_bytes = 131072
 discord_history_timeout_seconds = 30
 turn_timeout_seconds = 3600
+
+# Optional integrated Threadwatch reporting. Preserve data_dir when migrating from
+# the former standalone collector so pending batches/checkpoints remain intact.
+# [threadwatch]
+# server_url = "http://192.168.192.183:8787"
+# ingest_token_file = "~/.config/omp-discord-bridge/threadwatch-ingest-token"
+# bot_id = "hephaestus"
+# bot_name = "Hephaestus"
+# data_dir = "~/.local/state/threadwatch-collector"
+# collect_interval_ms = 2000
+# heartbeat_interval_ms = 10000

@@ -10,4 +10,5 @@ pub mod store;
 mod table_images;
 pub mod titles;
 mod usage;
+pub mod threadwatch;
 mod update;

@@ -2496,6 +2496,7 @@ mod tests {
                 discord_history_timeout_seconds: 5,
                 turn_timeout_seconds: 60,
             },
+            threadwatch: None,
         }
     }
 

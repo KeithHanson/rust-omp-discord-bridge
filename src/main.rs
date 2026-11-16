@@ -1,8 +1,10 @@
 use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use omp_discord_bridge::{config::AppConfig, discord, omp::OmpTransport, store::Store};
+use omp_discord_bridge::{
+    config::AppConfig, discord, omp::OmpTransport, store::Store, threadwatch,
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -47,9 +49,36 @@ async fn main() -> ExitCode {
     }
 }
 
+fn collector_config(config: &AppConfig) -> Result<Option<threadwatch::Config>> {
+    let Some(reporting) = &config.threadwatch else {
+        return Ok(None);
+    };
+    let token = threadwatch::load_token(&reporting.ingest_token_file)?;
+    ensure!(
+        token.len() >= 32 && !token.chars().any(char::is_whitespace),
+        "Threadwatch ingest token must contain at least 32 non-whitespace characters"
+    );
+    Ok(Some(threadwatch::Config {
+        server_url: reporting.server_url.clone(),
+        token,
+        bridge: threadwatch::Bridge {
+            id: reporting.bot_id.clone(),
+            name: reporting.bot_name.clone(),
+            database_path: config.runtime.database_path.clone(),
+            session_dir: config.omp.session_dir.clone(),
+            bot_token_file: Some(config.discord.token_file.clone()),
+        },
+        data_dir: reporting.data_dir.clone(),
+        collect_interval: Duration::from_millis(reporting.collect_interval_ms),
+        heartbeat_interval: Duration::from_millis(reporting.heartbeat_interval_ms),
+        request_timeout: Duration::from_secs(10),
+    }))
+}
 async fn execute(cli: Cli) -> Result<()> {
+
     let config_path = expand_cli_home(cli.config)?;
     let config = AppConfig::load(&config_path)?;
+    let collector = collector_config(&config)?;
     if matches!(cli.command, Some(Command::CheckUpdate)) {
         drop(config.discord.load_token()?);
         let transport = OmpTransport::new(
@@ -75,7 +104,18 @@ async fn execute(cli: Cli) -> Result<()> {
                     "marked interrupted OMP turns uncertain; they will not be replayed"
                 );
             }
-            discord::run(config, store, &config_path).await
+            let reporting = collector.map(|config| {
+                tokio::spawn(async move {
+                    if let Err(error) = threadwatch::run(config, false).await {
+                        tracing::error!(error = %format!("{error:#}"), "Threadwatch reporting stopped");
+                    }
+                })
+            });
+            let result = discord::run(config, store, &config_path).await;
+            if let Some(task) = reporting {
+                task.abort();
+            }
+            result
         }
         Command::Check => {
             drop(config.discord.load_token()?);

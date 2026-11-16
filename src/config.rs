@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub discord: DiscordConfig,
     pub omp: OmpConfig,
     pub runtime: RuntimeConfig,
+    pub threadwatch: Option<ThreadwatchConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,17 @@ pub struct OmpConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct ThreadwatchConfig {
+    pub server_url: String,
+    pub ingest_token_file: PathBuf,
+    pub bot_id: String,
+    pub bot_name: String,
+    pub data_dir: PathBuf,
+    pub collect_interval_ms: u64,
+    pub heartbeat_interval_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub database_path: PathBuf,
     pub max_concurrency: usize,
@@ -68,6 +80,7 @@ struct RawConfig {
     omp: RawOmpConfig,
     #[serde(default)]
     runtime: RawRuntimeConfig,
+    threadwatch: Option<RawThreadwatchConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +111,20 @@ struct RawOmpConfig {
     model: Option<String>,
     title_model: Option<String>,
     thinking_level: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawThreadwatchConfig {
+    server_url: String,
+    ingest_token_file: PathBuf,
+    bot_id: String,
+    bot_name: String,
+    data_dir: PathBuf,
+    #[serde(default = "default_threadwatch_collect_interval_ms")]
+    collect_interval_ms: u64,
+    #[serde(default = "default_threadwatch_heartbeat_interval_ms")]
+    heartbeat_interval_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +167,14 @@ const fn default_auto_archive_minutes() -> u16 {
 
 fn default_omp_executable() -> PathBuf {
     PathBuf::from("omp")
+}
+
+const fn default_threadwatch_collect_interval_ms() -> u64 {
+    2_000
+}
+
+const fn default_threadwatch_heartbeat_interval_ms() -> u64 {
+    10_000
 }
 
 impl AppConfig {
@@ -224,6 +259,50 @@ impl AppConfig {
         if raw.runtime.turn_timeout_seconds == 0 {
             bail!("runtime.turn_timeout_seconds must be at least 1");
         }
+        let threadwatch = raw
+            .threadwatch
+            .map(|config| -> Result<ThreadwatchConfig> {
+                let url = reqwest::Url::parse(&config.server_url)
+                    .context("threadwatch.server_url must be a plain HTTP origin")?;
+                if url.scheme() != "http"
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.path() != "/"
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                    || url.host_str().is_none()
+                {
+                    bail!("threadwatch.server_url must be a plain HTTP origin");
+                }
+                if config.bot_id.is_empty()
+                    || config.bot_id.len() > 100
+                    || !config
+                        .bot_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                {
+                    bail!("threadwatch.bot_id is invalid");
+                }
+                if config.bot_name.trim().is_empty() {
+                    bail!("threadwatch.bot_name must not be empty");
+                }
+                if !(100..=2_147_483_647).contains(&config.collect_interval_ms) {
+                    bail!("threadwatch.collect_interval_ms is invalid");
+                }
+                if !(100..=30_000).contains(&config.heartbeat_interval_ms) {
+                    bail!("threadwatch.heartbeat_interval_ms is invalid");
+                }
+                Ok(ThreadwatchConfig {
+                    server_url: url.origin().ascii_serialization(),
+                    ingest_token_file: expand_home(&config.ingest_token_file)?,
+                    bot_id: config.bot_id,
+                    bot_name: config.bot_name,
+                    data_dir: expand_home(&config.data_dir)?,
+                    collect_interval_ms: config.collect_interval_ms,
+                    heartbeat_interval_ms: config.heartbeat_interval_ms,
+                })
+            })
+            .transpose()?;
 
         Ok(Self {
             discord: DiscordConfig {
@@ -252,6 +331,7 @@ impl AppConfig {
                 discord_history_timeout_seconds: raw.runtime.discord_history_timeout_seconds,
                 turn_timeout_seconds: raw.runtime.turn_timeout_seconds,
             },
+            threadwatch,
         })
     }
 
@@ -402,6 +482,7 @@ mod tests {
                 thinking_level: None,
             },
             runtime: RawRuntimeConfig::default(),
+            threadwatch: None,
         };
 
         let error = AppConfig::from_raw(raw).expect_err("empty channel allowlist must fail");
@@ -436,6 +517,7 @@ mod tests {
                 thinking_level: None,
             },
             runtime: RawRuntimeConfig::default(),
+            threadwatch: None,
         };
 
         let error = AppConfig::from_raw(raw).expect_err("cwd escape must fail");
@@ -465,6 +547,7 @@ mod tests {
                 thinking_level: None,
             },
             runtime: RawRuntimeConfig::default(),
+            threadwatch: None,
         })
         .expect("valid config");
         let policy = config.guild_policy(GuildId::new(1)).expect("guild policy");
@@ -495,6 +578,7 @@ mod tests {
                 thinking_level: None,
             },
             runtime,
+            threadwatch: None,
         }
     }
 
