@@ -553,6 +553,19 @@ impl Watcher {
     }
 }
 
+fn finalize_streaming_wav(mut wav: Vec<u8>) -> Result<Vec<u8>> {
+    ensure!(wav.len() >= 12 && &wav[..4] == b"RIFF" && &wav[8..12] == b"WAVE",
+        "TTS response is not a RIFF/WAVE stream");
+    let riff_len = u32::try_from(wav.len() - 8).context("TTS WAV exceeds RIFF size")?;
+    wav[4..8].copy_from_slice(&riff_len.to_le_bytes());
+    let data = wav.windows(4).position(|window| window == b"data")
+        .context("TTS WAV has no data chunk")?;
+    ensure!(data + 8 <= wav.len(), "TTS WAV data chunk is truncated");
+    let data_len = u32::try_from(wav.len() - data - 8).context("TTS PCM exceeds RIFF size")?;
+    wav[data + 4..data + 8].copy_from_slice(&data_len.to_le_bytes());
+    Ok(wav)
+}
+
 async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, text: String) {
     let result = async {
         let endpoint = url.join("/tts")?;
@@ -565,11 +578,11 @@ async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, 
             .send()
             .await?
             .error_for_status()?;
-        let wav = response.bytes().await?;
+        let wav = finalize_streaming_wav(response.bytes().await?.to_vec())?;
         let call = manager.get(guild).context("voice call unavailable")?;
         let mut call = call.lock().await;
         call.mute(false).await?;
-        call.play_only_input(wav.to_vec().into());
+        call.play_only_input(wav.into());
         Result::<()>::Ok(())
     }
     .await;
@@ -931,6 +944,18 @@ mod tests {
     fn chronological(buffer: &AudioBuffer) -> Vec<i16> {
         let start = (buffer.next + buffer.samples.len() - buffer.len) % buffer.samples.len();
         (0..buffer.len).map(|i| buffer.samples[(start + i) % buffer.samples.len()]).collect()
+    }
+
+    #[test]
+    fn finalizes_streaming_wav_lengths_for_songbird_probe() {
+        let mut wav = b"RIFF\xff\xff\xff\xffWAVEfmt ".to_vec();
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&[0; 16]);
+        wav.extend_from_slice(b"data\xff\xff\xff\xff");
+        wav.extend_from_slice(&[1, 2, 3, 4]);
+        let wav = finalize_streaming_wav(wav).unwrap();
+        assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), (wav.len() - 8) as u32);
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 4);
     }
 
     #[test]
