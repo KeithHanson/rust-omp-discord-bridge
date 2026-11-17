@@ -12,3 +12,4 @@ pub mod titles;
 mod usage;
 pub mod threadwatch;
 mod update;
+pub mod voice_ingress;

@@ -52,6 +52,9 @@ use discord_prompts::PromptBroker;
 #[path = "discord_upload.rs"]
 mod discord_upload;
 
+#[path = "discord_voice.rs"]
+mod discord_voice;
+
 #[path = "title_http.rs"]
 mod title_http;
 use title_http::{Reply as TitleReply, TitleHttp, TitleState};
@@ -109,7 +112,7 @@ pub async fn run(
     let presence = runner.subscribe_presence();
     let (presence_target, presence_targets) = watch::channel(None);
     let admission = Arc::new(tokio::sync::RwLock::new(()));
-    let handler = DiscordHandler {
+    let handler = Arc::new(DiscordHandler {
         config: Arc::clone(&config),
         store: store.clone(),
         runner: Arc::clone(&runner),
@@ -118,13 +121,16 @@ pub async fn run(
         bot_user_id,
         presence_target,
         admission: Arc::clone(&admission),
-    };
+    });
     let intents =
         GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
     let mut client = Client::builder(&token, intents)
-        .event_handler(handler)
+        .event_handler_arc(Arc::clone(&handler))
         .await
         .context("failed to create Discord client")?;
+    let voice = std::env::var_os("OMP_DISCORD_BRIDGE_VOICE_SOCKET")
+        .map(|path| discord_voice::VoiceSocket::bind(std::path::PathBuf::from(path)))
+        .transpose()?;
 
     for thread_id in store.queued_thread_ids().await? {
         runner.poke(thread_id).await;
@@ -138,8 +144,14 @@ pub async fn run(
         _ = gateway_presence(presence, presence_targets, send_gateway_presence) => {
             bail!("Discord presence worker stopped unexpectedly")
         }
+        result = async {
+            match &voice {
+                Some(socket) => socket.serve(Arc::clone(&handler), Arc::clone(&http)).await,
+                None => std::future::pending::<Result<()>>().await,
+            }
+        } => result.context("voice ingress stopped"),
         result = client.start() => result.context("Discord client stopped"),
-        result = auto_update(config_path, &runner, &admission) => result,
+        result = auto_update(config_path, &runner, &admission, voice.as_ref()) => result,
         result = &mut control => result,
         signal = shutdown_signal() => {
             signal?;
@@ -199,6 +211,7 @@ async fn auto_update(
     config_path: &std::path::Path,
     runner: &ThreadQueueRunner,
     admission: &tokio::sync::RwLock<()>,
+    voice: Option<&discord_voice::VoiceSocket>,
 ) -> Result<()> {
     loop {
         let mut candidate = crate::update::wait_for_update(config_path).await;
@@ -222,8 +235,14 @@ async fn auto_update(
             }
             // exec replaces this process (including the gateway) without creating
             // a second database owner. An exec failure restores the old executable.
+            if let Some(socket) = voice {
+                socket.unlink_owned()?;
+            }
             if let Err(error) = candidate.install_and_exec() {
                 tracing::error!(%error, "update installation failed; keeping current bridge");
+                if voice.is_some() {
+                    return Err(error).context("update exec failed after closing voice ingress");
+                }
             }
             drop(gate);
             break;
@@ -3326,6 +3345,183 @@ mod tests {
             bot_user_id: Arc::new(AtomicU64::new(9)),
             presence_target: watch::channel(None).0,
             admission: Arc::new(tokio::sync::RwLock::new(())),
+        }
+    }
+
+    fn voice_request(text: Option<&str>) -> crate::voice_ingress::VoiceRequest {
+        crate::voice_ingress::VoiceRequest {
+            guild_id: 1, user_id: 7, thread_id: 3, text: text.map(str::to_owned),
+        }
+    }
+
+    fn voice_destination_responses() -> Vec<(&'static str, &'static str, u16, serde_json::Value)> {
+        let mut thread = routing_channel();
+        thread.thread_metadata = Some(serde_json::from_value(serde_json::json!({
+            "archived": false, "auto_archive_duration": 1440, "locked": false
+        })).unwrap());
+        let mut parent = routing_channel();
+        parent.id = SerenityChannelId::new(2);
+        parent.kind = ChannelType::Text;
+        parent.parent_id = None;
+        // Selected human is the fixture guild owner, so Discord's real permission
+        // calculation grants visibility without a synthetic permission bypass.
+        let guild = serde_json::json!({
+            "id": "1", "name": "voice fixture", "owner_id": "7",
+            "verification_level": 0, "default_message_notifications": 0,
+            "explicit_content_filter": 0, "roles": [], "emojis": [],
+            "features": [], "mfa_level": 0, "system_channel_flags": 0,
+            "premium_tier": 0, "preferred_locale": "en-US", "nsfw_level": 0,
+            "stickers": [], "premium_progress_bar_enabled": false
+        });
+        vec![
+            ("GET", "/channels/3", 200, serde_json::to_value(thread).unwrap()),
+            ("GET", "/guilds/1", 200, guild),
+            ("GET", "/guilds/1/members/7", 200, serde_json::to_value(participant_member(7)).unwrap()),
+            ("GET", "/channels/2", 200, serde_json::to_value(parent).unwrap()),
+        ]
+    }
+
+    async fn voice_session(handler: &DiscordHandler, root: &std::path::Path) {
+        handler.store.create_session(&NewSession {
+            thread_id: ThreadId::new(3), guild_id: GuildId::new(1),
+            parent_channel_id: ChannelId::new(2), trigger_message_id: MessageId::new(99),
+            cwd: root.to_owned(), created_by_user_id: UserId::new(7),
+        }).await.unwrap();
+        handler.store.set_session_path(ThreadId::new(3), &root.join("existing-session.jsonl")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn voice_posts_before_human_admission_and_preserves_existing_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut responses = voice_destination_responses();
+        // A spoken control word must be ordinary human content, never stop/reset.
+        responses.push(("POST", "/channels/3/messages", 200,
+            serde_json::to_value(routing_message(true, "voice fixture transcript")).unwrap()));
+        let (http, requests) = discord_api(responses);
+        let handler = routing_handler(root.path(), Arc::clone(&http)).await;
+        voice_session(&handler, root.path()).await;
+        handler.store.enqueue_turn(ThreadId::new(3), MessageId::new(98), UserId::new(8),
+            "existing peer turn", TurnSource::Bot).await.unwrap();
+        let mut receipt = None;
+        handler.admit_voice(&http, voice_request(Some(" stop ")), &mut receipt).await.unwrap();
+        assert_eq!(receipt, Some(100));
+        let bodies = requests.join().unwrap();
+        assert!(bodies[4]["content"].as_str().unwrap().contains("selected human Discord user 7"));
+        assert_eq!(bodies[4]["allowed_mentions"]["parse"], serde_json::json!([]));
+        let previous = handler.store.claim_next(ThreadId::new(3)).await.unwrap().unwrap();
+        assert_eq!(previous.discord_message_id, MessageId::new(98));
+        let turn = handler.store.claim_next(ThreadId::new(3)).await.unwrap().unwrap();
+        assert_eq!(turn.discord_message_id, MessageId::new(100));
+        assert_eq!(turn.author_id, UserId::new(7));
+        assert!(turn.content.contains("ASR"));
+        assert!(turn.content.ends_with("\n\nstop"));
+        let session = handler.store.session(ThreadId::new(3)).await.unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Active);
+        assert_eq!(session.trigger_message_id, MessageId::new(99));
+        assert_eq!(session.omp_session_path, Some(root.path().join("existing-session.jsonl")));
+        // Human admission replenishes the real durable peer budget (one old peer
+        // turn existed); a Bot submission here would leave only six slots.
+        for id in 101..109 {
+            assert!(matches!(handler.store.enqueue_turn(ThreadId::new(3), MessageId::new(id),
+                UserId::new(8), "peer continuation", TurnSource::Bot).await.unwrap(), EnqueueResult::Enqueued(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_partial_delivery_never_admits_an_incomplete_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let mut responses = voice_destination_responses();
+        responses.extend([
+            ("POST", "/channels/3/messages", 200,
+                serde_json::to_value(routing_message(true, "first transcript chunk")).unwrap()),
+            ("POST", "/channels/3/messages", 403,
+                serde_json::json!({"code":50001,"message":"Missing Access"})),
+        ]);
+        let (http, requests) = discord_api(responses);
+        let handler = routing_handler(root.path(), Arc::clone(&http)).await;
+        voice_session(&handler, root.path()).await;
+        let mut receipt = None;
+        assert!(handler.admit_voice(&http, voice_request(Some(&"word ".repeat(500))), &mut receipt).await.is_err());
+        assert_eq!(receipt, Some(100));
+        assert!(handler.store.claim_next(ThreadId::new(3)).await.unwrap().is_none());
+        assert_eq!(requests.join().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn voice_validation_does_not_post_or_enqueue() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(voice_destination_responses());
+        let handler = routing_handler(root.path(), Arc::clone(&http)).await;
+        voice_session(&handler, root.path()).await;
+        let mut receipt = None;
+        handler.admit_voice(&http, voice_request(None), &mut receipt).await.unwrap();
+        assert!(receipt.is_none());
+        assert!(handler.store.claim_next(ThreadId::new(3)).await.unwrap().is_none());
+        assert_eq!(requests.join().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn voice_rejects_unmapped_disallowed_stopped_and_excluded_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        let (http, requests) = discord_api(vec![]);
+        let handler = routing_handler(root.path(), Arc::clone(&http)).await;
+        assert!(handler.admit_voice(&http, voice_request(None), &mut None).await.is_err());
+        voice_session(&handler, root.path()).await;
+        for (guild_id, user_id, thread_id) in [(0,7,3), (1,0,3), (1,7,0), (2,7,3), (1,8,3), (1,7,4)] {
+            let mut request = voice_request(None);
+            request.guild_id = guild_id;
+            request.user_id = user_id;
+            request.thread_id = thread_id;
+            assert!(handler.admit_voice(&http, request, &mut None).await.is_err());
+        }
+        for text in [" ".into(), "x".repeat(6001)] {
+            assert!(handler.admit_voice(&http, voice_request(Some(&text)), &mut None).await.is_err());
+        }
+        handler.store.set_session_status(ThreadId::new(3), SessionStatus::Stopped).await.unwrap();
+        assert!(handler.admit_voice(&http, voice_request(None), &mut None).await.is_err());
+        handler.store.set_session_status(ThreadId::new(3), SessionStatus::Active).await.unwrap();
+        handler.exclude_thread(ThreadId::new(3)).await.unwrap();
+        assert!(handler.admit_voice(&http, voice_request(None), &mut None).await.is_err());
+        assert!(requests.join().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn voice_rejects_inaccessible_archived_locked_and_moved_threads() {
+        for reason in ["archived", "locked", "parent", "human", "visibility", "missing"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut responses = voice_destination_responses();
+            match reason {
+                "archived" | "locked" => {
+                    responses[0].3["thread_metadata"][reason] = true.into();
+                    responses.truncate(1);
+                }
+                "parent" => {
+                    responses[0].3["parent_id"] = "44".into();
+                    responses.truncate(1);
+                }
+                "human" => {
+                    responses[2].3["user"]["bot"] = true.into();
+                    responses.truncate(3);
+                }
+                "visibility" => {
+                    responses[1].3["owner_id"] = "8".into();
+                }
+                "missing" => {
+                    responses[0].2 = 403;
+                    responses[0].3 = serde_json::json!({"code":50001,"message":"Missing Access"});
+                    responses.truncate(1);
+                }
+                _ => unreachable!(),
+            }
+            let count = responses.len();
+            let (http, requests) = discord_api(responses);
+            let handler = routing_handler(root.path(), Arc::clone(&http)).await;
+            voice_session(&handler, root.path()).await;
+            let mut receipt = None;
+            assert!(handler.admit_voice(&http, voice_request(Some("not admitted")), &mut receipt).await.is_err(), "{reason}");
+            assert!(receipt.is_none());
+            assert!(handler.store.claim_next(ThreadId::new(3)).await.unwrap().is_none());
+            assert_eq!(requests.join().unwrap().len(), count);
         }
     }
 

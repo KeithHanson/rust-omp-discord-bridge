@@ -4,6 +4,67 @@ Rust Discord gateway for persistent, thread-scoped OMP sessions.
 
 A permitted user mentions the bot in an allowed parent channel. The bridge creates a Discord thread, starts an OMP conversation for that thread, interrupts active work when a newer message arrives, and resumes the same saved OMP session across idle periods and daemon restarts.
 
+## Private voice-to-thread trial
+
+Build the optional companion with `cargo build --locked --features local-voice
+--bin voice-watch`. The normal bridge binary has no audio dependency unless that
+feature is selected. This is an opt-in local experiment, not a published release.
+
+The bridge accepts companion input only when `OMP_DISCORD_BRIDGE_VOICE_SOCKET`
+names a Unix socket in an existing, owner-only directory (mode 0700). The socket
+is mode 0600 and accepts only same-user peers. Do not expose it over TCP. The
+configured guild, parent-channel and human allowlists and thread exclusions still
+apply. A companion cannot create a session through this interface.
+
+Start the bridge with that environment setting, then the companion:
+
+```sh
+voice-watch --token-file /path/to/discord-token \
+  --bot-id BOT_ID --guild-id GUILD_ID --channel-id GENERAL_VOICE_ID \
+  --user-id OPERATOR_ID \
+  --stt-url http://PRIVATE_ASR_HOST:18086 --stt-key-file /path/to/asr-key \
+  --bridge-socket /private/directory/voice.sock
+```
+
+Use `/voice on` in an existing bridge thread, then speak in the configured General
+voice channel. The companion registers this guild-only slash command without
+replacing other commands. Only the configured human can operate it. Confirmation
+identifies the destination; enabling another thread replaces the previous binding.
+`/voice off` or leaving General disarms it. Restarting the companion also disarms.
+Already submitted turns are not canceled by turning voice off; use the existing
+`stop` control for an active agent turn.
+
+Recognized speech is visibly attributed as a transcription, then admitted as a
+human turn in the thread's existing OMP session. Replies remain text-only. Voice
+transcripts are prompts, not bridge control commands. Transcripts remain in
+Discord and session history; microphone audio is memory-only. There is no TTS.
+An acknowledgement failure is not retried because admission may already have
+occurred; check the thread before repeating the utterance.
+
+Capture retains only the configured human's attributed audio, decoded at stereo
+16 kHz. Earshot VAD uses mono 16 ms frames, 640 ms pre-roll, 800 ms trailing
+non-speech and a 160 ms minimum speech duration. Utterances cap at 20 seconds with
+640 ms overlap; two completed utterances may wait behind a request. Backlog
+overflow drops new chunks with a warning. Quiet/brief speech can be rejected and
+overlap can repeat words. Unknown-SSRC audio remains excluded. Model and VAD
+quality still require live microphone testing.
+
+`scripts/voice-asr.Dockerfile` adds pinned audio decoders to the vLLM image.
+Build it as `hephaestus/qwen3-asr:trial` on the authorized GPU host;
+`scripts/run-local-asr.sh` launches pinned Whisper large-v3-turbo as `voice-asr`.
+The image/container/cache names retain the original Qwen trial names. The launcher
+requires a mode-0600 `~/hephaestus-qwen3-asr/api.env` containing `VLLM_API_KEY`.
+It binds port 18086 on all interfaces: restrict firewall access to approved
+LAN/ZeroTier ranges. Its 4% GPU setting is not a hard VRAM isolation boundary.
+Stop the previous ASR container before switching models on the shared GPU.
+Plain LAN HTTP is unencrypted; the companion uses the private overlay endpoint.
+
+Omitting `--bridge-socket` retains the standalone log-only transcription trial;
+it does not deliver agent turns. Keep automatic binary updates disabled during
+private deployment (`OMP_DISCORD_BRIDGE_AUTO_UPDATE=false`). Activate a changed
+bridge only through the normal idle-safe handoff; never restart it from an active
+agent conversation.
+
 ## Current behavior
 
 - mention-to-thread session creation and joining existing threads by mention;
