@@ -8,7 +8,7 @@ use serenity::{all::{Channel, ChannelId, ChannelType, CommandDataOption, Command
     CommandInteraction, CommandOptionType, CommandType, Context, CreateAllowedMentions,
     CreateCommand, CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage,
     CreateMessage, EditInteractionResponse, EventHandler, GatewayIntents, Guild, GuildId, Http,
-    Interaction, Ready, UnavailableGuild, UserId, VoiceState},
+    Interaction, Message, Ready, UnavailableGuild, UserId, VoiceState},
     gateway::{ConnectionStage, ShardStageUpdateEvent}, async_trait, Client};
 use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate}, CoreEvent, Event, EventContext, SerenityInit, Songbird};
 use tokio::sync::watch;
@@ -44,6 +44,9 @@ struct Args {
     /// Enable /voice on|off routing to existing bridge threads; otherwise only log transcripts.
     #[arg(long, requires = "stt_url")]
     bridge_socket: Option<PathBuf>,
+    /// Pocket TTS server base URL. Speaks the next assistant reply in the armed thread.
+    #[arg(long, requires = "bridge_socket")]
+    tts_url: Option<reqwest::Url>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +130,7 @@ struct Capture {
     routing: bool,
     binding: Option<ChannelId>,
     command_revision: u64,
+    awaiting_reply: Option<ChannelId>,
     ssrc: Option<u32>,
     audio: AudioBuffer,
     pre_roll: AudioBuffer,
@@ -152,6 +156,7 @@ impl Capture {
             routing: false,
             binding: None,
             command_revision: 0,
+            awaiting_reply: None,
             ssrc: None,
             audio: AudioBuffer::new(capacity),
             pre_roll: AudioBuffer::new(PRE_ROLL_SAMPLES),
@@ -182,6 +187,7 @@ impl Capture {
                 buffered_samples = self.audio.len, "Voice capture ended; clearing PCM");
         }
         self.epoch += 1;
+        self.awaiting_reply = None;
         self.audio.clear();
         self.pre_roll.clear();
         self.detector.reset();
@@ -421,6 +427,9 @@ struct Watcher {
     desired: watch::Sender<Desired>,
     capture: Arc<Mutex<Capture>>,
     bridge: Option<Arc<BridgeRoute>>,
+    bot: UserId,
+    manager: Arc<Songbird>,
+    tts_url: Option<reqwest::Url>,
 }
 
 impl Watcher {
@@ -544,6 +553,31 @@ impl Watcher {
     }
 }
 
+async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, text: String) {
+    let result = async {
+        let endpoint = url.join("/tts")?;
+        let response = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(30))
+            .build()?
+            .post(endpoint)
+            .form(&[("text", text.as_str())])
+            .send()
+            .await?
+            .error_for_status()?;
+        let wav = response.bytes().await?;
+        let call = manager.get(guild).context("voice call unavailable")?;
+        let mut call = call.lock().await;
+        call.mute(false).await?;
+        call.play_only_input(wav.to_vec().into());
+        Result::<()>::Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, "TTS reply failed");
+    }
+}
+
 #[async_trait]
 impl EventHandler for Watcher {
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -606,6 +640,37 @@ impl EventHandler for Watcher {
             if command.data.name == "voice" {
                 self.command(&ctx, &command).await;
             }
+        }
+    }
+
+    async fn message(&self, _ctx: Context, message: Message) {
+        let Some(tts_url) = self.tts_url.clone() else { return };
+        if message.author.id != self.bot || message.content.trim().is_empty() {
+            return;
+        }
+        let ignored = message.content.starts_with("Human voice transcript from Discord user ")
+            || message.content == "Message accepted. Active work in this thread will be interrupted."
+            || message.content.starts_with("OMP session created.");
+        if ignored {
+            return;
+        }
+        let should_speak = {
+            let mut capture = self.capture.lock().unwrap();
+            if capture.awaiting_reply == Some(message.channel_id) {
+                capture.awaiting_reply = None;
+                true
+            } else {
+                false
+            }
+        };
+        if should_speak {
+            let text: String = message.content.chars().take(1500).collect();
+            tokio::spawn(speak_reply(
+                Arc::clone(&self.manager),
+                self.guild,
+                tts_url,
+                text,
+            ));
         }
     }
 }
@@ -759,7 +824,9 @@ async fn transcribe(
                     // No retry or cancellation after dispatch: an ambiguous acknowledgement may
                     // already have admitted a Human turn. Off only fences results not yet sent.
                     match voice_ingress::request(&bridge.socket, &request).await {
-                        Ok(response) if response.ok => {}
+                        Ok(response) if response.ok => {
+                            capture.lock().unwrap().awaiting_reply = destination;
+                        }
                         Ok(_) => notify_thread(&bridge.http, thread,
                             "Voice submission failed or is uncertain; it may already have been admitted. No retry was made. Check this thread before repeating it.").await,
                         Err(_) => notify_thread(&bridge.http, thread,
@@ -818,8 +885,23 @@ async fn main() -> Result<()> {
         socket, guild, user, http: Arc::clone(&http),
     }));
     let (desired, changes) = watch::channel(capture.lock().unwrap().desired);
-    let handler = Watcher { guild, channel, user, desired, capture: Arc::clone(&capture), bridge: bridge.clone() };
-    let mut client = Client::builder(&token, GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES)
+    let handler = Watcher {
+        guild,
+        channel,
+        user,
+        desired,
+        capture: Arc::clone(&capture),
+        bridge: bridge.clone(),
+        bot: me.id,
+        manager: Arc::clone(&manager),
+        tts_url: args.tts_url,
+    };
+    let mut client = Client::builder(
+        &token,
+        GatewayIntents::GUILDS
+            | GatewayIntents::GUILD_VOICE_STATES
+            | GatewayIntents::GUILD_MESSAGES,
+    )
         .event_handler(handler)
         .register_songbird_with(Arc::clone(&manager))
         .await?;
@@ -895,8 +977,11 @@ mod tests {
     fn only_target_in_selected_guild_and_channel_changes_membership() {
         let capture = Arc::new(Mutex::new(Capture::new(10)));
         let (desired, changes) = watch::channel(capture.lock().unwrap().desired);
-        let watcher = Watcher { guild: GuildId::new(1), channel: ChannelId::new(2),
-            user: UserId::new(3), desired, capture: Arc::clone(&capture), bridge: None };
+        let watcher = Watcher {
+            guild: GuildId::new(1), channel: ChannelId::new(2),
+            user: UserId::new(3), desired, capture: Arc::clone(&capture), bridge: None,
+            bot: UserId::new(9), manager: Songbird::serenity(), tts_url: None,
+        };
         watcher.voice_state(Some(GuildId::new(4)), watcher.user, Some(watcher.channel));
         watcher.voice_state(Some(watcher.guild), UserId::new(4), Some(watcher.channel));
         assert!(!changes.borrow().present);
@@ -925,8 +1010,11 @@ mod tests {
     fn fresh_startup_snapshot_joins_existing_member_and_invalidates_old_audio() {
         let capture = Arc::new(Mutex::new(Capture::new(10)));
         let (desired, changes) = watch::channel(capture.lock().unwrap().desired);
-        let watcher = Watcher { guild: GuildId::new(1), channel: ChannelId::new(2),
-            user: UserId::new(3), desired, capture: Arc::clone(&capture), bridge: None };
+        let watcher = Watcher {
+            guild: GuildId::new(1), channel: ChannelId::new(2),
+            user: UserId::new(3), desired, capture: Arc::clone(&capture), bridge: None,
+            bot: UserId::new(9), manager: Songbird::serenity(), tts_url: None,
+        };
         watcher.update(true, true);
         let old = *changes.borrow();
         watcher.update(true, true);
@@ -1039,8 +1127,11 @@ mod tests {
         state.routing = true;
         let capture = Arc::new(Mutex::new(state));
         let (desired, _) = watch::channel(capture.lock().unwrap().desired);
-        Watcher { guild: GuildId::new(1), channel: ChannelId::new(2), user: UserId::new(3),
-            desired, capture, bridge: None }
+        Watcher {
+            guild: GuildId::new(1), channel: ChannelId::new(2), user: UserId::new(3),
+            desired, capture, bridge: None, bot: UserId::new(9),
+            manager: Songbird::serenity(), tts_url: None,
+        }
     }
 
     fn queue_speech(capture: &mut Capture) {
