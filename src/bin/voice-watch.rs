@@ -1,5 +1,5 @@
 //! Opt-in local voice receiver with optional private bridge-thread routing; no audio files.
-use std::{collections::VecDeque, num::NonZeroU64, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant}};
+use std::{collections::VecDeque, io::Cursor, num::NonZeroU64, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant}};
 
 use anyhow::{Context as _, Result, ensure};
 use clap::Parser;
@@ -10,7 +10,7 @@ use serenity::{all::{Channel, ChannelId, ChannelType, CommandDataOption, Command
     CreateMessage, EditInteractionResponse, EventHandler, GatewayIntents, Guild, GuildId, Http,
     Interaction, Message, Ready, UnavailableGuild, UserId, VoiceState},
     gateway::{ConnectionStage, ShardStageUpdateEvent}, async_trait, Client};
-use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate}, CoreEvent, Event, EventContext, SerenityInit, Songbird};
+use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate}, input::RawAdapter, CoreEvent, Event, EventContext, SerenityInit, Songbird};
 use tokio::sync::watch;
 
 const SAMPLE_RATE: usize = 16_000;
@@ -566,6 +566,27 @@ fn finalize_streaming_wav(mut wav: Vec<u8>) -> Result<Vec<u8>> {
     Ok(wav)
 }
 
+fn pocket_tts_pcm(wav: &[u8]) -> Result<Vec<u8>> {
+    ensure!(wav.len() >= 44, "TTS WAV is too short");
+    ensure!(u16::from_le_bytes(wav[20..22].try_into()?) == 1, "TTS WAV is not PCM");
+    ensure!(u16::from_le_bytes(wav[22..24].try_into()?) == 1, "TTS WAV is not mono");
+    ensure!(u32::from_le_bytes(wav[24..28].try_into()?) == 24_000,
+        "TTS WAV sample rate changed");
+    ensure!(u16::from_le_bytes(wav[34..36].try_into()?) == 16,
+        "TTS WAV sample width changed");
+    let data = wav.windows(4).position(|window| window == b"data")
+        .context("TTS WAV has no data chunk")?;
+    ensure!(data + 8 <= wav.len() && (wav.len() - data - 8).is_multiple_of(2),
+        "TTS WAV PCM is truncated");
+    let samples = &wav[data + 8..];
+    let mut pcm = Vec::with_capacity(samples.len() * 2);
+    for sample in samples.chunks_exact(2) {
+        let value = f32::from(i16::from_le_bytes(sample.try_into()?)) / 32_768.0;
+        pcm.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(pcm)
+}
+
 async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, text: String) {
     let result = async {
         let endpoint = url.join("/tts")?;
@@ -579,10 +600,11 @@ async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, 
             .await?
             .error_for_status()?;
         let wav = finalize_streaming_wav(response.bytes().await?.to_vec())?;
+        let pcm = pocket_tts_pcm(&wav)?;
         let call = manager.get(guild).context("voice call unavailable")?;
         let mut call = call.lock().await;
         call.mute(false).await?;
-        call.play_only_input(wav.into());
+        call.play_only_input(RawAdapter::new(Cursor::new(pcm), 24_000, 1).into());
         Result::<()>::Ok(())
     }
     .await;
@@ -950,12 +972,21 @@ mod tests {
     fn finalizes_streaming_wav_lengths_for_songbird_probe() {
         let mut wav = b"RIFF\xff\xff\xff\xffWAVEfmt ".to_vec();
         wav.extend_from_slice(&16_u32.to_le_bytes());
-        wav.extend_from_slice(&[0; 16]);
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&24_000_u32.to_le_bytes());
+        wav.extend_from_slice(&48_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
         wav.extend_from_slice(b"data\xff\xff\xff\xff");
-        wav.extend_from_slice(&[1, 2, 3, 4]);
+        wav.extend_from_slice(&[0, 0, 0, 64]);
         let wav = finalize_streaming_wav(wav).unwrap();
         assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), (wav.len() - 8) as u32);
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 4);
+        let pcm = pocket_tts_pcm(&wav).unwrap();
+        assert_eq!(pcm.len(), 8);
+        assert_eq!(f32::from_le_bytes(pcm[..4].try_into().unwrap()), 0.0);
+        assert_eq!(f32::from_le_bytes(pcm[4..].try_into().unwrap()), 0.5);
     }
 
     #[test]
