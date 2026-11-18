@@ -1,7 +1,11 @@
 //! Opt-in local voice receiver with optional private bridge-thread routing; no audio files.
-use std::{collections::VecDeque, io::Cursor, num::NonZeroU64, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant}};
+use std::{collections::VecDeque, io::{self, Cursor, SeekFrom}, num::NonZeroU64, path::PathBuf,
+    pin::Pin, sync::{Arc, Mutex}, task::{Context as TaskContext, Poll}, time::{Duration, Instant}};
 
 use anyhow::{Context as _, Result, ensure};
+use futures_util::{SinkExt, StreamExt};
+use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+use opus2::{Application, Channels as OpusChannels, Encoder as OpusEncoder};
 use clap::Parser;
 use omp_discord_bridge::{config::DiscordConfig, voice_ingress::{self, VoiceRequest}};
 use serenity::{all::{Channel, ChannelId, ChannelType, CommandDataOption, CommandDataOptionValue,
@@ -10,8 +14,13 @@ use serenity::{all::{Channel, ChannelId, ChannelType, CommandDataOption, Command
     CreateMessage, EditInteractionResponse, EventHandler, GatewayIntents, Guild, GuildId, Http,
     Interaction, Message, Ready, UnavailableGuild, UserId, VoiceState},
     gateway::{ConnectionStage, ShardStageUpdateEvent}, async_trait, Client};
-use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate}, input::RawAdapter, tracks::Track, CoreEvent, Event, EventContext, SerenityInit, Songbird};
-use tokio::sync::watch;
+use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
+    input::{codecs::{get_codec_registry, get_probe}, AsyncAdapterStream, AsyncMediaSource,
+        AudioStream, Input, LiveInput, RawAdapter},
+    tracks::Track, CoreEvent, Event, EventContext, SerenityInit, Songbird};
+use tokio::{io::{AsyncRead, AsyncSeek, AsyncWriteExt, DuplexStream, ReadBuf},
+    sync::{mpsc, watch}};
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 const SAMPLE_RATE: usize = 16_000;
 const CHANNELS: usize = 2;
@@ -21,6 +30,8 @@ const PRE_ROLL_SAMPLES: usize = SAMPLE_RATE * CHANNELS * 640 / 1000;
 const END_SILENCE_FRAMES: usize = 800 / 16;
 const MIN_SPEECH_FRAMES: usize = 160 / 16;
 const MAX_QUEUED_UTTERANCES: usize = 2;
+const PERSONAPLEX_FRAME_SAMPLES: usize = 480; // 20 ms at 24 kHz mono.
+const PERSONAPLEX_QUEUE_FRAMES: usize = 50; // Bound latency to one second.
 
 #[derive(Parser)]
 #[command(about = "Private auto-join voice receiver with optional remote transcription; no audio files")]
@@ -47,6 +58,9 @@ struct Args {
     /// Pocket TTS server base URL. Speaks the next assistant reply in the armed thread.
     #[arg(long, requires = "bridge_socket")]
     tts_url: Option<reqwest::Url>,
+    /// Native full-duplex PersonaPlex base URL. Mutually exclusive with STT/TTS routing.
+    #[arg(long, conflicts_with_all = ["stt_url", "stt_key_file", "bridge_socket", "tts_url"])]
+    personaplex_url: Option<reqwest::Url>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -726,12 +740,23 @@ impl EventHandler for Watcher {
     }
 }
 
+fn discord_to_personaplex(pcm: Option<&[i16]>) -> [i16; PERSONAPLEX_FRAME_SAMPLES] {
+    let mut output = [0; PERSONAPLEX_FRAME_SAMPLES];
+    let Some(pcm) = pcm else { return output };
+    for (sample, frames) in output.iter_mut().zip(pcm.chunks_exact(4)) {
+        let sum = frames.iter().map(|value| i32::from(*value)).sum::<i32>();
+        *sample = (sum / 4) as i16;
+    }
+    output
+}
+
 #[derive(Clone)]
 struct Receiver {
     user: u64,
     generation: u64,
     capture: Arc<Mutex<Capture>>,
     http: Arc<Http>,
+    personaplex: Option<mpsc::Sender<[i16; PERSONAPLEX_FRAME_SAMPLES]>>,
 }
 
 #[async_trait]
@@ -744,9 +769,15 @@ impl songbird::EventHandler for Receiver {
                     .and_then(|user| capture.identify(self.generation, speaking.ssrc, user.0 == self.user)),
                 EventContext::VoiceTick(tick) => {
                     let voice = capture.ssrc.and_then(|ssrc| tick.speaking.get(&ssrc));
-                    capture.voice_tick(self.generation,
-                        voice.and_then(|voice| voice.decoded_voice.as_deref()),
-                        voice.is_some_and(|voice| voice.packet.is_some()));
+                    if let Some(personaplex) = &self.personaplex {
+                        let frame = discord_to_personaplex(
+                            voice.and_then(|voice| voice.decoded_voice.as_deref()));
+                        _ = personaplex.try_send(frame);
+                    } else {
+                        capture.voice_tick(self.generation,
+                            voice.and_then(|voice| voice.decoded_voice.as_deref()),
+                            voice.is_some_and(|voice| voice.packet.is_some()));
+                    }
                     None
                 }
                 EventContext::ClientDisconnect(client) if client.user_id.0 == self.user => {
@@ -792,6 +823,7 @@ async fn follow(
     channel: ChannelId,
     user: UserId,
     capture: Arc<Mutex<Capture>>,
+    personaplex: Option<mpsc::Sender<[i16; PERSONAPLEX_FRAME_SAMPLES]>>,
     mut desired: watch::Receiver<Desired>,
     http: Arc<Http>,
 ) -> Result<()> {
@@ -808,7 +840,8 @@ async fn follow(
             call.mute(false).await?;
             call.deafen(false).await?;
             let receiver = Receiver { user: user.get(), generation: state.generation,
-                capture: Arc::clone(&capture), http: Arc::clone(&http) };
+                capture: Arc::clone(&capture), http: Arc::clone(&http),
+                personaplex: personaplex.clone() };
             for event in [CoreEvent::SpeakingStateUpdate, CoreEvent::VoiceTick,
                 CoreEvent::ClientDisconnect, CoreEvent::DriverConnect,
                 CoreEvent::DriverReconnect, CoreEvent::DriverDisconnect]
@@ -830,6 +863,217 @@ async fn follow(
         }
     }
 }
+struct Unseekable(DuplexStream);
+
+impl AsyncRead for Unseekable {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>>
+    {
+        Pin::new(&mut self.0).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncSeek for Unseekable {
+    fn start_seek(self: Pin<&mut Self>, _position: SeekFrom) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "live PersonaPlex stream"))
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>)
+        -> Poll<io::Result<u64>>
+    {
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::Unsupported, "live PersonaPlex stream")))
+    }
+}
+
+#[async_trait]
+impl AsyncMediaSource for Unseekable {
+    fn is_seekable(&self) -> bool { false }
+    async fn byte_len(&self) -> Option<u64> { None }
+}
+
+struct PersonaOpus {
+    encoder: OpusEncoder,
+    writer: PacketWriter<'static, Cursor<Vec<u8>>>,
+    emitted: usize,
+    granule: u64,
+}
+
+impl PersonaOpus {
+    fn new() -> Result<Self> {
+        let mut encoder = OpusEncoder::new(
+            24_000, OpusChannels::Mono, Application::LowDelay)?;
+        encoder.set_complexity(0)?;
+        let pre_skip = u16::try_from(encoder.get_lookahead()? * 2)
+            .context("Opus lookahead exceeds Ogg header")?;
+        let mut writer = PacketWriter::new(Cursor::new(Vec::with_capacity(64 * 1024)));
+        let mut head = Vec::with_capacity(19);
+        head.extend_from_slice(b"OpusHead");
+        head.push(1);
+        head.push(1);
+        head.extend_from_slice(&pre_skip.to_le_bytes());
+        head.extend_from_slice(&24_000_u32.to_le_bytes());
+        head.extend_from_slice(&0_i16.to_le_bytes());
+        head.push(0);
+        writer.write_packet(head, 1, PacketWriteEndInfo::EndPage, 0)?;
+        let vendor = b"omp-discord-bridge";
+        let mut tags = Vec::with_capacity(16 + vendor.len());
+        tags.extend_from_slice(b"OpusTags");
+        tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        tags.extend_from_slice(vendor);
+        tags.extend_from_slice(&0_u32.to_le_bytes());
+        writer.write_packet(tags, 1, PacketWriteEndInfo::EndPage, 0)?;
+        Ok(Self { encoder, writer, emitted: 0, granule: 0 })
+    }
+
+    fn headers(&mut self) -> Vec<u8> {
+        self.take_new_bytes()
+    }
+
+    fn encode(&mut self, pcm: &[i16; PERSONAPLEX_FRAME_SAMPLES]) -> Result<Vec<u8>> {
+        let mut encoded = [0_u8; 1275];
+        let len = self.encoder.encode(pcm, &mut encoded)?;
+        self.granule += 960; // Ogg Opus granules are always measured at 48 kHz.
+        self.writer.write_packet(encoded[..len].to_vec(), 1,
+            PacketWriteEndInfo::EndPage, self.granule)?;
+        Ok(self.take_new_bytes())
+    }
+
+    fn take_new_bytes(&mut self) -> Vec<u8> {
+        let bytes = self.writer.inner().get_ref();
+        let output = bytes[self.emitted..].to_vec();
+        self.emitted = bytes.len();
+        output
+    }
+}
+
+async fn play_personaplex_output(
+    manager: Arc<Songbird>,
+    guild: GuildId,
+    reader: DuplexStream,
+) -> Result<()> {
+    let stream = AsyncAdapterStream::new(Box::new(Unseekable(reader)), 256 * 1024);
+    let input = Input::Live(LiveInput::Raw(AudioStream { input: Box::new(stream) }), None)
+        .make_playable_async(get_codec_registry(), get_probe()).await
+        .context("parsing PersonaPlex Ogg stream")?;
+    let call = manager.get(guild).context("voice call unavailable")?;
+    let mut call = call.lock().await;
+    call.play_only(Track::from(input).volume(0.99));
+    tracing::info!("PersonaPlex output track started");
+    Ok(())
+}
+
+fn personaplex_endpoint(mut url: reqwest::Url) -> Result<reqwest::Url> {
+    match url.scheme() {
+        "http" => { url.set_scheme("ws").map_err(|_| anyhow::anyhow!("invalid PersonaPlex URL"))?; }
+        "https" => { url.set_scheme("wss").map_err(|_| anyhow::anyhow!("invalid PersonaPlex URL"))?; }
+        "ws" | "wss" => {}
+        _ => anyhow::bail!("PersonaPlex URL must use http, https, ws, or wss"),
+    }
+    url.set_path("/api/chat");
+    url.set_query(None);
+    url.query_pairs_mut()
+        .append_pair("voice_prompt", "NATF2.pt")
+        .append_pair("text_prompt",
+            "You are Hephaestus, a concise, friendly technical assistant. Speak naturally.")
+        .append_pair("seed", "-1");
+    Ok(url)
+}
+
+async fn run_personaplex_session(
+    manager: Arc<Songbird>,
+    guild: GuildId,
+    endpoint: &reqwest::Url,
+    frames: &mut mpsc::Receiver<[i16; PERSONAPLEX_FRAME_SAMPLES]>,
+    desired: &mut watch::Receiver<Desired>,
+) -> Result<()> {
+    let (mut socket, _) = connect_async(endpoint.as_str()).await
+        .context("connecting to PersonaPlex")?;
+    loop {
+        tokio::select! {
+            result = desired.changed() => {
+                result.context("voice membership watcher stopped")?;
+                return Ok(());
+            }
+            message = socket.next() => {
+                let message = message.context("PersonaPlex closed before handshake")??;
+                if let WsMessage::Binary(data) = &message {
+                    if data.as_ref() == [0] { break; }
+                }
+            }
+        }
+    }
+    while frames.try_recv().is_ok() {}
+    let mut opus = PersonaOpus::new()?;
+    let mut first = Vec::with_capacity(1 + opus.writer.inner().get_ref().len());
+    first.push(1);
+    first.extend_from_slice(&opus.headers());
+    socket.send(WsMessage::Binary(first.into())).await?;
+    let (reader, mut writer) = tokio::io::duplex(256 * 1024);
+    tokio::spawn(async move {
+        if let Err(error) = play_personaplex_output(manager, guild, reader).await {
+            tracing::warn!(%error, "PersonaPlex output failed");
+        }
+    });
+    tracing::info!("PersonaPlex full-duplex session connected");
+    loop {
+        tokio::select! {
+            result = desired.changed() => {
+                result.context("voice membership watcher stopped")?;
+                return Ok(());
+            }
+            frame = frames.recv() => {
+                let frame = frame.context("PersonaPlex input channel closed")?;
+                let page = opus.encode(&frame)?;
+                let mut message = Vec::with_capacity(1 + page.len());
+                message.push(1);
+                message.extend_from_slice(&page);
+                socket.send(WsMessage::Binary(message.into())).await?;
+            }
+            message = socket.next() => {
+                let message = message.context("PersonaPlex connection closed")??;
+                match message {
+                    WsMessage::Binary(data) if data.first() == Some(&1) => {
+                        writer.write_all(&data[1..]).await?;
+                    }
+                    WsMessage::Binary(data) if data.first() == Some(&2) => {
+                        if let Ok(text) = std::str::from_utf8(&data[1..]) {
+                            tracing::debug!(text, "PersonaPlex inner speech");
+                        }
+                    }
+                    WsMessage::Close(_) => anyhow::bail!("PersonaPlex closed the session"),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn personaplex(
+    manager: Arc<Songbird>,
+    guild: GuildId,
+    url: Option<reqwest::Url>,
+    mut frames: mpsc::Receiver<[i16; PERSONAPLEX_FRAME_SAMPLES]>,
+    mut desired: watch::Receiver<Desired>,
+) -> Result<()> {
+    let Some(url) = url else { return std::future::pending().await };
+    let endpoint = personaplex_endpoint(url)?;
+    loop {
+        while !desired.borrow().present {
+            desired.changed().await.context("voice membership watcher stopped")?;
+        }
+        while frames.try_recv().is_ok() {}
+        if let Err(error) = run_personaplex_session(
+            Arc::clone(&manager), guild, &endpoint, &mut frames, &mut desired).await
+        {
+            tracing::warn!(%error, "PersonaPlex session ended");
+        }
+        if desired.borrow().present {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
 
 async fn transcribe(
     capture: Arc<Mutex<Capture>>,
@@ -926,9 +1170,11 @@ async fn main() -> Result<()> {
     ensure!(target.guild_id == guild && target.kind == ChannelType::Voice,
         "target must be a voice channel in the configured guild");
 
+    let native_voice = args.personaplex_url.is_some();
+    let decode_rate = if native_voice { SampleRate::Hz48000 } else { SampleRate::Hz16000 };
     let manager = Songbird::serenity_from_config(
         songbird::Config::default().decode_mode(DecodeMode::Decode(
-            DecodeConfig::new(Channels::Stereo, SampleRate::Hz16000))),
+            DecodeConfig::new(Channels::Stereo, decode_rate))),
     );
     let capture = Arc::new(Mutex::new(Capture::new(BUFFER_SAMPLES)));
     capture.lock().unwrap().routing = args.bridge_socket.is_some();
@@ -936,6 +1182,10 @@ async fn main() -> Result<()> {
         socket, guild, user, http: Arc::clone(&http),
     }));
     let (desired, changes) = watch::channel(capture.lock().unwrap().desired);
+    let (personaplex_tx, personaplex_rx) = mpsc::channel(PERSONAPLEX_QUEUE_FRAMES);
+    let personaplex_sender = native_voice.then_some(personaplex_tx);
+    let personaplex_url = args.personaplex_url.clone();
+    let persona_changes = changes.clone();
     let handler = Watcher {
         guild,
         channel,
@@ -960,8 +1210,11 @@ async fn main() -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = tokio::select! {
         result = client.start() => result.context("voice gateway stopped"),
-        result = follow(Arc::clone(&manager), guild, channel, user, Arc::clone(&capture), changes, Arc::clone(&http)) => result,
+        result = follow(Arc::clone(&manager), guild, channel, user, Arc::clone(&capture),
+            personaplex_sender, changes, Arc::clone(&http)) => result,
         result = transcribe(Arc::clone(&capture), args.stt_url, stt_key, bridge) => result,
+        result = personaplex(Arc::clone(&manager), guild, personaplex_url,
+            personaplex_rx, persona_changes) => result,
         result = tokio::signal::ctrl_c() => result.context("waiting for Ctrl-C"),
         _ = terminate.recv() => Ok(()),
     };
@@ -1390,4 +1643,32 @@ mod tests {
         assert_eq!(voice_action(&options(serde_json::json!([{"name":"on","type":1,"options":[]},{"name":"off","type":1,"options":[]}]))), None);
         assert_eq!(voice_action(&[]), None);
     }
+    #[test]
+    fn personaplex_input_downmixes_stereo_and_halves_48_khz_rate() {
+        let mut input = vec![0_i16; PERSONAPLEX_FRAME_SAMPLES * 4];
+        input[0..8].copy_from_slice(&[100, 300, 500, 700, -100, -300, -500, -700]);
+        let output = discord_to_personaplex(Some(&input));
+        assert_eq!(output[0], 400);
+        assert_eq!(output[1], -400);
+        assert!(discord_to_personaplex(None).iter().all(|sample| *sample == 0));
+    }
+
+    #[test]
+    fn personaplex_endpoint_and_opus_pages_match_server_protocol() {
+        let endpoint = personaplex_endpoint("http://192.0.2.1:18998/old".parse().unwrap()).unwrap();
+        assert_eq!(endpoint.scheme(), "ws");
+        assert_eq!(endpoint.path(), "/api/chat");
+        let query = endpoint.query_pairs().collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("voice_prompt").map(|value| value.as_ref()), Some("NATF2.pt"));
+        assert!(query.contains_key("text_prompt"));
+
+        let mut opus = PersonaOpus::new().unwrap();
+        let headers = opus.headers();
+        assert!(headers.starts_with(b"OggS"));
+        assert!(headers.windows(8).any(|window| window == b"OpusHead"));
+        assert!(headers.windows(8).any(|window| window == b"OpusTags"));
+        let page = opus.encode(&[0; PERSONAPLEX_FRAME_SAMPLES]).unwrap();
+        assert!(page.starts_with(b"OggS"));
+    }
+
 }

@@ -49,6 +49,27 @@ overflow drops new chunks with a warning. Quiet/brief speech can be rejected and
 overlap can repeat words. Unknown-SSRC audio remains excluded. Model and VAD
 quality still require live microphone testing.
 
+### Native PersonaPlex trial
+
+`voice-watch` can instead bridge Discord directly to a private PersonaPlex
+full-duplex speech model:
+
+```sh
+voice-watch --token-file /path/to/discord-token \
+  --bot-id BOT_ID --guild-id GUILD_ID --channel-id GENERAL_VOICE_ID \
+  --user-id OPERATOR_ID \
+  --personaplex-url http://PRIVATE_GPU_HOST:18998
+```
+
+This mode is mutually exclusive with `--stt-url`, `--stt-key-file`,
+`--bridge-socket`, and `--tts-url`; it does not transcribe speech or synthesize
+text replies. While the selected human is in the configured channel, the
+companion forwards only that attributed Discord stream to PersonaPlex and plays
+the model's streamed audio back into the call. Discord stereo 48 kHz PCM is
+downmixed and resampled to PersonaPlex's mono 24 kHz Opus protocol. Leaving the
+channel closes the model session. Audio remains streaming and memory-only.
+Keep the HTTP/WebSocket endpoint on an approved private network.
+
 `scripts/voice-asr.Dockerfile` adds pinned audio decoders to the vLLM image.
 Build it as `hephaestus/qwen3-asr:trial` on the authorized GPU host;
 `scripts/run-local-asr.sh` launches pinned Whisper large-v3-turbo as `voice-asr`.
