@@ -18,7 +18,7 @@ use serenity::{all::{Channel, ChannelId, ChannelType, CommandDataOption, Command
     gateway::{ConnectionStage, ShardStageUpdateEvent}, async_trait, Client};
 use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
     input::{codecs::{get_codec_registry, get_probe}, AsyncAdapterStream, AsyncMediaSource,
-        AudioStream, Input, LiveInput, RawAdapter},
+        AudioStream, Input, LiveInput},
     tracks::Track, CoreEvent, Event, EventContext, SerenityInit, Songbird};
 use tokio::{fs::File, io::{AsyncRead, AsyncSeek, AsyncWriteExt, DuplexStream, ReadBuf},
     sync::{mpsc, watch}};
@@ -29,7 +29,7 @@ const CHANNELS: usize = 2;
 const BUFFER_SAMPLES: usize = SAMPLE_RATE * CHANNELS * 20;
 const VAD_SAMPLES: usize = 256 * CHANNELS; // Earshot: 16 ms at 16 kHz.
 const PRE_ROLL_SAMPLES: usize = SAMPLE_RATE * CHANNELS * 640 / 1000;
-const END_SILENCE_FRAMES: usize = 800 / 16;
+const END_SILENCE_FRAMES: usize = 320 / 16;
 const MIN_SPEECH_FRAMES: usize = 160 / 16;
 const MAX_QUEUED_UTTERANCES: usize = 2;
 const PERSONAPLEX_FRAME_SAMPLES: usize = 480; // 20 ms at 24 kHz mono.
@@ -573,41 +573,9 @@ impl Watcher {
     }
 }
 
-fn finalize_streaming_wav(mut wav: Vec<u8>) -> Result<Vec<u8>> {
-    ensure!(wav.len() >= 12 && &wav[..4] == b"RIFF" && &wav[8..12] == b"WAVE",
-        "TTS response is not a RIFF/WAVE stream");
-    let riff_len = u32::try_from(wav.len() - 8).context("TTS WAV exceeds RIFF size")?;
-    wav[4..8].copy_from_slice(&riff_len.to_le_bytes());
-    let data = wav.windows(4).position(|window| window == b"data")
-        .context("TTS WAV has no data chunk")?;
-    ensure!(data + 8 <= wav.len(), "TTS WAV data chunk is truncated");
-    let data_len = u32::try_from(wav.len() - data - 8).context("TTS PCM exceeds RIFF size")?;
-    wav[data + 4..data + 8].copy_from_slice(&data_len.to_le_bytes());
-    Ok(wav)
-}
-
-fn pocket_tts_pcm(wav: &[u8]) -> Result<Vec<u8>> {
-    ensure!(wav.len() >= 44, "TTS WAV is too short");
-    ensure!(u16::from_le_bytes(wav[20..22].try_into()?) == 1, "TTS WAV is not PCM");
-    ensure!(u16::from_le_bytes(wav[22..24].try_into()?) == 1, "TTS WAV is not mono");
-    ensure!(u32::from_le_bytes(wav[24..28].try_into()?) == 24_000,
-        "TTS WAV sample rate changed");
-    ensure!(u16::from_le_bytes(wav[34..36].try_into()?) == 16,
-        "TTS WAV sample width changed");
-    let data = wav.windows(4).position(|window| window == b"data")
-        .context("TTS WAV has no data chunk")?;
-    ensure!(data + 8 <= wav.len() && (wav.len() - data - 8).is_multiple_of(2),
-        "TTS WAV PCM is truncated");
-    let samples = &wav[data + 8..];
-    let mut pcm = Vec::with_capacity(samples.len() * 2);
-    for sample in samples.chunks_exact(2) {
-        let value = f32::from(i16::from_le_bytes(sample.try_into()?)) / 32_768.0;
-        pcm.extend_from_slice(&value.to_le_bytes());
-    }
-    Ok(pcm)
-}
 
 async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, text: String) {
+    let started = Instant::now();
     let result = async {
         let endpoint = url.join("/tts")?;
         let response = reqwest::Client::builder()
@@ -619,29 +587,25 @@ async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, 
             .send()
             .await?
             .error_for_status()?;
-        let wav = finalize_streaming_wav(response.bytes().await?.to_vec())?;
-        let pcm = pocket_tts_pcm(&wav)?;
-        let audio_ms = pcm.len() as u64 * 1_000 / (24_000 * 4);
-        let call = manager.get(guild).context("voice call unavailable")?;
-        let track = {
-            let mut call = call.lock().await;
-            call.mute(false).await?;
-            let input: songbird::input::Input =
-                RawAdapter::new(Cursor::new(pcm), 24_000, 1).into();
-            call.play_only(Track::from(input).volume(0.99))
-        };
-        tracing::info!(audio_ms, "TTS track submitted");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let state = track.get_info().await?;
-        tracing::info!(?state, "TTS track state");
-        tokio::time::sleep(Duration::from_millis(audio_ms.saturating_sub(500) + 500)).await;
-        let state = track.get_info().await?;
-        tracing::info!(?state, "TTS track final state");
+        let (reader, mut writer) = tokio::io::duplex(256 * 1024);
+        let playback = tokio::spawn(play_audio_stream(
+            manager, guild, reader, "Pocket TTS", started));
+        let mut chunks = response.bytes_stream();
+        let mut bytes = 0_u64;
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk?;
+            bytes += chunk.len() as u64;
+            writer.write_all(&chunk).await?;
+        }
+        drop(writer);
+        playback.await.context("joining TTS playback task")??;
+        tracing::info!(bytes, elapsed_ms = started.elapsed().as_millis(),
+            "TTS response stream completed");
         Result::<()>::Ok(())
     }
     .await;
     if let Err(error) = result {
-        tracing::warn!(%error, "TTS reply failed");
+        tracing::warn!(%error, elapsed_ms = started.elapsed().as_millis(), "TTS reply failed");
     }
 }
 
@@ -953,19 +917,22 @@ impl PersonaOpus {
     }
 }
 
-async fn play_personaplex_output(
+async fn play_audio_stream(
     manager: Arc<Songbird>,
     guild: GuildId,
     reader: DuplexStream,
+    source: &'static str,
+    started: Instant,
 ) -> Result<()> {
     let stream = AsyncAdapterStream::new(Box::new(Unseekable(reader)), 256 * 1024);
     let input = Input::Live(LiveInput::Raw(AudioStream { input: Box::new(stream) }), None)
         .make_playable_async(get_codec_registry(), get_probe()).await
-        .context("parsing PersonaPlex Ogg stream")?;
+        .with_context(|| format!("parsing {source} audio stream"))?;
     let call = manager.get(guild).context("voice call unavailable")?;
     let mut call = call.lock().await;
     call.play_only(Track::from(input).volume(0.99));
-    tracing::info!("PersonaPlex output track started");
+    tracing::info!(source, elapsed_ms = started.elapsed().as_millis(),
+        "Voice output track started");
     Ok(())
 }
 
@@ -1151,7 +1118,9 @@ async fn run_personaplex_session(
     };
     let (reader, mut writer) = tokio::io::duplex(256 * 1024);
     tokio::spawn(async move {
-        if let Err(error) = play_personaplex_output(manager, guild, reader).await {
+        if let Err(error) = play_audio_stream(
+            manager, guild, reader, "PersonaPlex", Instant::now()).await
+        {
             tracing::warn!(%error, "PersonaPlex output failed");
         }
     });
@@ -1391,26 +1360,6 @@ mod tests {
         (0..buffer.len).map(|i| buffer.samples[(start + i) % buffer.samples.len()]).collect()
     }
 
-    #[test]
-    fn finalizes_streaming_wav_lengths_for_songbird_probe() {
-        let mut wav = b"RIFF\xff\xff\xff\xffWAVEfmt ".to_vec();
-        wav.extend_from_slice(&16_u32.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&24_000_u32.to_le_bytes());
-        wav.extend_from_slice(&48_000_u32.to_le_bytes());
-        wav.extend_from_slice(&2_u16.to_le_bytes());
-        wav.extend_from_slice(&16_u16.to_le_bytes());
-        wav.extend_from_slice(b"data\xff\xff\xff\xff");
-        wav.extend_from_slice(&[0, 0, 0, 64]);
-        let wav = finalize_streaming_wav(wav).unwrap();
-        assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), (wav.len() - 8) as u32);
-        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 4);
-        let pcm = pocket_tts_pcm(&wav).unwrap();
-        assert_eq!(pcm.len(), 8);
-        assert_eq!(f32::from_le_bytes(pcm[..4].try_into().unwrap()), 0.0);
-        assert_eq!(f32::from_le_bytes(pcm[4..].try_into().unwrap()), 0.5);
-    }
 
     #[test]
     fn pcm_ring_keeps_newest_samples_across_wrap_and_oversize_frames() {
@@ -1546,9 +1495,12 @@ mod tests {
         for _ in 0..END_SILENCE_FRAMES { capture.accept_frame(false); }
         let pcm = wav_pcm(&capture.ready.pop_front().unwrap());
         assert_eq!(&pcm[..20 * VAD_SAMPLES], vec![1; 20 * VAD_SAMPLES]);
-        assert_eq!(&pcm[20 * VAD_SAMPLES..30 * VAD_SAMPLES], vec![2; 10 * VAD_SAMPLES]);
-        assert_eq!(&pcm[79 * VAD_SAMPLES..80 * VAD_SAMPLES], vec![3; VAD_SAMPLES]);
-        assert_eq!(pcm.len(), 130 * VAD_SAMPLES);
+        assert_eq!(&pcm[20 * VAD_SAMPLES..(20 + MIN_SPEECH_FRAMES) * VAD_SAMPLES],
+            vec![2; MIN_SPEECH_FRAMES * VAD_SAMPLES]);
+        let marker = 20 + MIN_SPEECH_FRAMES + END_SILENCE_FRAMES - 1;
+        assert_eq!(&pcm[marker * VAD_SAMPLES..(marker + 1) * VAD_SAMPLES],
+            vec![3; VAD_SAMPLES]);
+        assert_eq!(pcm.len(), (marker + 1 + END_SILENCE_FRAMES) * VAD_SAMPLES);
         capture.frame.fill(100);
         for _ in 0..MIN_SPEECH_FRAMES - 1 { capture.accept_frame(true); }
         capture.frame.fill(0);

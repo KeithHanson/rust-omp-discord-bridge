@@ -35,19 +35,25 @@ Already submitted turns are not canceled by turning voice off; use the existing
 `stop` control for an active agent turn.
 
 Recognized speech is visibly attributed as a transcription, then admitted as a
-human turn in the thread's existing OMP session. Replies remain text-only. Voice
-transcripts are prompts, not bridge control commands. Transcripts remain in
-Discord and session history; microphone audio is memory-only. There is no TTS.
+human turn in the thread's existing OMP session. Voice transcripts are prompts,
+not bridge control commands. Transcripts remain in Discord and session history;
+microphone audio is memory-only. With `--tts-url`, the next assistant reply is
+streamed into Discord as the synthesizer produces it instead of waiting for the
+whole waveform.
 An acknowledgement failure is not retried because admission may already have
 occurred; check the thread before repeating the utterance.
 
 Capture retains only the configured human's attributed audio, decoded at stereo
-16 kHz. Earshot VAD uses mono 16 ms frames, 640 ms pre-roll, 800 ms trailing
+16 kHz. Earshot VAD uses mono 16 ms frames, 640 ms pre-roll, 320 ms trailing
 non-speech and a 160 ms minimum speech duration. Utterances cap at 20 seconds with
 640 ms overlap; two completed utterances may wait behind a request. Backlog
 overflow drops new chunks with a warning. Quiet/brief speech can be rejected and
 overlap can repeat words. Unknown-SSRC audio remains excluded. Model and VAD
 quality still require live microphone testing.
+End-to-end latency is dominated by the selected OMP model. Use a dedicated voice
+thread with a fast subscription-backed model and minimal reasoning; measured
+short-answer latency for `openai-codex/gpt-5.6-luna` was about two seconds before
+speech synthesis.
 
 ### Native PersonaPlex trial
 
