@@ -601,10 +601,20 @@ async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, 
             .error_for_status()?;
         let wav = finalize_streaming_wav(response.bytes().await?.to_vec())?;
         let pcm = pocket_tts_pcm(&wav)?;
+        let audio_ms = pcm.len() as u64 * 1_000 / (24_000 * 4);
         let call = manager.get(guild).context("voice call unavailable")?;
-        let mut call = call.lock().await;
-        call.mute(false).await?;
-        call.play_only_input(RawAdapter::new(Cursor::new(pcm), 24_000, 1).into());
+        let track = {
+            let mut call = call.lock().await;
+            call.mute(false).await?;
+            call.play_only_input(RawAdapter::new(Cursor::new(pcm), 24_000, 1).into())
+        };
+        tracing::info!(audio_ms, "TTS track submitted");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let state = track.get_info().await?;
+        tracing::info!(?state, "TTS track state");
+        tokio::time::sleep(Duration::from_millis(audio_ms.saturating_sub(500) + 500)).await;
+        let state = track.get_info().await?;
+        tracing::info!(?state, "TTS track final state");
         Result::<()>::Ok(())
     }
     .await;
@@ -649,6 +659,10 @@ impl EventHandler for Watcher {
     }
 
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
+        if new.user_id == self.bot {
+            tracing::info!(channel = ?new.channel_id, self_mute = new.self_mute,
+                self_deaf = new.self_deaf, suppress = new.suppress, "Bot voice state updated");
+        }
         if let Some(thread) = self.voice_state(new.guild_id, new.user_id, new.channel_id) {
             notify_thread(&ctx.http, thread, "Voice is off because you left General. Use /voice on to arm again.").await;
         }
