@@ -65,7 +65,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
 [patch.crates-io]
-songbird = { git = "https://github.com/Smotto/DiscordMusicBot", rev = "798901f" }
+songbird = { git = "https://github.com/Smotto/DiscordMusicBot", rev = "75579347" }
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["test-util"] }

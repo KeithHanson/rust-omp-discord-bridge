@@ -3510,7 +3510,7 @@ dependencies = [
 [[package]]
 name = "songbird"
 version = "0.6.0"
-source = "git+https://github.com/Smotto/DiscordMusicBot?rev=798901f#798901f8c7dd2632f2df7ad81ad3dead6d2e3118"
+source = "git+https://github.com/Smotto/DiscordMusicBot?rev=75579347#75579347bcc33dbee62248d72783e9e7c93281b7"
 dependencies = [
  "aead",
  "aes-gcm",
