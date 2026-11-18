@@ -10,7 +10,7 @@ use serenity::{all::{Channel, ChannelId, ChannelType, CommandDataOption, Command
     CreateMessage, EditInteractionResponse, EventHandler, GatewayIntents, Guild, GuildId, Http,
     Interaction, Message, Ready, UnavailableGuild, UserId, VoiceState},
     gateway::{ConnectionStage, ShardStageUpdateEvent}, async_trait, Client};
-use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate}, input::RawAdapter, CoreEvent, Event, EventContext, SerenityInit, Songbird};
+use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate}, input::RawAdapter, tracks::Track, CoreEvent, Event, EventContext, SerenityInit, Songbird};
 use tokio::sync::watch;
 
 const SAMPLE_RATE: usize = 16_000;
@@ -606,7 +606,9 @@ async fn speak_reply(manager: Arc<Songbird>, guild: GuildId, url: reqwest::Url, 
         let track = {
             let mut call = call.lock().await;
             call.mute(false).await?;
-            call.play_only_input(RawAdapter::new(Cursor::new(pcm), 24_000, 1).into())
+            let input: songbird::input::Input =
+                RawAdapter::new(Cursor::new(pcm), 24_000, 1).into();
+            call.play_only(Track::from(input).volume(0.99))
         };
         tracing::info!(audio_ms, "TTS track submitted");
         tokio::time::sleep(Duration::from_millis(500)).await;
