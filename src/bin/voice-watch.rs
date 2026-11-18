@@ -1,6 +1,8 @@
-//! Opt-in local voice receiver with optional private bridge-thread routing; no audio files.
-use std::{collections::VecDeque, io::{self, Cursor, SeekFrom}, num::NonZeroU64, path::PathBuf,
-    pin::Pin, sync::{Arc, Mutex}, task::{Context as TaskContext, Poll}, time::{Duration, Instant}};
+//! Opt-in local voice receiver with optional private routing and bounded review capture.
+use std::{collections::VecDeque, fs, io::{self, Cursor, SeekFrom}, num::NonZeroU64,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt}, path::{Path, PathBuf}, pin::Pin,
+    sync::{Arc, Mutex}, task::{Context as TaskContext, Poll},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 use anyhow::{Context as _, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
@@ -18,7 +20,7 @@ use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
     input::{codecs::{get_codec_registry, get_probe}, AsyncAdapterStream, AsyncMediaSource,
         AudioStream, Input, LiveInput, RawAdapter},
     tracks::Track, CoreEvent, Event, EventContext, SerenityInit, Songbird};
-use tokio::{io::{AsyncRead, AsyncSeek, AsyncWriteExt, DuplexStream, ReadBuf},
+use tokio::{fs::File, io::{AsyncRead, AsyncSeek, AsyncWriteExt, DuplexStream, ReadBuf},
     sync::{mpsc, watch}};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
@@ -32,9 +34,10 @@ const MIN_SPEECH_FRAMES: usize = 160 / 16;
 const MAX_QUEUED_UTTERANCES: usize = 2;
 const PERSONAPLEX_FRAME_SAMPLES: usize = 480; // 20 ms at 24 kHz mono.
 const PERSONAPLEX_QUEUE_FRAMES: usize = 50; // Bound latency to one second.
+const REVIEW_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Parser)]
-#[command(about = "Private auto-join voice receiver with optional remote transcription; no audio files")]
+#[command(about = "Private auto-join voice receiver with optional transcription or review capture")]
 struct Args {
     #[arg(long)]
     token_file: PathBuf,
@@ -61,6 +64,9 @@ struct Args {
     /// Native full-duplex PersonaPlex base URL. Mutually exclusive with STT/TTS routing.
     #[arg(long, conflicts_with_all = ["stt_url", "stt_key_file", "bridge_socket", "tts_url"])]
     personaplex_url: Option<reqwest::Url>,
+    /// Private directory for 24-hour PersonaPlex quality-review artifacts.
+    #[arg(long, requires = "personaplex_url")]
+    review_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -979,10 +985,141 @@ fn personaplex_endpoint(mut url: reqwest::Url) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+struct ReviewCapture {
+    directory: PathBuf,
+    incoming: File,
+    outgoing: File,
+    model_text: File,
+    timing: File,
+    started: Instant,
+    incoming_frames: u64,
+    outgoing_bytes: u64,
+    text_bytes: u64,
+}
+
+fn private_file(path: &Path) -> Result<File> {
+    let file = fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
+        .open(path).with_context(|| format!("creating {}", path.display()))?;
+    Ok(File::from_std(file))
+}
+
+fn prepare_review_root(root: &Path) -> Result<()> {
+    fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("securing {}", root.display()))?;
+    let now = SystemTime::now();
+    for entry in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if now.duration_since(modified).unwrap_or_default() >= REVIEW_RETENTION {
+            fs::remove_dir_all(entry.path())
+                .with_context(|| format!("removing expired {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+impl ReviewCapture {
+    async fn new(root: &Path) -> Result<Self> {
+        prepare_review_root(root)?;
+        let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)
+            .context("system clock predates Unix epoch")?;
+        let directory = root.join(format!("{}-{:03}", elapsed.as_secs(), elapsed.subsec_millis()));
+        fs::create_dir(&directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        let mut metadata = private_file(&directory.join("session.json"))?;
+        metadata.write_all(br#"{
+  "retention_hours": 24,
+  "incoming": {"file": "incoming.pcm", "format": "s16le", "channels": 1, "sample_rate": 24000},
+  "outgoing": {"file": "outgoing.ogg", "format": "ogg_opus"},
+  "model_text": "model-text.txt",
+  "timing": "timing.jsonl"
+}
+"#).await?;
+        let mut capture = Self {
+            incoming: private_file(&directory.join("incoming.pcm"))?,
+            outgoing: private_file(&directory.join("outgoing.ogg"))?,
+            model_text: private_file(&directory.join("model-text.txt"))?,
+            timing: private_file(&directory.join("timing.jsonl"))?,
+            directory,
+            started: Instant::now(),
+            incoming_frames: 0,
+            outgoing_bytes: 0,
+            text_bytes: 0,
+        };
+        capture.event("session_started").await?;
+        Ok(capture)
+    }
+
+    async fn event(&mut self, event: &str) -> Result<()> {
+        let line = serde_json::json!({
+            "elapsed_ms": self.started.elapsed().as_millis(),
+            "event": event,
+        });
+        self.timing.write_all(line.to_string().as_bytes()).await?;
+        self.timing.write_all(b"\n").await?;
+        Ok(())
+    }
+
+    async fn input(&mut self, frame: &[i16; PERSONAPLEX_FRAME_SAMPLES]) -> Result<()> {
+        if self.incoming_frames == 0 {
+            self.event("first_input_frame").await?;
+        }
+        let mut bytes = [0_u8; PERSONAPLEX_FRAME_SAMPLES * 2];
+        for (encoded, sample) in bytes.chunks_exact_mut(2).zip(frame) {
+            encoded.copy_from_slice(&sample.to_le_bytes());
+        }
+        self.incoming.write_all(&bytes).await?;
+        self.incoming_frames += 1;
+        Ok(())
+    }
+
+    async fn output(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.outgoing_bytes == 0 {
+            self.event("first_output_bytes").await?;
+        }
+        self.outgoing.write_all(bytes).await?;
+        self.outgoing_bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    async fn text(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.text_bytes == 0 {
+            self.event("first_model_text").await?;
+        }
+        self.model_text.write_all(bytes).await?;
+        self.text_bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        let summary = serde_json::json!({
+            "elapsed_ms": self.started.elapsed().as_millis(),
+            "event": "session_finished",
+            "incoming_frames": self.incoming_frames,
+            "outgoing_bytes": self.outgoing_bytes,
+            "model_text_bytes": self.text_bytes,
+        });
+        self.timing.write_all(summary.to_string().as_bytes()).await?;
+        self.timing.write_all(b"\n").await?;
+        self.incoming.flush().await?;
+        self.outgoing.flush().await?;
+        self.model_text.flush().await?;
+        self.timing.flush().await?;
+        tracing::info!(directory = %self.directory.display(), "PersonaPlex review capture saved");
+        Ok(())
+    }
+}
+
 async fn run_personaplex_session(
     manager: Arc<Songbird>,
     guild: GuildId,
     endpoint: &reqwest::Url,
+    review_root: Option<&Path>,
     frames: &mut mpsc::Receiver<[i16; PERSONAPLEX_FRAME_SAMPLES]>,
     desired: &mut watch::Receiver<Desired>,
 ) -> Result<()> {
@@ -1008,6 +1145,10 @@ async fn run_personaplex_session(
     first.push(1);
     first.extend_from_slice(&opus.headers());
     socket.send(WsMessage::Binary(first.into())).await?;
+    let mut review = match review_root {
+        Some(root) => Some(ReviewCapture::new(root).await?),
+        None => None,
+    };
     let (reader, mut writer) = tokio::io::duplex(256 * 1024);
     tokio::spawn(async move {
         if let Err(error) = play_personaplex_output(manager, guild, reader).await {
@@ -1019,10 +1160,16 @@ async fn run_personaplex_session(
         tokio::select! {
             result = desired.changed() => {
                 result.context("voice membership watcher stopped")?;
+                if let Some(review) = review.take() {
+                    review.finish().await?;
+                }
                 return Ok(());
             }
             frame = frames.recv() => {
                 let frame = frame.context("PersonaPlex input channel closed")?;
+                if let Some(review) = &mut review {
+                    review.input(&frame).await?;
+                }
                 let page = opus.encode(&frame)?;
                 let mut message = Vec::with_capacity(1 + page.len());
                 message.push(1);
@@ -1033,9 +1180,15 @@ async fn run_personaplex_session(
                 let message = message.context("PersonaPlex connection closed")??;
                 match message {
                     WsMessage::Binary(data) if data.first() == Some(&1) => {
+                        if let Some(review) = &mut review {
+                            review.output(&data[1..]).await?;
+                        }
                         writer.write_all(&data[1..]).await?;
                     }
                     WsMessage::Binary(data) if data.first() == Some(&2) => {
+                        if let Some(review) = &mut review {
+                            review.text(&data[1..]).await?;
+                        }
                         if let Ok(text) = std::str::from_utf8(&data[1..]) {
                             tracing::debug!(text, "PersonaPlex inner speech");
                         }
@@ -1052,6 +1205,7 @@ async fn personaplex(
     manager: Arc<Songbird>,
     guild: GuildId,
     url: Option<reqwest::Url>,
+    review_root: Option<PathBuf>,
     mut frames: mpsc::Receiver<[i16; PERSONAPLEX_FRAME_SAMPLES]>,
     mut desired: watch::Receiver<Desired>,
 ) -> Result<()> {
@@ -1062,8 +1216,8 @@ async fn personaplex(
             desired.changed().await.context("voice membership watcher stopped")?;
         }
         while frames.try_recv().is_ok() {}
-        if let Err(error) = run_personaplex_session(
-            Arc::clone(&manager), guild, &endpoint, &mut frames, &mut desired).await
+        if let Err(error) = run_personaplex_session(Arc::clone(&manager), guild, &endpoint,
+            review_root.as_deref(), &mut frames, &mut desired).await
         {
             tracing::warn!(%error, "PersonaPlex session ended");
         }
@@ -1184,6 +1338,7 @@ async fn main() -> Result<()> {
     let (personaplex_tx, personaplex_rx) = mpsc::channel(PERSONAPLEX_QUEUE_FRAMES);
     let personaplex_sender = native_voice.then_some(personaplex_tx);
     let personaplex_url = args.personaplex_url.clone();
+    let review_dir = args.review_dir.clone();
     let persona_changes = changes.clone();
     let handler = Watcher {
         guild,
@@ -1212,7 +1367,7 @@ async fn main() -> Result<()> {
         result = follow(Arc::clone(&manager), guild, channel, user, Arc::clone(&capture),
             personaplex_sender, changes, Arc::clone(&http)) => result,
         result = transcribe(Arc::clone(&capture), args.stt_url, stt_key, bridge) => result,
-        result = personaplex(Arc::clone(&manager), guild, personaplex_url,
+        result = personaplex(Arc::clone(&manager), guild, personaplex_url, review_dir,
             personaplex_rx, persona_changes) => result,
         result = tokio::signal::ctrl_c() => result.context("waiting for Ctrl-C"),
         _ = terminate.recv() => Ok(()),
@@ -1668,6 +1823,42 @@ mod tests {
         assert!(headers.windows(8).any(|window| window == b"OpusTags"));
         let page = opus.encode(&[0; PERSONAPLEX_FRAME_SAMPLES]).unwrap();
         assert!(page.starts_with(b"OggS"));
+    }
+
+    #[tokio::test]
+    async fn review_capture_is_private_complete_and_removes_expired_sessions() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("review");
+        fs::create_dir_all(&root).unwrap();
+        let stale = root.join("stale");
+        fs::create_dir(&stale).unwrap();
+        let stale_handle = fs::File::open(&stale).unwrap();
+        stale_handle.set_times(fs::FileTimes::new().set_modified(
+            SystemTime::now() - REVIEW_RETENTION - Duration::from_secs(1))).unwrap();
+
+        let mut review = ReviewCapture::new(&root).await.unwrap();
+        let directory = review.directory.clone();
+        review.input(&[7; PERSONAPLEX_FRAME_SAMPLES]).await.unwrap();
+        review.output(b"OggSoutput").await.unwrap();
+        review.text(b"hello").await.unwrap();
+        review.finish().await.unwrap();
+
+        assert!(!stale.exists());
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(directory.join("incoming.pcm")).unwrap().len(),
+            (PERSONAPLEX_FRAME_SAMPLES * 2) as u64);
+        assert_eq!(fs::read(directory.join("outgoing.ogg")).unwrap(), b"OggSoutput");
+        assert_eq!(fs::read_to_string(directory.join("model-text.txt")).unwrap(), "hello");
+        let timing = fs::read_to_string(directory.join("timing.jsonl")).unwrap();
+        assert!(timing.contains("\"event\":\"session_finished\""));
+        for file in ["incoming.pcm", "outgoing.ogg", "model-text.txt", "timing.jsonl",
+            "session.json"]
+        {
+            assert_eq!(fs::metadata(directory.join(file)).unwrap().mode() & 0o777, 0o600);
+        }
     }
 
 }

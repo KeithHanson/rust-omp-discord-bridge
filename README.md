@@ -58,7 +58,8 @@ full-duplex speech model:
 voice-watch --token-file /path/to/discord-token \
   --bot-id BOT_ID --guild-id GUILD_ID --channel-id GENERAL_VOICE_ID \
   --user-id OPERATOR_ID \
-  --personaplex-url http://PRIVATE_GPU_HOST:18998
+  --personaplex-url http://PRIVATE_GPU_HOST:18998 \
+  --review-dir /private/local/personaplex-review
 ```
 
 This mode is mutually exclusive with `--stt-url`, `--stt-key-file`,
@@ -67,8 +68,15 @@ text replies. While the selected human is in the configured channel, the
 companion forwards only that attributed Discord stream to PersonaPlex and plays
 the model's streamed audio back into the call. Discord stereo 48 kHz PCM is
 downmixed and resampled to PersonaPlex's mono 24 kHz Opus protocol. Leaving the
-channel closes the model session. Audio remains streaming and memory-only.
-Keep the HTTP/WebSocket endpoint on an approved private network.
+channel closes the model session. Without `--review-dir`, audio remains streaming
+and memory-only.
+
+Quality review capture stores separate incoming mono 24 kHz signed-16-bit PCM,
+outgoing Ogg Opus, PersonaPlex model-text frames, and JSONL timing diagnostics.
+The root and per-session directories are mode 0700; files are mode 0600.
+Sessions older than 24 hours are deleted when the next session begins. Raw PCM
+can be opened as `s16le`, one channel, 24 kHz. Keep the capture directory and
+HTTP/WebSocket endpoint on approved private storage and networks.
 
 `scripts/voice-asr.Dockerfile` adds pinned audio decoders to the vLLM image.
 Build it as `hephaestus/qwen3-asr:trial` on the authorized GPU host;
