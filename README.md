@@ -40,6 +40,10 @@ not bridge control commands. Transcripts remain in Discord and session history;
 microphone audio is memory-only. With `--tts-url`, the next assistant reply is
 streamed into Discord as the synthesizer produces it instead of waiting for the
 whole waveform.
+After a transcript is admitted, the companion immediately plays a preloaded
+“Got it. Let me think about that.” acknowledgement. A quiet two-note cue then
+loops until the assistant reply arrives; reply playback replaces the cue. New
+voice turns replace older feedback, and connection/binding resets cancel it.
 An acknowledgement failure is not retried because admission may already have
 occurred; check the thread before repeating the utterance.
 
