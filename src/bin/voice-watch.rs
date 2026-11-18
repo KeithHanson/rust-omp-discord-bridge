@@ -975,8 +975,7 @@ fn personaplex_endpoint(mut url: reqwest::Url) -> Result<reqwest::Url> {
     url.query_pairs_mut()
         .append_pair("voice_prompt", "NATF2.pt")
         .append_pair("text_prompt",
-            "You are Hephaestus, a concise, friendly technical assistant. Speak naturally.")
-        .append_pair("seed", "-1");
+            "You are Hephaestus, a concise, friendly technical assistant. Speak naturally.");
     Ok(url)
 }
 
