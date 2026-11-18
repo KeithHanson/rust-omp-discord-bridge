@@ -40,20 +40,23 @@ not bridge control commands. Transcripts remain in Discord and session history;
 microphone audio is memory-only. With `--tts-url`, the next assistant reply is
 streamed into Discord as the synthesizer produces it instead of waiting for the
 whole waveform.
-After a transcript is admitted, the companion immediately plays a preloaded
-“Got it. Let me think about that.” acknowledgement. A quiet two-note cue then
-loops until the assistant reply arrives; reply playback replaces the cue. New
-voice turns replace older feedback, and connection/binding resets cancel it.
-An acknowledgement failure is not retried because admission may already have
-occurred; check the thread before repeating the utterance.
+After a transcript is admitted, the companion immediately starts a quiet two-note
+cue. In parallel, a tool-free, sessionless `openai-codex/gpt-5.6-luna` turn with
+thinking disabled generates a transcript-specific acknowledgement capped at 12
+words. Its streamed speech briefly replaces the cue, then the cue resumes until
+the assistant reply arrives. Reply playback replaces the cue. New voice turns
+replace older feedback, and connection/binding resets cancel it. A failed or
+eight-second acknowledgement generation is not retried; the cue continues because
+the human turn was already admitted.
 
 Capture retains only the configured human's attributed audio, decoded at stereo
 16 kHz. Earshot VAD uses mono 16 ms frames, 640 ms pre-roll, 320 ms trailing
-non-speech and a 160 ms minimum speech duration. Utterances cap at 20 seconds with
-640 ms overlap; two completed utterances may wait behind a request. Backlog
-overflow drops new chunks with a warning. Quiet/brief speech can be rejected and
-overlap can repeat words. Unknown-SSRC audio remains excluded. Model and VAD
-quality still require live microphone testing.
+non-speech, a 48 ms minimum speech duration, and a minimum utterance RMS of 300.
+Utterances cap at 20 seconds with 640 ms overlap; two completed utterances may
+wait behind a request. Backlog overflow drops new chunks with a warning.
+Quiet/brief speech can be rejected and overlap can repeat words. Unknown-SSRC
+audio remains excluded. Model and VAD quality still require live microphone
+testing.
 End-to-end latency is dominated by the selected OMP model. Use a dedicated voice
 thread with a fast subscription-backed model and minimal reasoning; measured
 short-answer latency for `openai-codex/gpt-5.6-luna` was about two seconds before

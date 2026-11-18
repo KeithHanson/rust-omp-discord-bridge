@@ -21,7 +21,7 @@ use songbird::{driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
         AudioStream, Input, LiveInput, RawAdapter},
     tracks::{LoopState, Track}, CoreEvent, Event, EventContext, SerenityInit, Songbird};
 use tokio::{fs::File, io::{AsyncRead, AsyncSeek, AsyncWriteExt, DuplexStream, ReadBuf},
-    sync::{mpsc, watch}};
+    process::Command as TokioCommand, sync::{mpsc, watch}};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 const SAMPLE_RATE: usize = 16_000;
@@ -599,29 +599,7 @@ impl Watcher {
 
 #[derive(Clone)]
 struct FeedbackAudio {
-    acknowledgement: Arc<[u8]>,
-    acknowledgement_duration: Duration,
     thinking: Arc<[u8]>,
-}
-
-fn wav_f32_pcm(wav: &[u8]) -> Result<Vec<u8>> {
-    ensure!(wav.len() >= 44 && &wav[..4] == b"RIFF" && &wav[8..12] == b"WAVE",
-        "TTS acknowledgement is not RIFF/WAVE");
-    ensure!(u16::from_le_bytes(wav[20..22].try_into()?) == 1
-        && u16::from_le_bytes(wav[22..24].try_into()?) == 1
-        && u32::from_le_bytes(wav[24..28].try_into()?) == 24_000
-        && u16::from_le_bytes(wav[34..36].try_into()?) == 16,
-        "TTS acknowledgement format changed");
-    let data = wav.windows(4).position(|window| window == b"data")
-        .context("TTS acknowledgement has no data chunk")? + 8;
-    ensure!(data <= wav.len() && (wav.len() - data).is_multiple_of(2),
-        "TTS acknowledgement PCM is truncated");
-    let mut pcm = Vec::with_capacity((wav.len() - data) * 2);
-    for sample in wav[data..].chunks_exact(2) {
-        let value = f32::from(i16::from_le_bytes(sample.try_into()?)) / 32_768.0;
-        pcm.extend_from_slice(&value.to_le_bytes());
-    }
-    Ok(pcm)
 }
 
 fn thinking_pcm() -> Arc<[u8]> {
@@ -643,22 +621,45 @@ fn thinking_pcm() -> Arc<[u8]> {
     pcm.into()
 }
 
-async fn load_feedback_audio(url: &reqwest::Url) -> Result<FeedbackAudio> {
-    let wav = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(30))
-        .build()?
-        .post(url.join("/tts")?)
-        .form(&[("text", "Got it. Let me think about that.")])
-        .send().await?.error_for_status()?.bytes().await?;
-    let acknowledgement = wav_f32_pcm(&wav)?;
-    let acknowledgement_duration =
-        Duration::from_secs_f64(acknowledgement.len() as f64 / (24_000.0 * 4.0));
-    Ok(FeedbackAudio {
-        acknowledgement: acknowledgement.into(),
-        acknowledgement_duration,
-        thinking: thinking_pcm(),
-    })
+async fn contextual_acknowledgement(transcript: &str) -> Result<String> {
+    let mut command = TokioCommand::new("omp");
+    command.args([
+        "-p",
+        "--model", "openai-codex/gpt-5.6-luna",
+        "--thinking", "off",
+        "--no-tools",
+        "--no-session",
+        "--no-skills",
+        "--no-rules",
+        "--no-context-files",
+        "--no-extensions",
+        "--system-prompt",
+        "Return one natural spoken acknowledgement of the user's specific intent. \
+         Do not answer it. Use at most 12 words. No quotation marks.",
+        transcript,
+    ]).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(8), command.output())
+        .await.context("contextual acknowledgement timed out")??;
+    ensure!(output.status.success(), "contextual acknowledgement model failed");
+    let acknowledgement = String::from_utf8(output.stdout)?.trim().to_owned();
+    ensure!(!acknowledgement.is_empty() && acknowledgement.len() <= 256,
+        "contextual acknowledgement model returned invalid output");
+    Ok(acknowledgement)
+}
+
+async fn play_thinking_feedback(
+    manager: &Songbird,
+    guild: GuildId,
+    audio: &FeedbackAudio,
+    generation: u64,
+) -> Result<()> {
+    let call = manager.get(guild).context("voice call unavailable")?;
+    let mut call = call.lock().await;
+    let input: Input = RawAdapter::new(
+        Cursor::new(Arc::clone(&audio.thinking)), 24_000, 1).into();
+    call.play_only(Track::from(input).loops(LoopState::Infinite).volume(0.99));
+    tracing::info!(generation, "Voice thinking cue started");
+    Ok(())
 }
 
 async fn play_waiting_feedback(
@@ -666,26 +667,21 @@ async fn play_waiting_feedback(
     guild: GuildId,
     capture: Arc<Mutex<Capture>>,
     audio: Arc<FeedbackAudio>,
+    tts_url: reqwest::Url,
+    transcript: String,
     generation: u64,
 ) {
     let result = async {
-        let call = manager.get(guild).context("voice call unavailable")?;
-        {
-            let mut call = call.lock().await;
-            let input: Input = RawAdapter::new(
-                Cursor::new(Arc::clone(&audio.acknowledgement)), 24_000, 1).into();
-            call.play_only(Track::from(input).volume(0.99));
-        }
-        tracing::info!(generation, "Voice acknowledgement started");
-        tokio::time::sleep(audio.acknowledgement_duration + Duration::from_millis(100)).await;
+        play_thinking_feedback(&manager, guild, &audio, generation).await?;
+        let acknowledgement = contextual_acknowledgement(&transcript).await?;
         if !capture.lock().unwrap().feedback_current(generation) {
             return Result::<()>::Ok(());
         }
-        let mut call = call.lock().await;
-        let input: Input = RawAdapter::new(
-            Cursor::new(Arc::clone(&audio.thinking)), 24_000, 1).into();
-        call.play_only(Track::from(input).loops(LoopState::Infinite).volume(0.99));
-        tracing::info!(generation, "Voice thinking cue started");
+        tracing::info!(generation, acknowledgement, "Contextual voice acknowledgement ready");
+        speak_reply(Arc::clone(&manager), guild, tts_url, acknowledgement).await;
+        if capture.lock().unwrap().feedback_current(generation) {
+            play_thinking_feedback(&manager, guild, &audio, generation).await?;
+        }
         Result::<()>::Ok(())
     }.await;
     if let Err(error) = result {
@@ -1315,6 +1311,7 @@ async fn transcribe(
     manager: Arc<Songbird>,
     guild: GuildId,
     feedback: Option<Arc<FeedbackAudio>>,
+    tts_url: Option<reqwest::Url>,
     url: Option<reqwest::Url>,
     key: Option<String>,
     bridge: Option<Arc<BridgeRoute>>,
@@ -1352,17 +1349,17 @@ async fn transcribe(
                         continue;
                     }
                     let request = VoiceRequest { guild_id: bridge.guild.get(), user_id: bridge.user.get(),
-                        thread_id: thread.get(), text: Some(text) };
+                        thread_id: thread.get(), text: Some(text.clone()) };
                     if !capture.lock().unwrap().accepts(epoch, destination) { continue }
                     // No retry or cancellation after dispatch: an ambiguous acknowledgement may
                     // already have admitted a Human turn. Off only fences results not yet sent.
                     match voice_ingress::request(&bridge.socket, &request).await {
                         Ok(response) if response.ok => {
                             let generation = capture.lock().unwrap().begin_feedback(thread);
-                            if let Some(feedback) = &feedback {
+                            if let (Some(feedback), Some(tts_url)) = (&feedback, &tts_url) {
                                 tokio::spawn(play_waiting_feedback(
                                     Arc::clone(&manager), guild, Arc::clone(&capture),
-                                    Arc::clone(feedback), generation));
+                                    Arc::clone(feedback), tts_url.clone(), text, generation));
                             }
                         }
                         Ok(_) => notify_thread(&bridge.http, thread,
@@ -1431,11 +1428,9 @@ async fn main() -> Result<()> {
     let review_dir = args.review_dir.clone();
     let persona_changes = changes.clone();
     let tts_url = args.tts_url.clone();
-    let feedback = match &tts_url {
-        Some(url) => Some(Arc::new(load_feedback_audio(url).await
-            .context("preloading voice acknowledgement")?)),
-        None => None,
-    };
+    let feedback = tts_url.as_ref().map(|_| Arc::new(FeedbackAudio {
+        thinking: thinking_pcm(),
+    }));
     let handler = Watcher {
         guild,
         channel,
@@ -1445,7 +1440,7 @@ async fn main() -> Result<()> {
         bridge: bridge.clone(),
         bot: me.id,
         manager: Arc::clone(&manager),
-        tts_url,
+        tts_url: tts_url.clone(),
     };
     let mut client = Client::builder(
         &token,
@@ -1463,7 +1458,7 @@ async fn main() -> Result<()> {
         result = follow(Arc::clone(&manager), guild, channel, user, Arc::clone(&capture),
             personaplex_sender, changes, Arc::clone(&http)) => result,
         result = transcribe(Arc::clone(&capture), Arc::clone(&manager), guild, feedback,
-            args.stt_url, stt_key, bridge) => result,
+            tts_url, args.stt_url, stt_key, bridge) => result,
         result = personaplex(Arc::clone(&manager), guild, personaplex_url, review_dir,
             personaplex_rx, persona_changes) => result,
         result = tokio::signal::ctrl_c() => result.context("waiting for Ctrl-C"),
@@ -1942,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_feedback_is_generation_fenced_and_audio_is_playable() {
+    fn wait_feedback_is_generation_fenced_and_thinking_audio_is_playable() {
         let mut capture = Capture::new(BUFFER_SAMPLES);
         let thread = ChannelId::new(7);
         let first = capture.begin_feedback(thread);
@@ -1954,18 +1949,6 @@ mod tests {
         capture.reset_audio();
         assert!(!capture.feedback_current(second));
 
-        let mut wav = b"RIFF\x28\0\0\0WAVEfmt ".to_vec();
-        wav.extend_from_slice(&16_u32.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&24_000_u32.to_le_bytes());
-        wav.extend_from_slice(&48_000_u32.to_le_bytes());
-        wav.extend_from_slice(&2_u16.to_le_bytes());
-        wav.extend_from_slice(&16_u16.to_le_bytes());
-        wav.extend_from_slice(b"data\x04\0\0\0\0\0\0\x40");
-        let pcm = wav_f32_pcm(&wav).unwrap();
-        assert_eq!(f32::from_le_bytes(pcm[..4].try_into().unwrap()), 0.0);
-        assert_eq!(f32::from_le_bytes(pcm[4..].try_into().unwrap()), 0.5);
         let thinking = thinking_pcm();
         assert_eq!(thinking.len(), 24_000 * 2 * 4);
         assert!(thinking.iter().any(|byte| *byte != 0));
