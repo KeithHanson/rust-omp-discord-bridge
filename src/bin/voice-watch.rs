@@ -30,7 +30,8 @@ const BUFFER_SAMPLES: usize = SAMPLE_RATE * CHANNELS * 20;
 const VAD_SAMPLES: usize = 256 * CHANNELS; // Earshot: 16 ms at 16 kHz.
 const PRE_ROLL_SAMPLES: usize = SAMPLE_RATE * CHANNELS * 640 / 1000;
 const END_SILENCE_FRAMES: usize = 320 / 16;
-const MIN_SPEECH_FRAMES: usize = 256 / 16;
+const MIN_SPEECH_FRAMES: usize = 48 / 16;
+const MIN_UTTERANCE_RMS: f64 = 300.0;
 const MAX_QUEUED_UTTERANCES: usize = 2;
 const PERSONAPLEX_FRAME_SAMPLES: usize = 480; // 20 ms at 24 kHz mono.
 const PERSONAPLEX_QUEUE_FRAMES: usize = 50; // Bound latency to one second.
@@ -384,10 +385,10 @@ impl Capture {
 
     fn finish(&mut self, reason: &'static str) {
         self.sequence += 1;
-        let accepted = self.speech_frames >= MIN_SPEECH_FRAMES;
         let (first, second) = self.audio.slices();
         let square_sum: f64 = first.iter().chain(second).map(|&s| f64::from(s).powi(2)).sum();
         let rms = (square_sum / self.audio.len.max(1) as f64).sqrt();
+        let accepted = self.speech_frames >= MIN_SPEECH_FRAMES && rms >= MIN_UTTERANCE_RMS;
         tracing::info!(sequence = self.sequence, reason, accepted,
             audio_ms = self.audio.len * 1000 / (SAMPLE_RATE * CHANNELS),
             speech_ms = self.speech_frames * 16, rms,
@@ -1609,24 +1610,24 @@ mod tests {
     #[test]
     fn speech_endpoint_preserves_preroll_and_short_pause_but_rejects_brief_noise() {
         let mut capture = Capture::new(BUFFER_SAMPLES);
-        capture.frame.fill(1);
+        capture.frame.fill(1000);
         for _ in 0..20 { capture.accept_frame(false); }
-        capture.frame.fill(2);
+        capture.frame.fill(2000);
         for _ in 0..MIN_SPEECH_FRAMES { capture.accept_frame(true); }
         capture.frame.fill(0);
         for _ in 0..END_SILENCE_FRAMES - 1 { capture.accept_frame(false); }
         assert!(capture.ready.is_empty());
-        capture.frame.fill(3);
+        capture.frame.fill(3000);
         capture.accept_frame(true);
         capture.frame.fill(0);
         for _ in 0..END_SILENCE_FRAMES { capture.accept_frame(false); }
         let pcm = wav_pcm(&capture.ready.pop_front().unwrap());
-        assert_eq!(&pcm[..20 * VAD_SAMPLES], vec![1; 20 * VAD_SAMPLES]);
+        assert_eq!(&pcm[..20 * VAD_SAMPLES], vec![1000; 20 * VAD_SAMPLES]);
         assert_eq!(&pcm[20 * VAD_SAMPLES..(20 + MIN_SPEECH_FRAMES) * VAD_SAMPLES],
-            vec![2; MIN_SPEECH_FRAMES * VAD_SAMPLES]);
+            vec![2000; MIN_SPEECH_FRAMES * VAD_SAMPLES]);
         let marker = 20 + MIN_SPEECH_FRAMES + END_SILENCE_FRAMES - 1;
         assert_eq!(&pcm[marker * VAD_SAMPLES..(marker + 1) * VAD_SAMPLES],
-            vec![3; VAD_SAMPLES]);
+            vec![3000; VAD_SAMPLES]);
         assert_eq!(pcm.len(), (marker + 1 + END_SILENCE_FRAMES) * VAD_SAMPLES);
         capture.frame.fill(100);
         for _ in 0..MIN_SPEECH_FRAMES - 1 { capture.accept_frame(true); }
@@ -1693,7 +1694,7 @@ mod tests {
     }
 
     fn queue_speech(capture: &mut Capture) {
-        capture.frame.fill(123);
+        capture.frame.fill(1000);
         for _ in 0..MIN_SPEECH_FRAMES { capture.accept_frame(true); }
         capture.frame.fill(0);
         for _ in 0..END_SILENCE_FRAMES { capture.accept_frame(false); }
