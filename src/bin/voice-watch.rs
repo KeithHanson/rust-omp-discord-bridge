@@ -805,7 +805,7 @@ async fn follow(
         let call = manager.get_or_insert(guild);
         {
             let mut call = call.lock().await;
-            call.mute(true).await?;
+            call.mute(false).await?;
             call.deafen(false).await?;
             let receiver = Receiver { user: user.get(), generation: state.generation,
                 capture: Arc::clone(&capture), http: Arc::clone(&http) };
