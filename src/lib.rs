@@ -1,6 +1,6 @@
 mod activity;
 pub mod config;
-pub mod discord;
+pub mod clients;
 pub mod domain;
 pub mod omp;
 mod presence;

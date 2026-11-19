@@ -45,14 +45,14 @@ use crate::{
     titles::{ReviewedTitle, TitleReviewer},
 };
 
-#[path = "discord_prompts.rs"]
+#[path = "../discord_prompts.rs"]
 mod discord_prompts;
 use discord_prompts::PromptBroker;
 
-#[path = "discord_upload.rs"]
+#[path = "../discord_upload.rs"]
 mod discord_upload;
 
-#[path = "title_http.rs"]
+#[path = "../title_http.rs"]
 mod title_http;
 use title_http::{Reply as TitleReply, TitleHttp, TitleState};
 

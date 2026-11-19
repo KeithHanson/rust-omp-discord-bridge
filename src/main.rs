@@ -3,7 +3,7 @@ use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use omp_discord_bridge::{
-    config::AppConfig, discord, omp::OmpTransport, store::Store, threadwatch,
+    clients::discord, config::AppConfig, omp::OmpTransport, store::Store, threadwatch,
 };
 use tracing_subscriber::EnvFilter;
 
