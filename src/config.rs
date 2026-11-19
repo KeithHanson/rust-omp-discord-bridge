@@ -287,7 +287,10 @@ impl AppConfig {
                 let mut room_ids = HashSet::new();
                 let mut rooms = Vec::with_capacity(matrix.rooms.len());
                 for policy in matrix.rooms {
-                    if !policy.id.starts_with('!') || !policy.id.contains(':') {
+                    if !policy.id.strip_prefix('!').is_some_and(|id| {
+                        !id.is_empty()
+                            && !id.chars().any(|character| character.is_whitespace() || character.is_control())
+                    }) {
                         bail!("invalid Matrix room id `{}`", policy.id);
                     }
                     if !room_ids.insert(policy.id.clone()) {
@@ -684,7 +687,7 @@ mod tests {
             access_token_file: root.path().join("matrix-token"),
             session_store_path: root.path().join("matrix-store"),
             rooms: vec![RawMatrixRoomPolicy {
-                id: "!room:matrix.example".to_owned(),
+                id: "!opaque-room-id".to_owned(),
                 allowed_users: vec!["@operator:matrix.example".to_owned()],
                 cwd: root.path().to_owned(),
             }],

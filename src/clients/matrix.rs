@@ -1,10 +1,11 @@
-use std::{collections::HashMap, io::Write, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration};
+use std::{collections::HashMap, io::Write, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::{Client, Method, Url};
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::{
     config::{AppConfig, MatrixConfig},
@@ -22,7 +23,6 @@ struct MatrixHttp {
     client: Client,
     homeserver: Url,
     token: Arc<str>,
-    transaction: Arc<AtomicU64>,
 }
 
 impl MatrixHttp {
@@ -31,7 +31,6 @@ impl MatrixHttp {
             client: Client::builder().timeout(Duration::from_secs(45)).build()?,
             homeserver: config.homeserver_url.clone(),
             token: Arc::from(config.load_access_token()?),
-            transaction: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -65,7 +64,7 @@ impl MatrixHttp {
     }
 
     async fn send_event(&self, room_id: &str, event_type: &str, content: &Value) -> Result<String> {
-        let transaction = self.transaction.fetch_add(1, Ordering::Relaxed).to_string();
+        let transaction = Uuid::new_v4().to_string();
         let url = self.endpoint(&["_matrix", "client", "v3", "rooms", room_id, "send", event_type, &transaction])?;
         let response = self.request(Method::PUT, url, Some(content)).await?;
         response.get("event_id").and_then(Value::as_str).map(str::to_owned)
@@ -157,8 +156,25 @@ impl ThreadMessenger for MatrixMessenger {
         let event = self.http.send_text(self.room(thread_id)?, content).await?;
         self.store.ensure_event(&EventId::scoped(ClientKind::Matrix, event)?).await
     }
-    async fn edit_activity(&self, thread_id: ThreadId, _message_id: MessageId, content: &str, _finished: bool) -> Result<MessageId> {
-        self.create_activity(thread_id, content, false).await
+    async fn edit_activity(&self, thread_id: ThreadId, message_id: MessageId, content: &str, _finished: bool) -> Result<MessageId> {
+        let target = self
+            .store
+            .event_native_id(ClientKind::Matrix, message_id)
+            .await?
+            .context("Matrix activity event mapping is missing")?;
+        self.http
+            .send_event(
+                self.room(thread_id)?,
+                "m.room.message",
+                &json!({
+                    "msgtype": "m.text",
+                    "body": format!("* {content}"),
+                    "m.new_content": {"msgtype": "m.text", "body": content},
+                    "m.relates_to": {"rel_type": "m.replace", "event_id": target},
+                }),
+            )
+            .await?;
+        Ok(message_id)
     }
     async fn confirm(&self, thread_id: ThreadId, request: ApprovalRequest) -> bool {
         let text = format!("Approval required: {request:?}\nReply to this message with approve or deny.");
@@ -392,7 +408,7 @@ mod tests {
             }
             let request = String::from_utf8(request).unwrap();
             assert!(request.starts_with("PUT /_matrix/client/v3/rooms/"));
-            assert!(request.contains("/send/m.room.message/1 HTTP/1.1"));
+            assert!(request.contains("/send/m.room.message/"));
             assert!(request.to_ascii_lowercase().contains("authorization: bearer test-token"));
             assert!(request.contains("\"body\":\"hello\""));
             stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"event_id\":\"$response\"}").unwrap();
@@ -401,7 +417,6 @@ mod tests {
             client: Client::builder().no_proxy().build().unwrap(),
             homeserver: Url::parse(&format!("http://{address}")).unwrap(),
             token: Arc::from("test-token"),
-            transaction: Arc::new(AtomicU64::new(1)),
         };
 
         assert_eq!(http.send_text("!room:example.org", "hello").await.unwrap(), "$response");

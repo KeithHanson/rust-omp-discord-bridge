@@ -311,6 +311,20 @@ impl Store {
         Ok(MessageId::new(u64::try_from(id)?))
     }
 
+    pub async fn event_native_id(
+        &self,
+        client: ClientKind,
+        message_id: MessageId,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT native_id FROM client_events WHERE id = ? AND client_kind = ?",
+        )
+        .bind(i64::try_from(message_id.get())?)
+        .bind(client.as_str())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn ensure_actor(&self, key: &ActorId) -> Result<UserId> {
         sqlx::query(
             "INSERT INTO client_actors (client_kind, native_id) VALUES (?, ?)
@@ -1035,12 +1049,24 @@ mod tests {
         let matrix_id = store.ensure_event(&matrix_event).await.unwrap();
         assert_eq!(store.ensure_event(&matrix_event).await.unwrap(), matrix_id);
         assert_ne!(store.ensure_event(&discord_event).await.unwrap(), matrix_id);
+        assert_eq!(
+            store.event_native_id(ClientKind::Matrix, matrix_id).await.unwrap().as_deref(),
+            Some("same")
+        );
+        assert_eq!(
+            store.event_native_id(ClientKind::Discord, matrix_id).await.unwrap(),
+            None
+        );
         let actor_id = store.ensure_actor(&actor).await.unwrap();
         assert_eq!(store.ensure_actor(&actor).await.unwrap(), actor_id);
         store.pool.close().await;
 
         let reopened = Store::open(&directory.path().join("bridge.sqlite")).await.unwrap();
         assert_eq!(reopened.ensure_event(&matrix_event).await.unwrap(), matrix_id);
+        assert_eq!(
+            reopened.event_native_id(ClientKind::Matrix, matrix_id).await.unwrap().as_deref(),
+            Some("same")
+        );
         assert_eq!(reopened.ensure_actor(&actor).await.unwrap(), actor_id);
     }
 

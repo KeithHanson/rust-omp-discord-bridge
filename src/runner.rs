@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex as StdMutex, Weak},
+    sync::{Arc, Mutex as StdMutex, Weak, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 
@@ -36,12 +36,13 @@ struct QueuedMessage {
 
 struct MessageDelivery {
     sender: mpsc::Sender<QueuedMessage>,
+    assistant_enqueued: AtomicBool,
 }
 
 impl MessageDelivery {
     fn new() -> (Self, mpsc::Receiver<QueuedMessage>) {
         let (sender, receiver) = mpsc::channel(MAX_PENDING_MESSAGES);
-        (Self { sender }, receiver)
+        (Self { sender, assistant_enqueued: AtomicBool::new(false) }, receiver)
     }
 
     fn message(&self, text: impl Into<String>) -> Result<(), OmpTurnError> {
@@ -66,9 +67,16 @@ impl MessageDelivery {
             text: text.into(),
             assistant,
         });
+        if assistant {
+            self.assistant_enqueued.store(true, Ordering::Release);
+        }
         Ok(())
     }
+    fn has_assistant(&self) -> bool {
+        self.assistant_enqueued.load(Ordering::Acquire)
+    }
 }
+
 
 
 async fn deliver_messages(
@@ -772,7 +780,18 @@ impl ThreadQueueRunner {
                 Err(error) if error.is_uncertain() => "Outcome uncertain; inspect before retrying",
                 Err(_) => "Failed",
             };
+            let fallback = match &result {
+                Ok(outcome)
+                    if !outcome.aborted && !outcome.text.is_empty() && !delivery.has_assistant() =>
+                {
+                    Some(outcome.text.clone())
+                }
+                _ => None,
+            };
             let finalized = async {
+                if let Some(text) = fallback {
+                    delivery.message(text)?;
+                }
                 let Err(error) = &result else {
                     return Ok(());
                 };
@@ -1028,6 +1047,7 @@ mod tests {
         lose_connection: bool,
         completed: Vec<String>,
         answer: String,
+        emit_answer_message: bool,
     }
 
     impl ControlledTransport {
@@ -1042,6 +1062,7 @@ mod tests {
                 lose_connection,
                 completed: Vec::new(),
                 answer: "finished answer".into(),
+                emit_answer_message: true,
             }
         }
 
@@ -1130,7 +1151,9 @@ mod tests {
                     }
                 };
                 if !aborted {
-                    ui.message(&self.answer)?;
+                    if self.emit_answer_message {
+                        ui.message(&self.answer)?;
+                    }
                     if !text.is_empty() {
                         text.push_str("\n\n");
                     }
@@ -2641,6 +2664,26 @@ mod tests {
         runner.poke(THREAD).await;
         idle(&runner).await;
         assert!(incoming.try_recv().is_err());
+        assert_eq!(*messenger.sent.lock().await, vec!["finished answer"]);
+    }
+
+    #[tokio::test]
+    async fn completed_result_is_delivered_when_transport_emits_no_message_frame() {
+        let (_directory, store) = fixture().await;
+        let (observed, mut incoming) = mpsc::unbounded_channel();
+        let mut transport = ControlledTransport::new(observed, false);
+        transport.emit_answer_message = false;
+        let transport = Arc::new(transport);
+        let messenger = Arc::new(FakeMessenger::default());
+        let runner =
+            ThreadQueueRunner::new(store.clone(), transport.clone(), messenger.clone(), 1_900, 1);
+        let turn = enqueue(&store, 20).await;
+        runner.poke(THREAD).await;
+        assert_eq!(received(&mut incoming).await, turn);
+
+        transport.finish.add_permits(1);
+        idle(&runner).await;
+
         assert_eq!(*messenger.sent.lock().await, vec!["finished answer"]);
     }
 
