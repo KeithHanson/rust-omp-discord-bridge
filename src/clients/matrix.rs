@@ -369,4 +369,42 @@ mod tests {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
         }
     }
+
+    #[tokio::test]
+    async fn matrix_http_sends_authenticated_room_events() {
+        use std::{io::Read, net::TcpListener, thread};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n")
+                    && request.ends_with(b"}")
+                {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("PUT /_matrix/client/v3/rooms/"));
+            assert!(request.contains("/send/m.room.message/1 HTTP/1.1"));
+            assert!(request.to_ascii_lowercase().contains("authorization: bearer test-token"));
+            assert!(request.contains("\"body\":\"hello\""));
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"event_id\":\"$response\"}").unwrap();
+        });
+        let http = MatrixHttp {
+            client: Client::builder().no_proxy().build().unwrap(),
+            homeserver: Url::parse(&format!("http://{address}")).unwrap(),
+            token: Arc::from("test-token"),
+            transaction: Arc::new(AtomicU64::new(1)),
+        };
+
+        assert_eq!(http.send_text("!room:example.org", "hello").await.unwrap(), "$response");
+        server.join().unwrap();
+    }
 }
