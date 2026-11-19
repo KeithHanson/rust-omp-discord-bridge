@@ -2,7 +2,7 @@
 
 Rust Discord and Matrix gateway for persistent, client-scoped OMP conversations.
 
-Discord maps one thread to one OMP conversation. Matrix maps one configured room to one OMP conversation. Both clients share durable SQLite state, bounded OMP concurrency, restart recovery, and the same process.
+Discord maps one thread to one OMP conversation. Matrix supports room-scoped conversations and mention-started native threads. Both clients share durable SQLite state, bounded OMP concurrency, restart recovery, and the same process.
 
 ## Current behavior
 
@@ -106,6 +106,14 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 `[VERSION] ([short commit])`. Neither value is read from the checkout at runtime.
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
+
+### Release 2026-11-19-1
+
+Refactors the Discord bridge around client-scoped conversations and adds an
+optional Matrix adapter. Matrix supports allowlisted rooms and users,
+mention-started native threads, durable per-thread OMP history, reply-based
+prompts and approvals, authenticated media, restart-safe event delivery, and
+thread-preserving output. Discord-only configurations remain supported.
 
 ### Release 2026-11-16-2
 
