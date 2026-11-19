@@ -116,7 +116,7 @@ async fn execute(cli: Cli) -> Result<()> {
                     }
                 })
             });
-            let result = clients::run(config, store, &config_path).await;
+            let result = clients::run(config, store, command_receiver, &config_path).await;
             if let Some(task) = reporting {
                 task.abort();
             }

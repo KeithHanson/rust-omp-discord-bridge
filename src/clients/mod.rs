@@ -6,9 +6,14 @@ use std::{path::Path, sync::Arc, time::Duration};
 use anyhow::Result;
 
 use crate::{config::AppConfig, store::Store};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 
-pub async fn run(config: AppConfig, store: Store, config_path: &Path) -> Result<()> {
+pub async fn run(
+    config: AppConfig,
+    store: Store,
+    command_receiver: mpsc::Receiver<crate::threadwatch::ControlCommand>,
+    config_path: &Path,
+) -> Result<()> {
     let permits = Arc::new(Semaphore::new(config.runtime.max_concurrency));
     let matrix = config.matrix.as_ref().map(|_| {
         let config = Arc::new(config.clone());
@@ -23,7 +28,7 @@ pub async fn run(config: AppConfig, store: Store, config_path: &Path) -> Result<
             }
         })
     });
-    let result = discord::run(config, store, config_path, permits).await;
+    let result = discord::run(config, store, command_receiver, config_path, permits).await;
     if let Some(task) = matrix {
         task.abort();
     }

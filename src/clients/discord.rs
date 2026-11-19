@@ -29,7 +29,7 @@ use serenity::{
     http::{LightMethod, Request, Route},
 };
 use tokio::{
-    sync::{Semaphore, oneshot, watch},
+    sync::{Semaphore, mpsc, oneshot, watch},
     time::Instant,
 };
 
@@ -71,7 +71,7 @@ impl ReviewTitle for TitleReviewer {
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run(config: AppConfig, store: Store, config_path: &std::path::Path, permits: Arc<Semaphore>) -> Result<()> {
+pub async fn run(config: AppConfig, store: Store, command_receiver: mpsc::Receiver<ControlCommand>, config_path: &std::path::Path, permits: Arc<Semaphore>) -> Result<()> {
     let token = config.discord.load_token()?;
     let config = Arc::new(config);
     let http = Arc::new(Http::new(&token));
