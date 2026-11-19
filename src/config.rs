@@ -182,7 +182,7 @@ struct RawRuntimeConfig {
 impl Default for RawRuntimeConfig {
     fn default() -> Self {
         Self {
-            database_path: PathBuf::from("~/.local/state/omp-discord-bridge/bridge.sqlite"),
+            database_path: PathBuf::from("~/.local/state/omp-client-bridge/bridge.sqlite"),
             max_concurrency: 2,
             discord_message_limit: 1_900,
             max_attachment_bytes: 25_000_000,

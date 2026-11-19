@@ -1931,10 +1931,11 @@ mod tests {
             panic!("expected two original turns");
         };
         let (first, pending) = (*first, *pending);
-        original
-            .claim_next(ThreadId::new(10))
+        sqlx::query("UPDATE turns SET status = 'running', started_at_ms = 0 WHERE id = ?")
+            .bind(first)
+            .execute(&original.pool)
             .await
-            .expect("claim original turn");
+            .expect("mark original turn running");
         original.pool.close().await;
 
         let migrated = Store::open(&database).await.expect("migrate");

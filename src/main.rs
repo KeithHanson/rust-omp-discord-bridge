@@ -2,7 +2,7 @@ use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use omp_discord_bridge::{
+use omp_client_bridge::{
     clients, config::AppConfig, omp::OmpTransport, store::Store, threadwatch,
 };
 use tracing_subscriber::EnvFilter;
@@ -12,8 +12,8 @@ use tracing_subscriber::EnvFilter;
 struct Cli {
     #[arg(
         long,
-        env = "OMP_DISCORD_BRIDGE_CONFIG",
-        default_value = "~/.config/omp-discord-bridge/config.toml"
+        env = "OMP_CLIENT_BRIDGE_CONFIG",
+        default_value = "~/.config/omp-client-bridge/config.toml"
     )]
     config: PathBuf,
 
@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, Subcommand)]
 enum Command {
-    /// Start the Discord gateway.
+    /// Start all configured client adapters.
     Run,
     /// Validate configuration, database access, token presence, and OMP RPC startup.
     Check,

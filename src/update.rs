@@ -20,7 +20,7 @@ mod supported {
     use tokio::{io::AsyncReadExt, process::Command, time};
 
     const REPOSITORY: &str = "KeithHanson/rust-omp-discord-bridge";
-    const ASSET: &str = "omp-discord-bridge-linux-x86_64";
+    const ASSET: &str = "omp-client-bridge-linux-x86_64";
     const POLL_INTERVAL: Duration = Duration::from_secs(420);
     const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
     const METADATA_LIMIT: usize = 1024 * 1024;
@@ -92,7 +92,7 @@ mod supported {
         fn production() -> Result<Self> {
             let mut headers = header::HeaderMap::new();
             headers.insert("X-GitHub-Api-Version", header::HeaderValue::from_static("2022-11-28"));
-            if let Some(token) = env::var_os("OMP_DISCORD_BRIDGE_UPDATE_TOKEN") {
+            if let Some(token) = env::var_os("OMP_CLIENT_BRIDGE_UPDATE_TOKEN") {
                 let token = token.into_string().map_err(|_| anyhow::anyhow!("invalid update token encoding"))?;
                 let mut value = header::HeaderValue::from_str(&format!("Bearer {token}"))
                     .map_err(|_| anyhow::anyhow!("invalid update token header"))?;
@@ -100,7 +100,7 @@ mod supported {
                 headers.insert(header::AUTHORIZATION, value);
             }
             let client = Client::builder()
-                .user_agent("omp-discord-bridge-updater")
+                .user_agent("omp-client-bridge-updater")
                 .default_headers(headers)
                 .https_only(true)
                 .connect_timeout(Duration::from_secs(10))
@@ -208,7 +208,7 @@ mod supported {
     fn version_matches(output: &[u8], expected: &str) -> bool {
         let Ok(text) = std::str::from_utf8(output) else { return false; };
         let Some(revision) = text.trim_end_matches(['\r', '\n'])
-            .strip_prefix("omp-discord-bridge ")
+            .strip_prefix("omp-client-bridge ")
             .and_then(|text| text.strip_prefix(expected))
             .and_then(|text| text.strip_prefix(" ("))
             .and_then(|text| text.strip_suffix(')')) else { return false; };
@@ -262,7 +262,7 @@ mod supported {
             self.checked = false;
             let mut child = Command::new(&self.candidate)
                 .arg("--config").arg(&self.config).arg("check-update")
-                .env("OMP_DISCORD_BRIDGE_AUTO_UPDATE", "false")
+                .env("OMP_CLIENT_BRIDGE_AUTO_UPDATE", "false")
                 .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
                 .kill_on_drop(true).spawn().context("starting candidate configuration check")?;
             match time::timeout(timeout, child.wait()).await {
@@ -320,7 +320,7 @@ mod supported {
 
     /// Poll the latest stable release. Disabled configurations remain pending until cancelled.
     pub async fn wait_for_update(config_path: &Path) -> PreparedUpdate {
-        let setting = env::var("OMP_DISCORD_BRIDGE_AUTO_UPDATE").ok();
+        let setting = env::var("OMP_CLIENT_BRIDGE_AUTO_UPDATE").ok();
         let disabled = setting.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("false"))
             || env!("BRIDGE_BUILD_REVISION").ends_with("-dirty")
             || (cfg!(debug_assertions) && !setting.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("true")));
@@ -400,8 +400,8 @@ mod supported {
 
         #[test]
         fn version_output_is_exact_and_clean() {
-            assert!(version_matches(b"omp-discord-bridge 2026-11-14-10 (abcdef0)\n", "2026-11-14-10"));
-            for output in ["omp-discord-bridge 2026-11-14-100 (abcdef0)", "omp-discord-bridge 2026-11-14-10 (abcdef0-dirty)", "other 2026-11-14-10 (abcdef0)", "omp-discord-bridge 2026-11-14-10 (abcdef0)\nextra"] {
+            assert!(version_matches(b"omp-client-bridge 2026-11-14-10 (abcdef0)\n", "2026-11-14-10"));
+            for output in ["omp-client-bridge 2026-11-14-100 (abcdef0)", "omp-client-bridge 2026-11-14-10 (abcdef0-dirty)", "other 2026-11-14-10 (abcdef0)", "omp-client-bridge 2026-11-14-10 (abcdef0)\nextra"] {
                 assert!(!version_matches(output.as_bytes(), "2026-11-14-10"));
             }
         }
@@ -421,7 +421,7 @@ mod supported {
         #[tokio::test]
         async fn preflight_uses_nonmutating_command_and_preserves_argument_boundaries() {
             let root = tempfile::tempdir().unwrap();
-            let mut update = prepared(root.path(), b"#!/bin/sh\n[ \"$#\" = 3 ] && [ \"$1\" = --config ] && [ \"$3\" = check-update ] && [ \"$OMP_DISCORD_BRIDGE_AUTO_UPDATE\" = false ]\n");
+            let mut update = prepared(root.path(), b"#!/bin/sh\n[ \"$#\" = 3 ] && [ \"$1\" = --config ] && [ \"$3\" = check-update ] && [ \"$OMP_CLIENT_BRIDGE_AUTO_UPDATE\" = false ]\n");
             update.preflight().await.unwrap();
             assert!(update.checked);
         }
@@ -526,7 +526,7 @@ mod supported {
             let root = tempfile::tempdir().unwrap();
             let target = root.path().join("bridge");
             executable(&target, b"old binary");
-            let binary = b"#!/bin/sh\nprintf 'omp-discord-bridge 2026-11-14-10 (abcdef0)\\n'\n";
+            let binary = b"#!/bin/sh\nprintf 'omp-client-bridge 2026-11-14-10 (abcdef0)\\n'\n";
             let sums = format!("{:x}  {ASSET}\n", Sha256::digest(binary)).into_bytes();
             let metadata = serde_json::to_vec(&serde_json::json!({
                 "tag_name": "v2026-11-14-10", "draft": false, "prerelease": false,
@@ -549,7 +549,7 @@ mod supported {
                 let root = tempfile::tempdir().unwrap();
                 let target = root.path().join("bridge");
                 executable(&target, b"old binary");
-                let binary = b"#!/bin/sh\nprintf 'omp-discord-bridge 2026-11-14-9 (abcdef0)\\n'\n";
+                let binary = b"#!/bin/sh\nprintf 'omp-client-bridge 2026-11-14-9 (abcdef0)\\n'\n";
                 let hash = if wrong_checksum { Sha256::digest(b"different binary") } else { Sha256::digest(binary) };
                 let sums = format!("{hash:x}  {ASSET}\n").into_bytes();
                 let metadata = serde_json::to_vec(&serde_json::json!({

@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
-use omp_discord_bridge::{
+use omp_client_bridge::{
     config::AppConfig,
     domain::{
         ChannelId, ConversationId, GuildId, MessageId, Session, SessionStatus, ThreadId, Turn,
@@ -77,7 +77,7 @@ impl OmpUi for Ui {
     async fn thread_participants(&self) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
-    async fn upload_file(&self, _: omp_discord_bridge::omp::UploadRequest) -> Result<String, String> {
+    async fn upload_file(&self, _: omp_client_bridge::omp::UploadRequest) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
 }
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     std::fs::write(&overlay, "tools:\n  approvalMode: yolo\n")?;
     let home = std::env::var("HOME")?;
     let mut config =
-        AppConfig::load(&Path::new(&home).join(".config/omp-discord-bridge/config.toml"))?.omp;
+        AppConfig::load(&Path::new(&home).join(".config/omp-client-bridge/config.toml"))?.omp;
     config.allowed_root = workspace.clone();
     config.session_dir = sessions;
     let transport = OmpTransport::new(config, Duration::from_secs(180), 100_000, 1);
