@@ -250,6 +250,27 @@ impl Store {
         .await?;
         id.map(ConversationId::new).transpose().map_err(Into::into)
     }
+    pub async fn client_conversations(
+        &self,
+        client: ClientKind,
+    ) -> Result<Vec<(ConversationId, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, native_id FROM client_conversations
+             WHERE client_kind = ? ORDER BY id",
+        )
+        .bind(client.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    ConversationId::new(row.try_get("id")?)?,
+                    row.try_get("native_id")?,
+                ))
+            })
+            .collect()
+    }
+
 
     pub async fn ensure_conversation(
         &self,
@@ -1011,6 +1032,10 @@ mod tests {
         assert_eq!(
             store.conversation_id(&matrix).await.unwrap(),
             Some(matrix_id)
+        );
+        assert_eq!(
+            store.client_conversations(ClientKind::Matrix).await.unwrap(),
+            vec![(matrix_id, "10".to_owned())]
         );
         let matrix_thread = ThreadId::new(u64::try_from(matrix_id.get()).unwrap());
         let mut matrix_session = new_session(matrix_thread.get(), 40);

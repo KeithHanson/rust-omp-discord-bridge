@@ -51,6 +51,7 @@ pub struct MatrixRoomPolicy {
     pub id: String,
     pub allowed_users: HashSet<String>,
     pub cwd: PathBuf,
+    pub require_mention: bool,
 }
 
 
@@ -133,6 +134,8 @@ struct RawMatrixConfig {
 struct RawMatrixRoomPolicy {
     id: String,
     allowed_users: Vec<String>,
+    #[serde(default)]
+    require_mention: bool,
     cwd: PathBuf,
 }
 
@@ -309,6 +312,7 @@ impl AppConfig {
                     rooms.push(MatrixRoomPolicy {
                         id: policy.id,
                         allowed_users,
+                        require_mention: policy.require_mention,
                         cwd,
                     });
                 }
@@ -689,6 +693,7 @@ mod tests {
             rooms: vec![RawMatrixRoomPolicy {
                 id: "!opaque-room-id".to_owned(),
                 allowed_users: vec!["@operator:matrix.example".to_owned()],
+                require_mention: true,
                 cwd: root.path().to_owned(),
             }],
         });
@@ -696,6 +701,7 @@ mod tests {
         let config = AppConfig::from_raw(raw).expect("valid Matrix config");
         let matrix = config.matrix.expect("Matrix config");
         assert_eq!(matrix.rooms.len(), 1);
+        assert!(matrix.rooms[0].require_mention);
         assert!(matrix.rooms[0].permits("@operator:matrix.example"));
         assert!(!matrix.rooms[0].permits("@intruder:matrix.example"));
     }

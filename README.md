@@ -348,6 +348,11 @@ Matrix is optional. Add `[matrix]` and one or more `[[matrix.rooms]]` policies a
 shown in `config.example.toml`. Each room and user is explicitly allowlisted;
 unlisted rooms, users, bot-authored events, and unsupported event types are
 ignored. Rooms must already exist and the access-token user must be joined.
+Set `require_mention = true` for a shared room: a room-level message then starts
+an OMP conversation only when its `m.mentions` metadata names the bot. The bot's
+reply and every subsequent event remain in a native Matrix thread rooted at that
+mention. Each root has independent durable OMP history. Messages already inside
+a native thread continue that thread without repeating the mention.
 
 Store the Matrix access token in the protected file referenced by
 `matrix.access_token_file` with mode `0600`. `matrix.session_store_path` holds the

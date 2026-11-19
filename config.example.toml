@@ -17,6 +17,7 @@ cwd = "~/src/project"
 # [[matrix.rooms]]
 # id = "!room:matrix.example.org"
 # allowed_users = ["@operator:matrix.example.org"]
+# require_mention = true
 # cwd = "~/src/project"
 
 [omp]
