@@ -2532,6 +2532,7 @@ mod tests {
                 thread_auto_archive_minutes: 1440,
                 guilds: vec![routing_policy()],
             },
+            matrix: None,
             omp: OmpConfig {
                 executable: root.join("must-not-run"),
                 session_dir: root.join("sessions"),

@@ -11,13 +11,21 @@ use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use tokio::sync::RwLock;
 
 use crate::domain::{
-    MessageId, NewSession, Session, SessionStatus, ThreadId, Turn, TurnCounts, TurnStatus, UserId,
+    ClientConversationId, ConversationId, MessageId, NewSession, Session, SessionStatus, ThreadId,
+    Turn, TurnCounts, TurnStatus, UserId,
 };
 
 const MAX_PENDING_TURNS_PER_THREAD: i64 = 64;
 pub const MAX_BOT_EXCHANGES: usize = 8;
 
 const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS client_conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_kind TEXT NOT NULL CHECK (client_kind IN ('discord', 'matrix')),
+    native_id TEXT NOT NULL,
+    UNIQUE(client_kind, native_id)
+);
+
 CREATE TABLE IF NOT EXISTS excluded_threads (
     thread_id TEXT PRIMARY KEY NOT NULL,
     excluded_at_ms INTEGER NOT NULL
@@ -25,6 +33,7 @@ CREATE TABLE IF NOT EXISTS excluded_threads (
 
 CREATE TABLE IF NOT EXISTS sessions (
     thread_id TEXT PRIMARY KEY NOT NULL,
+    conversation_id INTEGER REFERENCES client_conversations(id),
     guild_id TEXT NOT NULL,
     parent_channel_id TEXT NOT NULL,
     trigger_message_id TEXT NOT NULL UNIQUE,
@@ -39,6 +48,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS turns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id TEXT NOT NULL REFERENCES sessions(thread_id) ON DELETE CASCADE,
+    conversation_id INTEGER REFERENCES client_conversations(id),
     discord_message_id TEXT NOT NULL UNIQUE,
     author_id TEXT NOT NULL,
     content TEXT NOT NULL,
@@ -136,6 +146,10 @@ impl Store {
                 "ALTER TABLE sessions ADD COLUMN latest_human_message_id TEXT",
             ),
             ("model", "ALTER TABLE sessions ADD COLUMN model TEXT"),
+            (
+                "conversation_id",
+                "ALTER TABLE sessions ADD COLUMN conversation_id INTEGER REFERENCES client_conversations(id)",
+            ),
         ] {
             let existing: Option<String> =
                 sqlx::query_scalar("SELECT name FROM pragma_table_info('sessions') WHERE name = ?")
@@ -146,6 +160,51 @@ impl Store {
                 sqlx::query(migration).execute(&mut *transaction).await?;
             }
         }
+        let turn_conversation_column: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('turns') WHERE name = 'conversation_id'",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if turn_conversation_column.is_none() {
+            sqlx::query(
+                "ALTER TABLE turns ADD COLUMN conversation_id INTEGER REFERENCES client_conversations(id)",
+            )
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO client_conversations (client_kind, native_id)
+             SELECT 'discord', thread_id FROM sessions WHERE true
+             ON CONFLICT(client_kind, native_id) DO NOTHING",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE sessions
+             SET conversation_id = (
+                 SELECT id FROM client_conversations
+                 WHERE client_kind = 'discord' AND native_id = sessions.thread_id
+             )
+             WHERE conversation_id IS NULL",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE turns
+             SET conversation_id = (
+                 SELECT sessions.conversation_id FROM sessions
+                 WHERE sessions.thread_id = turns.thread_id
+             )
+             WHERE conversation_id IS NULL",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::raw_sql(
+            "CREATE INDEX IF NOT EXISTS sessions_conversation_id_idx ON sessions(conversation_id);
+             CREATE INDEX IF NOT EXISTS turns_conversation_status_id_idx ON turns(conversation_id, status, id);",
+        )
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(Self {
             pool,
@@ -162,6 +221,52 @@ impl Store {
             .entry(thread_id)
             .or_insert_with(|| Arc::new(RwLock::new(())))
             .clone()
+    }
+
+    pub async fn conversation_id(
+        &self,
+        key: &ClientConversationId,
+    ) -> Result<Option<ConversationId>> {
+        let id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM client_conversations WHERE client_kind = ? AND native_id = ?",
+        )
+        .bind(key.client().as_str())
+        .bind(key.native())
+        .fetch_optional(&self.pool)
+        .await?;
+        id.map(ConversationId::new).transpose().map_err(Into::into)
+    }
+
+    pub async fn ensure_conversation(
+        &self,
+        key: &ClientConversationId,
+    ) -> Result<ConversationId> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let id = Self::ensure_conversation_in(&mut transaction, key).await?;
+        transaction.commit().await?;
+        Ok(id)
+    }
+
+    async fn ensure_conversation_in(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        key: &ClientConversationId,
+    ) -> Result<ConversationId> {
+        sqlx::query(
+            "INSERT INTO client_conversations (client_kind, native_id) VALUES (?, ?)
+             ON CONFLICT(client_kind, native_id) DO NOTHING",
+        )
+        .bind(key.client().as_str())
+        .bind(key.native())
+        .execute(&mut **transaction)
+        .await?;
+        let id: i64 = sqlx::query_scalar(
+            "SELECT id FROM client_conversations WHERE client_kind = ? AND native_id = ?",
+        )
+        .bind(key.client().as_str())
+        .bind(key.native())
+        .fetch_one(&mut **transaction)
+        .await?;
+        Ok(ConversationId::new(id)?)
     }
 
     pub async fn is_thread_excluded(&self, thread_id: ThreadId) -> Result<bool> {
@@ -206,11 +311,16 @@ impl Store {
     pub async fn create_session(&self, input: &NewSession) -> Result<CreateSessionResult> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         require_thread_admitted(&mut transaction, input.thread_id).await?;
+        let input_key =
+            ClientConversationId::discord(input.thread_id.get()).expect("valid Discord thread id");
+        let input_conversation_id =
+            Self::ensure_conversation_in(&mut transaction, &input_key).await?;
         let now = now_ms()?;
         let result = sqlx::query(
-            "INSERT INTO sessions (thread_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO sessions (thread_id, conversation_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?) ON CONFLICT DO NOTHING",
         )
         .bind(input.thread_id.to_string())
+        .bind(input_conversation_id.get())
         .bind(input.guild_id.to_string())
         .bind(input.parent_channel_id.to_string())
         .bind(input.trigger_message_id.to_string())
@@ -244,6 +354,17 @@ impl Store {
     pub async fn session(&self, thread_id: ThreadId) -> Result<Option<Session>> {
         let row = sqlx::query("SELECT * FROM sessions WHERE thread_id = ?")
             .bind(thread_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| session_from_row(&row)).transpose()
+    }
+
+    pub async fn session_by_conversation(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Option<Session>> {
+        let row = sqlx::query("SELECT * FROM sessions WHERE conversation_id = ?")
+            .bind(conversation_id.get())
             .fetch_optional(&self.pool)
             .await?;
         row.map(|row| session_from_row(&row)).transpose()
@@ -383,7 +504,7 @@ impl Store {
             return Ok(EnqueueResult::Duplicate);
         }
         let session = sqlx::query(
-            "SELECT status, bot_exchange_count, latest_human_message_id FROM sessions WHERE thread_id = ?",
+            "SELECT status, conversation_id, bot_exchange_count, latest_human_message_id FROM sessions WHERE thread_id = ?",
         )
         .bind(thread_id.to_string())
         .fetch_optional(&mut *transaction)
@@ -392,6 +513,9 @@ impl Store {
         if session.try_get::<&str, _>("status")? != "active" {
             bail!("cannot enqueue a turn in a stopped session");
         }
+        let conversation_id: i64 = session
+            .try_get::<Option<i64>, _>("conversation_id")?
+            .context("session is missing its client conversation mapping")?;
         let pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM turns WHERE thread_id = ? AND status IN ('queued', 'running')",
         )
@@ -410,9 +534,10 @@ impl Store {
         let resets_budget =
             source == TurnSource::Human && is_new_human_message(&session, message_id)?;
         let result = sqlx::query(
-            "INSERT INTO turns (thread_id, discord_message_id, author_id, content, status, created_at_ms) VALUES (?, ?, ?, ?, 'queued', ?) ON CONFLICT(discord_message_id) DO NOTHING",
+            "INSERT INTO turns (thread_id, conversation_id, discord_message_id, author_id, content, status, created_at_ms) VALUES (?, ?, ?, ?, ?, 'queued', ?) ON CONFLICT(discord_message_id) DO NOTHING",
         )
         .bind(thread_id.to_string())
+        .bind(conversation_id)
         .bind(message_id.to_string())
         .bind(author_id.to_string())
         .bind(content)
@@ -618,6 +743,19 @@ impl Store {
             .map(|row| parse_id(row.try_get::<String, _>("thread_id")?, "thread_id"))
             .collect()
     }
+
+    pub async fn queued_conversation_ids(&self) -> Result<Vec<ConversationId>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT conversation_id FROM turns
+             WHERE status = 'queued' AND conversation_id IS NOT NULL
+             ORDER BY conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok(ConversationId::new(row.try_get("conversation_id")?)?))
+            .collect()
+    }
 }
 
 async fn require_thread_admitted(
@@ -650,6 +788,7 @@ fn is_new_human_message(row: &sqlx::sqlite::SqliteRow, message_id: MessageId) ->
 
 fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Session> {
     Ok(Session {
+        conversation_id: ConversationId::new(row.try_get("conversation_id")?)?,
         thread_id: parse_id(row.try_get("thread_id")?, "thread_id")?,
         guild_id: parse_id(row.try_get("guild_id")?, "guild_id")?,
         parent_channel_id: parse_id(row.try_get("parent_channel_id")?, "parent_channel_id")?,
@@ -666,6 +805,7 @@ fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Session> {
 
 fn turn_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Turn> {
     Ok(Turn {
+        conversation_id: ConversationId::new(row.try_get("conversation_id")?)?,
         id: row.try_get("id")?,
         thread_id: parse_id(row.try_get("thread_id")?, "thread_id")?,
         discord_message_id: parse_id(row.try_get("discord_message_id")?, "discord_message_id")?,
@@ -706,7 +846,10 @@ fn now_ms() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ChannelId, GuildId, MessageId, NewSession, ThreadId, UserId};
+    use crate::domain::{
+        ChannelId, ClientConversationId, ClientKind, GuildId, MessageId, NewSession, ThreadId,
+        UserId,
+    };
 
     async fn test_store() -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -725,6 +868,77 @@ mod tests {
             cwd: std::env::temp_dir(),
             created_by_user_id: UserId::new(3),
         }
+    }
+
+    #[tokio::test]
+    async fn conversation_keys_are_client_scoped() {
+        let (_directory, store) = test_store().await;
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        let discord = ClientConversationId::discord(10).unwrap();
+        let matrix =
+            ClientConversationId::scoped(ClientKind::Matrix, "10").expect("Matrix room id");
+
+        let discord_id = store
+            .conversation_id(&discord)
+            .await
+            .unwrap()
+            .expect("Discord conversation mapping");
+        store
+            .enqueue_turn(
+                ThreadId::new(10),
+                MessageId::new(30),
+                UserId::new(3),
+                "prompt",
+                TurnSource::Human,
+            )
+            .await
+            .unwrap();
+        let turn_conversation_id: i64 =
+            sqlx::query_scalar("SELECT conversation_id FROM turns WHERE discord_message_id = '30'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(turn_conversation_id, discord_id.get());
+        assert_eq!(
+            store
+                .session_by_conversation(discord_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .thread_id,
+            ThreadId::new(10)
+        );
+        assert_eq!(store.queued_conversation_ids().await.unwrap(), vec![discord_id]);
+        assert!(store.conversation_id(&matrix).await.unwrap().is_none());
+
+        let matrix_id = store.ensure_conversation(&matrix).await.unwrap();
+
+        assert_ne!(discord_id, matrix_id);
+        assert_eq!(
+            store.conversation_id(&matrix).await.unwrap(),
+            Some(matrix_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_existing_discord_state_backfills_conversation_keys() {
+        let (directory, store) = test_store().await;
+        store.create_session(&new_session(10, 20)).await.unwrap();
+        sqlx::query("UPDATE sessions SET conversation_id = NULL")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM client_conversations")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store.pool.close().await;
+
+        let reopened = Store::open(&directory.path().join("bridge.sqlite"))
+            .await
+            .unwrap();
+        let key = ClientConversationId::discord(10).unwrap();
+        assert!(reopened.conversation_id(&key).await.unwrap().is_some());
     }
 
     #[tokio::test]

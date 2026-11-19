@@ -1778,7 +1778,7 @@ mod tests {
         },
     };
 
-    use crate::domain::{MessageId, UserId};
+    use crate::domain::{ConversationId, MessageId, UserId};
 
     #[derive(Debug)]
     struct Recorded {
@@ -1911,6 +1911,7 @@ mod tests {
 
     fn turn(id: i64) -> Turn {
         Turn {
+            conversation_id: ConversationId::new(1).unwrap(),
             id,
             thread_id: ThreadId::new(1),
             discord_message_id: MessageId::new(u64::try_from(id).unwrap()),

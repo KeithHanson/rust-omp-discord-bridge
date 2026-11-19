@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use omp_discord_bridge::{
     config::AppConfig,
     domain::{
-        ChannelId, GuildId, MessageId, Session, SessionStatus, ThreadId, Turn, TurnStatus, UserId,
+        ChannelId, ConversationId, GuildId, MessageId, Session, SessionStatus, ThreadId, Turn,
+        TurnStatus, UserId,
     },
     omp::{ApprovalRequest, OmpTransport, OmpTurnError, OmpUi, TurnControl, TurnInput},
 };
@@ -83,6 +84,7 @@ impl OmpUi for Ui {
 
 fn turn(id: i64, content: &str) -> Turn {
     Turn {
+        conversation_id: ConversationId::new(1).unwrap(),
         id,
         thread_id: ThreadId::new(1),
         discord_message_id: MessageId::new(id as u64),
@@ -110,6 +112,7 @@ async fn main() -> Result<()> {
     transport.probe().await?;
     println!("PASS real OMP RPC startup and clean shutdown");
     let mut session = Session {
+        conversation_id: ConversationId::new(1)?,
         thread_id: ThreadId::new(1),
         guild_id: GuildId::new(1),
         parent_channel_id: ChannelId::new(1),
