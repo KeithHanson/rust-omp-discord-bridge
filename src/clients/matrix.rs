@@ -86,7 +86,7 @@ impl MatrixHttp {
         if media_id.is_empty() || media_id.contains('/') {
             bail!("Matrix attachment URL has an invalid media ID");
         }
-        let url = self.endpoint(&["_matrix", "media", "v3", "download", server, media_id])?;
+        let url = self.endpoint(&["_matrix", "client", "v1", "media", "download", server, media_id])?;
         let response = self.client.get(url).bearer_auth(&*self.token).send().await?;
         let status = response.status();
         if !status.is_success() {
