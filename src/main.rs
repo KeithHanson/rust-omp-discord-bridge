@@ -3,7 +3,7 @@ use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use omp_discord_bridge::{
-    clients::discord, config::AppConfig, omp::OmpTransport, store::Store, threadwatch,
+    clients, config::AppConfig, omp::OmpTransport, store::Store, threadwatch,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -85,7 +85,7 @@ async fn execute(cli: Cli) -> Result<()> {
     let (command_sender, command_receiver) = tokio::sync::mpsc::channel(32);
     let collector = collector_config(&config, command_sender)?;
     if matches!(cli.command, Some(Command::CheckUpdate)) {
-        drop(config.discord.load_token()?);
+        validate_client_tokens(&config)?;
         let transport = OmpTransport::new(
             config.omp,
             Duration::from_secs(config.runtime.turn_timeout_seconds),
@@ -116,14 +116,14 @@ async fn execute(cli: Cli) -> Result<()> {
                     }
                 })
             });
-            let result = discord::run(config, store, command_receiver, &config_path).await;
+            let result = clients::run(config, store, &config_path).await;
             if let Some(task) = reporting {
                 task.abort();
             }
             result
         }
         Command::Check => {
-            drop(config.discord.load_token()?);
+            validate_client_tokens(&config)?;
             let transport = OmpTransport::new(
                 config.omp,
                 Duration::from_secs(config.runtime.turn_timeout_seconds),
@@ -131,11 +131,19 @@ async fn execute(cli: Cli) -> Result<()> {
                 config.runtime.discord_history_max_days,
             );
             transport.probe().await?;
-            println!("configuration, SQLite, Discord token, and OMP RPC startup are valid");
+            println!("configuration, SQLite, client tokens, and OMP RPC startup are valid");
             Ok(())
         }
         Command::CheckUpdate => unreachable!("handled before opening the database"),
     }
+}
+
+fn validate_client_tokens(config: &AppConfig) -> Result<()> {
+    drop(config.discord.load_token()?);
+    if let Some(matrix) = &config.matrix {
+        drop(matrix.load_access_token()?);
+    }
+    Ok(())
 }
 
 fn expand_cli_home(path: PathBuf) -> Result<PathBuf> {

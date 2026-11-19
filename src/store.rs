@@ -11,8 +11,8 @@ use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use tokio::sync::RwLock;
 
 use crate::domain::{
-    ClientConversationId, ConversationId, MessageId, NewSession, Session, SessionStatus, ThreadId,
-    Turn, TurnCounts, TurnStatus, UserId,
+    ActorId, ClientConversationId, ClientKind, ConversationId, EventId, MessageId, NewSession,
+    Session, SessionStatus, ThreadId, Turn, TurnCounts, TurnStatus, UserId,
 };
 
 const MAX_PENDING_TURNS_PER_THREAD: i64 = 64;
@@ -20,6 +20,20 @@ pub const MAX_BOT_EXCHANGES: usize = 8;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS client_conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_kind TEXT NOT NULL CHECK (client_kind IN ('discord', 'matrix')),
+    native_id TEXT NOT NULL,
+    UNIQUE(client_kind, native_id)
+);
+
+CREATE TABLE IF NOT EXISTS client_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_kind TEXT NOT NULL CHECK (client_kind IN ('discord', 'matrix')),
+    native_id TEXT NOT NULL,
+    UNIQUE(client_kind, native_id)
+);
+
+CREATE TABLE IF NOT EXISTS client_actors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     client_kind TEXT NOT NULL CHECK (client_kind IN ('discord', 'matrix')),
     native_id TEXT NOT NULL,
@@ -278,6 +292,44 @@ impl Store {
         .await?)
     }
 
+    pub async fn ensure_event(&self, key: &EventId) -> Result<MessageId> {
+        sqlx::query(
+            "INSERT INTO client_events (client_kind, native_id) VALUES (?, ?)
+             ON CONFLICT(client_kind, native_id) DO NOTHING",
+        )
+        .bind(key.client().as_str())
+        .bind(key.native())
+        .execute(&self.pool)
+        .await?;
+        let id: i64 = sqlx::query_scalar(
+            "SELECT id FROM client_events WHERE client_kind = ? AND native_id = ?",
+        )
+        .bind(key.client().as_str())
+        .bind(key.native())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(MessageId::new(u64::try_from(id)?))
+    }
+
+    pub async fn ensure_actor(&self, key: &ActorId) -> Result<UserId> {
+        sqlx::query(
+            "INSERT INTO client_actors (client_kind, native_id) VALUES (?, ?)
+             ON CONFLICT(client_kind, native_id) DO NOTHING",
+        )
+        .bind(key.client().as_str())
+        .bind(key.native())
+        .execute(&self.pool)
+        .await?;
+        let id: i64 = sqlx::query_scalar(
+            "SELECT id FROM client_actors WHERE client_kind = ? AND native_id = ?",
+        )
+        .bind(key.client().as_str())
+        .bind(key.native())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(UserId::new(u64::try_from(id)?))
+    }
+
     /// Persist exclusion even for an unmanaged thread; preserve history and running turns.
     /// The caller holds the thread's write guard and cancels running work after committing.
     pub async fn exclude_thread(&self, thread_id: ThreadId) -> Result<()> {
@@ -309,18 +361,25 @@ impl Store {
     }
 
     pub async fn create_session(&self, input: &NewSession) -> Result<CreateSessionResult> {
+        let key =
+            ClientConversationId::discord(input.thread_id.get()).expect("valid Discord thread id");
+        let conversation_id = self.ensure_conversation(&key).await?;
+        self.create_session_for_conversation(conversation_id, input).await
+    }
+
+    pub async fn create_session_for_conversation(
+        &self,
+        conversation_id: ConversationId,
+        input: &NewSession,
+    ) -> Result<CreateSessionResult> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         require_thread_admitted(&mut transaction, input.thread_id).await?;
-        let input_key =
-            ClientConversationId::discord(input.thread_id.get()).expect("valid Discord thread id");
-        let input_conversation_id =
-            Self::ensure_conversation_in(&mut transaction, &input_key).await?;
         let now = now_ms()?;
         let result = sqlx::query(
             "INSERT INTO sessions (thread_id, conversation_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?) ON CONFLICT DO NOTHING",
         )
         .bind(input.thread_id.to_string())
-        .bind(input_conversation_id.get())
+        .bind(conversation_id.get())
         .bind(input.guild_id.to_string())
         .bind(input.parent_channel_id.to_string())
         .bind(input.trigger_message_id.to_string())
@@ -744,6 +803,27 @@ impl Store {
             .collect()
     }
 
+    pub async fn queued_thread_ids_for(&self, client: ClientKind) -> Result<Vec<ThreadId>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT turns.thread_id
+             FROM turns
+             JOIN client_conversations ON client_conversations.id = turns.conversation_id
+             WHERE turns.status = 'queued'
+               AND client_conversations.client_kind = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM excluded_threads
+                   WHERE excluded_threads.thread_id = turns.thread_id
+               )
+             ORDER BY turns.thread_id",
+        )
+        .bind(client.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| parse_id(row.try_get::<String, _>("thread_id")?, "thread_id"))
+            .collect()
+    }
+
     pub async fn queued_conversation_ids(&self) -> Result<Vec<ConversationId>> {
         let rows = sqlx::query(
             "SELECT DISTINCT conversation_id FROM turns
@@ -918,6 +998,50 @@ mod tests {
             store.conversation_id(&matrix).await.unwrap(),
             Some(matrix_id)
         );
+        let matrix_thread = ThreadId::new(u64::try_from(matrix_id.get()).unwrap());
+        let mut matrix_session = new_session(matrix_thread.get(), 40);
+        matrix_session.created_by_user_id = UserId::new(4);
+        store
+            .create_session_for_conversation(matrix_id, &matrix_session)
+            .await
+            .unwrap();
+        store
+            .enqueue_turn(
+                matrix_thread,
+                MessageId::new(50),
+                UserId::new(4),
+                "matrix prompt",
+                TurnSource::Human,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.queued_thread_ids_for(ClientKind::Discord).await.unwrap(),
+            vec![ThreadId::new(10)]
+        );
+        assert_eq!(
+            store.queued_thread_ids_for(ClientKind::Matrix).await.unwrap(),
+            vec![matrix_thread]
+        );
+    }
+
+    #[tokio::test]
+    async fn client_event_and_actor_ids_are_durable_and_namespaced() {
+        let (directory, store) = test_store().await;
+        let matrix_event = EventId::scoped(ClientKind::Matrix, "same").unwrap();
+        let discord_event = EventId::scoped(ClientKind::Discord, "same").unwrap();
+        let actor = ActorId::scoped(ClientKind::Matrix, "@operator:example.org").unwrap();
+
+        let matrix_id = store.ensure_event(&matrix_event).await.unwrap();
+        assert_eq!(store.ensure_event(&matrix_event).await.unwrap(), matrix_id);
+        assert_ne!(store.ensure_event(&discord_event).await.unwrap(), matrix_id);
+        let actor_id = store.ensure_actor(&actor).await.unwrap();
+        assert_eq!(store.ensure_actor(&actor).await.unwrap(), actor_id);
+        store.pool.close().await;
+
+        let reopened = Store::open(&directory.path().join("bridge.sqlite")).await.unwrap();
+        assert_eq!(reopened.ensure_event(&matrix_event).await.unwrap(), matrix_id);
+        assert_eq!(reopened.ensure_actor(&actor).await.unwrap(), actor_id);
     }
 
     #[tokio::test]

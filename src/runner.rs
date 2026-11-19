@@ -343,6 +343,22 @@ impl ThreadQueueRunner {
         message_limit: usize,
         max_concurrency: usize,
     ) -> Arc<Self> {
+        Self::new_with_permits(
+            store,
+            transport,
+            messenger,
+            message_limit,
+            Arc::new(Semaphore::new(max_concurrency)),
+        )
+    }
+
+    pub fn new_with_permits(
+        store: Store,
+        transport: Arc<dyn AgentTransport>,
+        messenger: Arc<dyn ThreadMessenger>,
+        message_limit: usize,
+        permits: Arc<Semaphore>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             transport,
@@ -352,7 +368,7 @@ impl ThreadQueueRunner {
             },
             messenger,
             message_limit,
-            permits: Arc::new(Semaphore::new(max_concurrency)),
+            permits,
             draining: Mutex::new(HashMap::new()),
             active: StdMutex::new(HashMap::new()),
             presence: Arc::new(PresenceTracker::default()),
@@ -613,6 +629,10 @@ impl ThreadQueueRunner {
             counts.uncertain,
             usage
         ))
+    }
+
+    pub async fn notify(&self, thread_id: ThreadId, message: &str) {
+        self.messenger.notify(thread_id, message).await;
     }
 
     /// Wait for turn execution and message/activity delivery, not title reconciliation.

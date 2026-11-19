@@ -29,13 +29,13 @@ use serenity::{
     http::{LightMethod, Request, Route},
 };
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Semaphore, oneshot, watch},
     time::Instant,
 };
 
 use crate::{
     config::{AppConfig, GuildPolicy},
-    domain::{ChannelId, GuildId, MessageId, NewSession, SessionStatus, ThreadId, UserId},
+    domain::{ChannelId, ClientKind, GuildId, MessageId, NewSession, SessionStatus, ThreadId, UserId},
     omp::{ApprovalRequest, OmpTransport},
     presence::PresenceSnapshot,
     render::{chunk_message, thread_name},
@@ -71,12 +71,7 @@ impl ReviewTitle for TitleReviewer {
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run(
-    config: AppConfig,
-    store: Store,
-    command_receiver: mpsc::Receiver<ControlCommand>,
-    config_path: &std::path::Path,
-) -> Result<()> {
+pub async fn run(config: AppConfig, store: Store, config_path: &std::path::Path, permits: Arc<Semaphore>) -> Result<()> {
     let token = config.discord.load_token()?;
     let config = Arc::new(config);
     let http = Arc::new(Http::new(&token));
@@ -98,12 +93,12 @@ pub async fn run(
         config.runtime.max_response_bytes,
         config.runtime.discord_history_max_days,
     ));
-    let runner = ThreadQueueRunner::new(
+    let runner = ThreadQueueRunner::new_with_permits(
         store.clone(),
         transport,
         messenger,
         config.runtime.discord_message_limit,
-        config.runtime.max_concurrency,
+        permits,
     );
     let bot_user_id = Arc::new(AtomicU64::new(0));
     let presence = runner.subscribe_presence();
@@ -126,7 +121,7 @@ pub async fn run(
         .await
         .context("failed to create Discord client")?;
 
-    for thread_id in store.queued_thread_ids().await? {
+    for thread_id in store.queued_thread_ids_for(ClientKind::Discord).await? {
         runner.poke(thread_id).await;
     }
 
