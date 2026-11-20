@@ -107,6 +107,11 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-19-2
+
+Rebuilds the multi-client release with the second release counter for the day.
+Behavior is unchanged from 2026-11-19-1.
+
 ### Release 2026-11-19-1
 
 Refactors the Discord bridge around client-scoped conversations and adds an
