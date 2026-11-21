@@ -1,5 +1,5 @@
 [discord]
-token_file = "~/.config/omp-discord-bridge/discord-token"
+token_file = "~/.config/omp-client-bridge/discord-token"
 thread_auto_archive_minutes = 1440
 
 [[discord.guilds]]
@@ -8,9 +8,21 @@ allowed_channels = ["234567890123456789"]
 allowed_users = ["345678901234567890"]
 cwd = "~/src/project"
 
+# Optional Matrix adapter. Rooms and users are default-deny.
+# [matrix]
+# homeserver_url = "https://matrix.example.org"
+# access_token_file = "~/.config/omp-client-bridge/matrix-token"
+# session_store_path = "~/.local/state/omp-client-bridge/matrix-sync-token"
+#
+# [[matrix.rooms]]
+# id = "!room:matrix.example.org"
+# allowed_users = ["@operator:matrix.example.org"]
+# require_mention = true
+# cwd = "~/src/project"
+
 [omp]
 executable = "omp"
-session_dir = "~/.local/state/omp-discord-bridge/omp-sessions"
+session_dir = "~/.local/state/omp-client-bridge/omp-sessions"
 allowed_root = "~/src"
 # Omit model to use OMP's configured default, or set an exact provider/model ID.
 # model = "openai-codex/gpt-5.6-sol"
@@ -19,7 +31,7 @@ allowed_root = "~/src"
 # title_model = "openai-codex/gpt-5.6-sol"
 
 [runtime]
-database_path = "~/.local/state/omp-discord-bridge/bridge.sqlite"
+database_path = "~/.local/state/omp-client-bridge/bridge.sqlite"
 max_concurrency = 2
 discord_message_limit = 1900
 max_attachment_bytes = 25000000
@@ -35,7 +47,7 @@ turn_timeout_seconds = 3600
 # the former standalone collector so pending batches/checkpoints remain intact.
 # [threadwatch]
 # server_url = "http://192.168.192.183:8787"
-# ingest_token_file = "~/.config/omp-discord-bridge/threadwatch-ingest-token"
+# ingest_token_file = "~/.config/omp-client-bridge/threadwatch-ingest-token"
 # bot_id = "hephaestus"
 # bot_name = "Hephaestus"
 # data_dir = "~/.local/state/threadwatch-collector"

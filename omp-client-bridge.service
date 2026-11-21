@@ -1,5 +1,5 @@
 [Unit]
-Description=OMP Discord Bridge
+Description=OMP Client Bridge
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
@@ -12,7 +12,7 @@ WorkingDirectory=/home/hephaestus
 Environment=HOME=/home/hephaestus
 Environment=PATH=/home/hephaestus/.local/share/mise/installs/oh-my-pi/latest:/home/hephaestus/.local/share/mise/shims:/home/hephaestus/.cargo/bin:/home/hephaestus/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
 Environment=RUST_LOG=info
-ExecStart=/home/hephaestus/src/personal/rust-omp-discord-bridge/target/release/omp-discord-bridge --config /home/hephaestus/.config/omp-discord-bridge/config.toml run
+ExecStart=/home/hephaestus/src/personal/omp-client-bridge/target/release/omp-client-bridge --config /home/hephaestus/.config/omp-client-bridge/config.toml run
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=45

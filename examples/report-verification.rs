@@ -7,10 +7,11 @@ use std::{
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
-use omp_discord_bridge::{
+use omp_client_bridge::{
     config::AppConfig,
     domain::{
-        ChannelId, GuildId, MessageId, Session, SessionStatus, ThreadId, Turn, TurnStatus, UserId,
+        ChannelId, ConversationId, GuildId, MessageId, Session, SessionStatus, ThreadId, Turn,
+        TurnStatus, UserId,
     },
     omp::{ApprovalRequest, OmpTransport, OmpTurnError, OmpUi, TurnControl, TurnInput},
 };
@@ -76,13 +77,14 @@ impl OmpUi for Ui {
     async fn thread_participants(&self) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
-    async fn upload_file(&self, _: omp_discord_bridge::omp::UploadRequest) -> Result<String, String> {
+    async fn upload_file(&self, _: omp_client_bridge::omp::UploadRequest) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
 }
 
 fn turn(id: i64, content: &str) -> Turn {
     Turn {
+        conversation_id: ConversationId::new(1).unwrap(),
         id,
         thread_id: ThreadId::new(1),
         discord_message_id: MessageId::new(id as u64),
@@ -103,13 +105,14 @@ async fn main() -> Result<()> {
     std::fs::write(&overlay, "tools:\n  approvalMode: yolo\n")?;
     let home = std::env::var("HOME")?;
     let mut config =
-        AppConfig::load(&Path::new(&home).join(".config/omp-discord-bridge/config.toml"))?.omp;
+        AppConfig::load(&Path::new(&home).join(".config/omp-client-bridge/config.toml"))?.omp;
     config.allowed_root = workspace.clone();
     config.session_dir = sessions;
     let transport = OmpTransport::new(config, Duration::from_secs(180), 100_000, 1);
     transport.probe().await?;
     println!("PASS real OMP RPC startup and clean shutdown");
     let mut session = Session {
+        conversation_id: ConversationId::new(1)?,
         thread_id: ThreadId::new(1),
         guild_id: GuildId::new(1),
         parent_channel_id: ChannelId::new(1),

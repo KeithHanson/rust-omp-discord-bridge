@@ -117,25 +117,25 @@ git archive "$commit" | tar -xf - -C "$work/source"
 )
 
 binaries="$work/build/$target/release"
-for binary in omp-discord-bridge bridge-local; do
+for binary in omp-client-bridge bridge-local; do
     headers=$(readelf --program-headers "$binaries/$binary")
     dynamic=$(readelf --dynamic "$binaries/$binary")
     [[ $headers != *INTERP* && $dynamic != *'(NEEDED)'* ]] || fail "$binary is not a self-contained static executable."
 done
-actual_version=$("$binaries/omp-discord-bridge" --version)
-expected_version="omp-discord-bridge $version (${commit:0:7})"
+actual_version=$("$binaries/omp-client-bridge" --version)
+expected_version="omp-client-bridge $version (${commit:0:7})"
 [[ $actual_version == "$expected_version" ]] || fail "Built binary reports '$actual_version', expected '$expected_version'."
 
-bundle="omp-discord-bridge-$version-linux-x86_64"
-raw_asset=omp-discord-bridge-linux-x86_64
+bundle="omp-client-bridge-$version-linux-x86_64"
+raw_asset=omp-client-bridge-linux-x86_64
 mkdir -p -- "$root/target/releases"
 artifacts=$(mktemp -d "$root/target/releases/$tag.XXXXXX")
 mkdir -- "$work/$bundle"
-install -m 755 "$binaries/omp-discord-bridge" "$binaries/bridge-local" "$work/$bundle/"
-for file in .env.example config.example.toml config.container.example.toml omp-discord-bridge.service README.md LICENSE; do
+install -m 755 "$binaries/omp-client-bridge" "$binaries/bridge-local" "$work/$bundle/"
+for file in .env.example config.example.toml config.container.example.toml omp-client-bridge.service README.md LICENSE; do
     install -m 644 "$work/source/$file" "$work/$bundle/"
 done
-install -m 755 "$binaries/omp-discord-bridge" "$artifacts/$raw_asset"
+install -m 755 "$binaries/omp-client-bridge" "$artifacts/$raw_asset"
 # Stable archive metadata; the executables still depend on the Rust toolchain.
 epoch=$(git show -s --format=%ct "$commit")
 tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \

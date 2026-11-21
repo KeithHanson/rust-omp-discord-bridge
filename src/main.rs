@@ -2,8 +2,8 @@ use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use omp_discord_bridge::{
-    config::AppConfig, discord, omp::OmpTransport, store::Store, threadwatch,
+use omp_client_bridge::{
+    clients, config::AppConfig, omp::OmpTransport, store::Store, threadwatch,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -12,8 +12,8 @@ use tracing_subscriber::EnvFilter;
 struct Cli {
     #[arg(
         long,
-        env = "OMP_DISCORD_BRIDGE_CONFIG",
-        default_value = "~/.config/omp-discord-bridge/config.toml"
+        env = "OMP_CLIENT_BRIDGE_CONFIG",
+        default_value = "~/.config/omp-client-bridge/config.toml"
     )]
     config: PathBuf,
 
@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, Subcommand)]
 enum Command {
-    /// Start the Discord gateway.
+    /// Start all configured client adapters.
     Run,
     /// Validate configuration, database access, token presence, and OMP RPC startup.
     Check,
@@ -49,7 +49,10 @@ async fn main() -> ExitCode {
     }
 }
 
-fn collector_config(config: &AppConfig) -> Result<Option<threadwatch::Config>> {
+fn collector_config(
+    config: &AppConfig,
+    command_sender: tokio::sync::mpsc::Sender<threadwatch::ControlCommand>,
+) -> Result<Option<threadwatch::Config>> {
     let Some(reporting) = &config.threadwatch else {
         return Ok(None);
     };
@@ -72,15 +75,17 @@ fn collector_config(config: &AppConfig) -> Result<Option<threadwatch::Config>> {
         collect_interval: Duration::from_millis(reporting.collect_interval_ms),
         heartbeat_interval: Duration::from_millis(reporting.heartbeat_interval_ms),
         request_timeout: Duration::from_secs(10),
+        command_sender,
     }))
 }
 async fn execute(cli: Cli) -> Result<()> {
 
     let config_path = expand_cli_home(cli.config)?;
     let config = AppConfig::load(&config_path)?;
-    let collector = collector_config(&config)?;
+    let (command_sender, command_receiver) = tokio::sync::mpsc::channel(32);
+    let collector = collector_config(&config, command_sender)?;
     if matches!(cli.command, Some(Command::CheckUpdate)) {
-        drop(config.discord.load_token()?);
+        validate_client_tokens(&config)?;
         let transport = OmpTransport::new(
             config.omp,
             Duration::from_secs(config.runtime.turn_timeout_seconds),
@@ -111,14 +116,14 @@ async fn execute(cli: Cli) -> Result<()> {
                     }
                 })
             });
-            let result = discord::run(config, store, &config_path).await;
+            let result = clients::run(config, store, command_receiver, &config_path).await;
             if let Some(task) = reporting {
                 task.abort();
             }
             result
         }
         Command::Check => {
-            drop(config.discord.load_token()?);
+            validate_client_tokens(&config)?;
             let transport = OmpTransport::new(
                 config.omp,
                 Duration::from_secs(config.runtime.turn_timeout_seconds),
@@ -126,11 +131,19 @@ async fn execute(cli: Cli) -> Result<()> {
                 config.runtime.discord_history_max_days,
             );
             transport.probe().await?;
-            println!("configuration, SQLite, Discord token, and OMP RPC startup are valid");
+            println!("configuration, SQLite, client tokens, and OMP RPC startup are valid");
             Ok(())
         }
         Command::CheckUpdate => unreachable!("handled before opening the database"),
     }
+}
+
+fn validate_client_tokens(config: &AppConfig) -> Result<()> {
+    drop(config.discord.load_token()?);
+    if let Some(matrix) = &config.matrix {
+        drop(matrix.load_access_token()?);
+    }
+    Ok(())
 }
 
 fn expand_cli_home(path: PathBuf) -> Result<PathBuf> {

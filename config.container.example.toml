@@ -8,6 +8,17 @@ allowed_channels = ["234567890123456789"]
 allowed_users = ["345678901234567890"]
 cwd = "/workspace"
 
+# Optional Matrix adapter. Mount /config/matrix-token read-only.
+# [matrix]
+# homeserver_url = "https://matrix.example.org"
+# access_token_file = "/config/matrix-token"
+# session_store_path = "/data/matrix-sync-token"
+#
+# [[matrix.rooms]]
+# id = "!room:matrix.example.org"
+# allowed_users = ["@operator:matrix.example.org"]
+# cwd = "/workspace"
+
 [omp]
 executable = "omp"
 session_dir = "/data/omp-sessions"

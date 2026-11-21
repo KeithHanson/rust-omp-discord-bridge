@@ -7,10 +7,10 @@ After=network-online.target
 Type=oneshot
 User=hephaestus
 Group=hephaestus
-WorkingDirectory=/home/hephaestus/src/personal/rust-omp-discord-bridge
+WorkingDirectory=/home/hephaestus/src/personal/omp-client-bridge
 Environment=HOME=/home/hephaestus
 Environment=PATH=/home/hephaestus/.local/share/mise/installs/oh-my-pi/latest:/usr/local/bin:/usr/bin
-ExecStart=/usr/bin/python /home/hephaestus/src/personal/rust-omp-discord-bridge/scripts/session-review.py
+ExecStart=/usr/bin/python /home/hephaestus/src/personal/omp-client-bridge/scripts/session-review.py
 TimeoutStartSec=6h
 TimeoutStopSec=30
 UMask=0077

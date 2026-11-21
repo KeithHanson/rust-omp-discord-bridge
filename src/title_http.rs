@@ -40,7 +40,7 @@ impl TitleHttp {
         Ok(Self {
             client: Client::builder()
                 .default_headers(headers)
-                .user_agent("rust-omp-discord-bridge")
+                .user_agent("omp-client-bridge")
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(REQUEST_TIMEOUT)

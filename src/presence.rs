@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::{Arc, Mutex}};
 
 use tokio::sync::watch;
 
-use crate::domain::ThreadId;
+use crate::domain::ConversationId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PresenceSnapshot {
@@ -26,14 +26,14 @@ impl ThreadPresence {
 }
 
 pub(crate) struct PresenceTracker {
-    threads: Mutex<HashMap<ThreadId, ThreadPresence>>,
+    conversations: Mutex<HashMap<ConversationId, ThreadPresence>>,
     snapshot: watch::Sender<PresenceSnapshot>,
 }
 
 impl Default for PresenceTracker {
     fn default() -> Self {
         Self {
-            threads: Mutex::new(HashMap::new()),
+            conversations: Mutex::new(HashMap::new()),
             snapshot: watch::channel(PresenceSnapshot::default()).0,
         }
     }
@@ -44,20 +44,30 @@ impl PresenceTracker {
         self.snapshot.subscribe()
     }
 
-    pub(crate) fn engage(self: &Arc<Self>, thread_id: ThreadId) -> WorkingPresence {
-        self.update(thread_id, |thread| thread.engaged += 1);
-        WorkingPresence { tracker: Arc::clone(self), thread_id }
+    pub(crate) fn engage(
+        self: &Arc<Self>,
+        conversation_id: ConversationId,
+    ) -> WorkingPresence {
+        self.update(conversation_id, |conversation| conversation.engaged += 1);
+        WorkingPresence {
+            tracker: Arc::clone(self),
+            conversation_id,
+        }
     }
 
-    fn update(&self, thread_id: ThreadId, update: impl FnOnce(&mut ThreadPresence)) {
+    fn update(
+        &self,
+        conversation_id: ConversationId,
+        update: impl FnOnce(&mut ThreadPresence),
+    ) {
         // Serialize the counters and publication together; no await or network I/O.
-        let mut threads = self.threads.lock().unwrap();
-        let thread = threads.entry(thread_id).or_default();
-        let before = thread.snapshot();
-        update(thread);
-        let after = thread.snapshot();
-        if thread.engaged == 0 && thread.approvals == 0 {
-            threads.remove(&thread_id);
+        let mut conversations = self.conversations.lock().unwrap();
+        let conversation = conversations.entry(conversation_id).or_default();
+        let before = conversation.snapshot();
+        update(conversation);
+        let after = conversation.snapshot();
+        if conversation.engaged == 0 && conversation.approvals == 0 {
+            conversations.remove(&conversation_id);
         }
         if before != after {
             self.snapshot.send_modify(|snapshot| {
@@ -71,19 +81,19 @@ impl PresenceTracker {
 
 pub(crate) struct WorkingPresence {
     tracker: Arc<PresenceTracker>,
-    thread_id: ThreadId,
+    conversation_id: ConversationId,
 }
 
 impl WorkingPresence {
     pub(crate) fn awaiting_approval(&self) -> ApprovalPresence<'_> {
-        self.tracker.update(self.thread_id, |thread| thread.approvals += 1);
+        self.tracker.update(self.conversation_id, |conversation| conversation.approvals += 1);
         ApprovalPresence(self)
     }
 }
 
 impl Drop for WorkingPresence {
     fn drop(&mut self) {
-        self.tracker.update(self.thread_id, |thread| thread.engaged -= 1);
+        self.tracker.update(self.conversation_id, |conversation| conversation.engaged -= 1);
     }
 }
 
@@ -91,7 +101,7 @@ pub(crate) struct ApprovalPresence<'a>(&'a WorkingPresence);
 
 impl Drop for ApprovalPresence<'_> {
     fn drop(&mut self) {
-        self.0.tracker.update(self.0.thread_id, |thread| thread.approvals -= 1);
+        self.0.tracker.update(self.0.conversation_id, |conversation| conversation.approvals -= 1);
     }
 }
 
@@ -103,9 +113,9 @@ mod tests {
     fn counts_unique_threads_and_nested_approvals_without_duplicate_updates() {
         let tracker = Arc::new(PresenceTracker::default());
         let mut snapshots = tracker.subscribe();
-        let first = tracker.engage(ThreadId::new(1));
-        let replacement = tracker.engage(ThreadId::new(1));
-        let second = tracker.engage(ThreadId::new(2));
+        let first = tracker.engage(ConversationId::new(1).unwrap());
+        let replacement = tracker.engage(ConversationId::new(1).unwrap());
+        let second = tracker.engage(ConversationId::new(2).unwrap());
         assert_eq!(*snapshots.borrow_and_update(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
         drop(replacement);
         assert!(!snapshots.has_changed().unwrap());
@@ -120,7 +130,7 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
-        assert!(tracker.threads.lock().unwrap().is_empty());
+        assert!(tracker.conversations.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -128,7 +138,7 @@ mod tests {
         let tracker = Arc::new(PresenceTracker::default());
         let snapshots = tracker.subscribe();
         let mut pending = Box::pin(async {
-            let working = tracker.engage(ThreadId::new(1));
+            let working = tracker.engage(ConversationId::new(1).unwrap());
             let _approval = working.awaiting_approval();
             std::future::pending::<()>().await;
         });
@@ -140,6 +150,6 @@ mod tests {
         assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 0, awaiting_approval: 1 });
         drop(pending);
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
-        assert!(tracker.threads.lock().unwrap().is_empty());
+        assert!(tracker.conversations.lock().unwrap().is_empty());
     }
 }

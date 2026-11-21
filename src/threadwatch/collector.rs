@@ -1,4 +1,5 @@
 use super::{
+    ControlCommand,
     bridge::{
         Bridge, BridgeReader, Cache, Cancellation, expand_path, load_bridges, private_database,
         private_directory, protected_token,
@@ -34,6 +35,7 @@ pub struct Config {
     pub collect_interval: Duration,
     pub heartbeat_interval: Duration,
     pub request_timeout: Duration,
+    pub command_sender: tokio::sync::mpsc::Sender<ControlCommand>,
 }
 
 impl Config {
@@ -91,6 +93,7 @@ impl Config {
             canonical_target(&data_dir)? != canonical_target(&server_dir)?,
             "Collector data directory must differ from server data directory"
         );
+        let (command_sender, _) = tokio::sync::mpsc::channel(1);
         Ok(Self {
             server_url: url.origin().ascii_serialization(),
             token,
@@ -99,6 +102,7 @@ impl Config {
             collect_interval: interval("TW_COLLECT_INTERVAL_MS", 2000, 2_147_483_647)?,
             heartbeat_interval: interval("TW_HEARTBEAT_INTERVAL_MS", 10_000, 30_000)?,
             request_timeout: Duration::from_secs(10),
+            command_sender,
         })
     }
 }
@@ -657,7 +661,8 @@ impl Transport {
         cancellation: &Cancellation,
     ) -> Result<Value> {
         ensure!(
-            matches!(path, "/api/ingest" | "/api/heartbeat"),
+            matches!(path, "/api/ingest" | "/api/heartbeat" | "/api/commands/poll")
+                || (path.starts_with("/api/commands/") && path.ends_with("/ack")),
             "Invalid collector API path"
         );
         tokio::select! {
@@ -784,6 +789,79 @@ async fn delivery_loop(
     }
 }
 
+async fn command_loop(
+    config: Arc<Config>,
+    cancellation: Arc<Cancellation>,
+) -> Result<()> {
+    let transport = Transport::new(&config)?;
+    let mut timer = tokio::time::interval(config.collect_interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = timer.tick() => {},
+        }
+        let response = match transport
+            .post(
+                "/api/commands/poll",
+                json!({"botId":config.bridge.id}).to_string(),
+                &cancellation,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        let commands = response["commands"]
+            .as_array()
+            .context("Reporting endpoint returned invalid commands")?;
+        for command in commands {
+            let id = command["id"]
+                .as_str()
+                .context("Reporting command has no id")?
+                .to_owned();
+            let thread_id = command["targetThreadId"]
+                .as_str()
+                .context("Reporting command has no target thread")?
+                .to_owned();
+            let text = command["text"]
+                .as_str()
+                .context("Reporting command has no text")?
+                .to_owned();
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            config
+                .command_sender
+                .send(ControlCommand {
+                    id: id.clone(),
+                    thread_id,
+                    text,
+                    response: response_tx,
+                })
+                .await
+                .map_err(|_| anyhow!("Bridge command receiver stopped"))?;
+            let outcome = response_rx
+                .await
+                .map_err(|_| anyhow!("Bridge command receiver dropped a response"))?;
+            let (accepted, error) = match outcome {
+                Ok(()) => (true, Value::Null),
+                Err(error) => (false, json!(error)),
+            };
+            if transport
+                .post(
+                    &format!("/api/commands/{id}/ack"),
+                    json!({"botId":config.bridge.id,"accepted":accepted,"error":error}).to_string(),
+                    &cancellation,
+                )
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+}
+
 async fn shutdown_signal() -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -903,7 +981,9 @@ pub async fn run(config: Config, once: bool) -> Result<()> {
             health.clone(),
             cancellation.clone(),
         ));
+        let mut commands = tokio::spawn(command_loop(config.clone(), cancellation.clone()));
         let mut delivery_consumed = false;
+        let mut commands_consumed = false;
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Ok(()),
@@ -916,10 +996,17 @@ pub async fn run(config: Config, once: bool) -> Result<()> {
                 delivery_consumed = true;
                 result.map_err(|_|anyhow!("Collector delivery task failed")).and_then(|result|result).and(Err(anyhow!("Collector delivery task stopped unexpectedly")))
             },
+            result = &mut commands => {
+                commands_consumed = true;
+                result.map_err(|_|anyhow!("Threadwatch command task failed")).and_then(|result|result).and(Err(anyhow!("Threadwatch command task stopped unexpectedly")))
+            },
         };
         cancellation.cancel();
         if !delivery_consumed {
             let _ = delivery.await;
+        }
+        if !commands_consumed {
+            let _ = commands.await;
         }
         result
     };

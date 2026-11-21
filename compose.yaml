@@ -1,4 +1,4 @@
-name: omp-discord-bridge
+name: omp-client-bridge
 
 services:
   bridge:
@@ -8,11 +8,11 @@ services:
         RUST_VERSION: "${RUST_VERSION:-1.99.1}"
         OMP_VERSION: "${OMP_VERSION:-18.20.0}"
         BRIDGE_BUILD_REVISION: "${BRIDGE_BUILD_REVISION:-}"
-    image: omp-discord-bridge:local
+    image: omp-client-bridge:local
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:
       HOME: /data
-      OMP_DISCORD_BRIDGE_CONFIG: /config/config.toml
+      OMP_CLIENT_BRIDGE_CONFIG: /config/config.toml
       RUST_LOG: "${RUST_LOG:-info}"
     volumes:
       - type: bind

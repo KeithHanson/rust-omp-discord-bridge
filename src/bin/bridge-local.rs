@@ -6,7 +6,7 @@ use std::{collections::HashMap, fs, io::Write, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use omp_discord_bridge::config::AppConfig;
+use omp_client_bridge::config::AppConfig;
 
 #[derive(Parser)]
 #[command(about = "Generate local bridge configuration from a protected .env and launch")]
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         }
     }
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
-    let directory = home.join(".config/omp-discord-bridge/local-env");
+    let directory = home.join(".config/omp-client-bridge/local-env");
     fs::create_dir_all(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     let token_path = directory.join("discord-token");
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     file.write_all(token.as_bytes())?;
     drop(file);
     drop(validated.discord.load_token()?);
-    let binary = std::env::current_exe()?.with_file_name("omp-discord-bridge");
+    let binary = std::env::current_exe()?.with_file_name("omp-client-bridge");
     let error = Command::new(binary)
         .arg("--config")
         .arg(config_path)

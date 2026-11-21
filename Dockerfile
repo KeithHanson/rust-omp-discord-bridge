@@ -7,7 +7,7 @@ WORKDIR /build
 ARG BRIDGE_BUILD_REVISION
 COPY Cargo.toml Cargo.lock build.rs VERSION ./
 COPY src ./src
-RUN BRIDGE_BUILD_REVISION="${BRIDGE_BUILD_REVISION}" cargo build --locked --release --bin omp-discord-bridge
+RUN BRIDGE_BUILD_REVISION="${BRIDGE_BUILD_REVISION}" cargo build --locked --release --bin omp-client-bridge
 
 FROM debian:bookworm-slim AS omp-installer
 
@@ -38,15 +38,15 @@ RUN apt-get update \
     && mkdir -p /config /data /workspace \
     && chown -R bridge:bridge /data /workspace
 
-COPY --from=builder /build/target/release/omp-discord-bridge /usr/local/bin/omp-discord-bridge
+COPY --from=builder /build/target/release/omp-client-bridge /usr/local/bin/omp-client-bridge
 COPY --from=omp-installer /opt/omp/omp /usr/local/bin/omp
 
 ENV HOME=/data \
-    OMP_DISCORD_BRIDGE_CONFIG=/config/config.toml \
+    OMP_CLIENT_BRIDGE_CONFIG=/config/config.toml \
     RUST_LOG=info
 
 WORKDIR /workspace
 USER bridge:bridge
 
-ENTRYPOINT ["omp-discord-bridge"]
+ENTRYPOINT ["omp-client-bridge"]
 CMD ["run"]

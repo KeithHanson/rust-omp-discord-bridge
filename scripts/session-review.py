@@ -276,7 +276,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=Path.home() / '.config/omp-discord-bridge/config.toml')
+    parser.add_argument('--config', type=Path, default=Path.home() / '.config/omp-client-bridge/config.toml')
     parser.add_argument('--output', type=Path, default=Path.home() / 'docs/session-reviews')
     parser.add_argument('--session-root', type=Path, action='append', help='Override scanned roots (repeatable)')
     args = parser.parse_args()

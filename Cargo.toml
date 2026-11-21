@@ -1,12 +1,12 @@
 [package]
-name = "omp-discord-bridge"
+name = "omp-client-bridge"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 publish = false
-description = "Discord gateway for persistent per-thread OMP sessions"
+description = "Discord and Matrix gateway for persistent OMP conversations"
 license = "MIT"
-default-run = "omp-discord-bridge"
+default-run = "omp-client-bridge"
 
 [dependencies]
 anyhow = "1.0"

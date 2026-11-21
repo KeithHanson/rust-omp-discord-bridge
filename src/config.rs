@@ -17,6 +17,7 @@ use crate::domain::{ChannelId, GuildId, UserId};
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub discord: DiscordConfig,
+    pub matrix: Option<MatrixConfig>,
     pub omp: OmpConfig,
     pub runtime: RuntimeConfig,
     pub threadwatch: Option<ThreadwatchConfig>,
@@ -36,6 +37,23 @@ pub struct GuildPolicy {
     pub allowed_users: HashSet<UserId>,
     pub cwd: PathBuf,
 }
+
+#[derive(Debug, Clone)]
+pub struct MatrixConfig {
+    pub homeserver_url: reqwest::Url,
+    pub access_token_file: PathBuf,
+    pub session_store_path: PathBuf,
+    pub rooms: Vec<MatrixRoomPolicy>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatrixRoomPolicy {
+    pub id: String,
+    pub allowed_users: HashSet<String>,
+    pub cwd: PathBuf,
+    pub require_mention: bool,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct OmpConfig {
@@ -77,6 +95,7 @@ pub struct RuntimeConfig {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     discord: RawDiscordConfig,
+    matrix: Option<RawMatrixConfig>,
     omp: RawOmpConfig,
     #[serde(default)]
     runtime: RawRuntimeConfig,
@@ -100,6 +119,26 @@ struct RawGuildPolicy {
     allowed_users: Vec<String>,
     cwd: PathBuf,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMatrixConfig {
+    homeserver_url: String,
+    access_token_file: PathBuf,
+    session_store_path: PathBuf,
+    rooms: Vec<RawMatrixRoomPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMatrixRoomPolicy {
+    id: String,
+    allowed_users: Vec<String>,
+    #[serde(default)]
+    require_mention: bool,
+    cwd: PathBuf,
+}
+
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,7 +185,7 @@ struct RawRuntimeConfig {
 impl Default for RawRuntimeConfig {
     fn default() -> Self {
         Self {
-            database_path: PathBuf::from("~/.local/state/omp-discord-bridge/bridge.sqlite"),
+            database_path: PathBuf::from("~/.local/state/omp-client-bridge/bridge.sqlite"),
             max_concurrency: 2,
             discord_message_limit: 1_900,
             max_attachment_bytes: 25_000_000,
@@ -281,6 +320,61 @@ impl AppConfig {
                 cwd,
             });
         }
+        let matrix = raw
+            .matrix
+            .map(|matrix| -> Result<MatrixConfig> {
+                let homeserver_url = reqwest::Url::parse(&matrix.homeserver_url)
+                    .context("matrix.homeserver_url must be an HTTP(S) origin")?;
+                if !matches!(homeserver_url.scheme(), "http" | "https")
+                    || !homeserver_url.username().is_empty()
+                    || homeserver_url.password().is_some()
+                    || homeserver_url.host_str().is_none()
+                    || homeserver_url.query().is_some()
+                    || homeserver_url.fragment().is_some()
+                {
+                    bail!("matrix.homeserver_url must be an HTTP(S) origin");
+                }
+                if matrix.rooms.is_empty() {
+                    bail!("matrix.rooms must contain at least one policy");
+                }
+                let mut room_ids = HashSet::new();
+                let mut rooms = Vec::with_capacity(matrix.rooms.len());
+                for policy in matrix.rooms {
+                    if !policy.id.strip_prefix('!').is_some_and(|id| {
+                        !id.is_empty()
+                            && !id.chars().any(|character| character.is_whitespace() || character.is_control())
+                    }) {
+                        bail!("invalid Matrix room id `{}`", policy.id);
+                    }
+                    if !room_ids.insert(policy.id.clone()) {
+                        bail!("Matrix room {} is configured more than once", policy.id);
+                    }
+                    let allowed_users = parse_nonempty_matrix_users(policy.allowed_users)?;
+                    let cwd = canonical_directory(&policy.cwd, "matrix.rooms[].cwd")?;
+                    if !cwd.starts_with(&allowed_root) {
+                        bail!(
+                            "Matrix room {} cwd {} is outside omp.allowed_root {}",
+                            policy.id,
+                            cwd.display(),
+                            allowed_root.display()
+                        );
+                    }
+                    rooms.push(MatrixRoomPolicy {
+                        id: policy.id,
+                        allowed_users,
+                        require_mention: policy.require_mention,
+                        cwd,
+                    });
+                }
+                Ok(MatrixConfig {
+                    homeserver_url,
+                    access_token_file: expand_home(&matrix.access_token_file)?,
+                    session_store_path: expand_home(&matrix.session_store_path)?,
+                    rooms,
+                })
+            })
+            .transpose()?;
+
 
         if raw.runtime.max_concurrency == 0 {
             bail!("runtime.max_concurrency must be at least 1");
@@ -354,12 +448,14 @@ impl AppConfig {
             })
             .transpose()?;
 
+
         Ok(Self {
             discord: DiscordConfig {
                 token_file: expand_home(&raw.discord.token_file)?,
                 thread_auto_archive_minutes: raw.discord.thread_auto_archive_minutes,
                 guilds,
             },
+            matrix,
             omp: OmpConfig {
                 executable: expand_home(&raw.omp.executable)?,
                 session_dir,
@@ -391,68 +487,94 @@ impl AppConfig {
             .iter()
             .find(|policy| policy.id == guild_id)
     }
+
+    pub fn matrix_room_policy(&self, room_id: &str) -> Option<&MatrixRoomPolicy> {
+        self.matrix
+            .as_ref()?
+            .rooms
+            .iter()
+            .find(|policy| policy.id == room_id)
+    }
 }
 
 impl DiscordConfig {
     pub fn load_token(&self) -> Result<String> {
-        const MAX_TOKEN_BYTES: usize = 4_096;
-
-        let file = fs::File::open(&self.token_file).with_context(|| {
-            format!(
-                "failed to open Discord token file {}",
-                self.token_file.display()
-            )
-        })?;
-        let metadata = file.metadata().with_context(|| {
-            format!(
-                "failed to inspect Discord token file {}",
-                self.token_file.display()
-            )
-        })?;
-        if !metadata.is_file() {
-            bail!(
-                "Discord token path {} is not a regular file",
-                self.token_file.display()
-            );
-        }
-        #[cfg(unix)]
-        if metadata.permissions().mode() & 0o077 != 0 {
-            bail!(
-                "Discord token file {} grants group or other access; run `chmod 600 {}`",
-                self.token_file.display(),
-                self.token_file.display()
-            );
-        }
-
-        let mut token = String::new();
-        file.take(4_097)
-            .read_to_string(&mut token)
-            .with_context(|| {
-                format!(
-                    "failed to read Discord token file {}",
-                    self.token_file.display()
-                )
-            })?;
-        if token.len() > MAX_TOKEN_BYTES {
-            bail!("Discord token file exceeds {MAX_TOKEN_BYTES} bytes");
-        }
-        while matches!(token.as_bytes().last(), Some(b'\r' | b'\n')) {
-            token.pop();
-        }
-        if token.is_empty() {
-            bail!("Discord token file is empty");
-        }
-        if token.bytes().any(|byte| byte.is_ascii_whitespace()) {
-            bail!("Discord token contains whitespace");
-        }
-        Ok(token)
+        load_protected_secret(&self.token_file, "Discord token")
     }
+}
+
+impl MatrixConfig {
+    pub fn load_access_token(&self) -> Result<String> {
+        load_protected_secret(&self.access_token_file, "Matrix access token")
+    }
+}
+
+
+fn load_protected_secret(path: &Path, label: &str) -> Result<String> {
+    const MAX_SECRET_BYTES: usize = 4_096;
+
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open {label} file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} path {} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "{label} file {} grants group or other access; run `chmod 600 {}`",
+            path.display(),
+            path.display()
+        );
+    }
+
+    let mut secret = String::new();
+    file.take((MAX_SECRET_BYTES + 1) as u64)
+        .read_to_string(&mut secret)
+        .with_context(|| format!("failed to read {label} file {}", path.display()))?;
+    if secret.len() > MAX_SECRET_BYTES {
+        bail!("{label} file exceeds {MAX_SECRET_BYTES} bytes");
+    }
+    while matches!(secret.as_bytes().last(), Some(b'\r' | b'\n')) {
+        secret.pop();
+    }
+    if secret.is_empty() {
+        bail!("{label} file is empty");
+    }
+    if secret.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        bail!("{label} contains whitespace");
+    }
+    Ok(secret)
 }
 
 impl GuildPolicy {
     pub fn permits(&self, channel_id: ChannelId, user_id: UserId) -> bool {
         self.allowed_channels.contains(&channel_id) && self.allowed_users.contains(&user_id)
     }
+}
+
+impl MatrixRoomPolicy {
+    pub fn permits(&self, user_id: &str) -> bool {
+        self.allowed_users.contains(user_id)
+    }
+}
+
+fn parse_nonempty_matrix_users(values: Vec<String>) -> Result<HashSet<String>> {
+    if values.is_empty() {
+        bail!("matrix.rooms[].allowed_users must not be empty (access is default-deny)");
+    }
+    let mut parsed = HashSet::with_capacity(values.len());
+    for value in values {
+        if !value.starts_with('@') || !value.contains(':') {
+            bail!("invalid Matrix user id `{value}`");
+        }
+        if !parsed.insert(value.clone()) {
+            bail!("Matrix user {value} is configured more than once");
+        }
+    }
+    Ok(parsed)
 }
 
 fn parse_nonempty_ids<T, E>(
@@ -523,6 +645,7 @@ mod tests {
                     cwd: root.path().to_owned(),
                 }],
             },
+            matrix: None,
             omp: RawOmpConfig {
                 executable: default_omp_executable(),
                 session_dir: root.path().join("sessions"),
@@ -558,6 +681,7 @@ mod tests {
                     cwd: outside.path().to_owned(),
                 }],
             },
+            matrix: None,
             omp: RawOmpConfig {
                 executable: default_omp_executable(),
                 session_dir: allowed.path().join("sessions"),
@@ -588,6 +712,7 @@ mod tests {
                     cwd: root.path().to_owned(),
                 }],
             },
+            matrix: None,
             omp: RawOmpConfig {
                 executable: default_omp_executable(),
                 session_dir: root.path().join("sessions"),
@@ -607,6 +732,31 @@ mod tests {
         assert!(!policy.permits(ChannelId::new(2), UserId::new(9)));
     }
 
+    #[test]
+    fn matrix_policy_is_client_scoped_and_default_deny() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.matrix = Some(RawMatrixConfig {
+            homeserver_url: "http://matrix.example:8008".to_owned(),
+            access_token_file: root.path().join("matrix-token"),
+            session_store_path: root.path().join("matrix-store"),
+            rooms: vec![RawMatrixRoomPolicy {
+                id: "!opaque-room-id".to_owned(),
+                allowed_users: vec!["@operator:matrix.example".to_owned()],
+                require_mention: true,
+                cwd: root.path().to_owned(),
+            }],
+        });
+
+        let config = AppConfig::from_raw(raw).expect("valid Matrix config");
+        let matrix = config.matrix.expect("Matrix config");
+        assert_eq!(matrix.rooms.len(), 1);
+        assert!(matrix.rooms[0].require_mention);
+        assert!(matrix.rooms[0].permits("@operator:matrix.example"));
+        assert!(!matrix.rooms[0].permits("@intruder:matrix.example"));
+    }
+
+
     fn raw_with_runtime(root: &Path, runtime: RawRuntimeConfig) -> RawConfig {
         RawConfig {
             discord: RawDiscordConfig {
@@ -619,6 +769,7 @@ mod tests {
                     cwd: root.to_owned(),
                 }],
             },
+            matrix: None,
             omp: RawOmpConfig {
                 executable: default_omp_executable(),
                 session_dir: root.join("sessions"),

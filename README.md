@@ -1,8 +1,8 @@
-# OMP Discord Bridge
+# OMP Client Bridge
 
-Rust Discord gateway for persistent, thread-scoped OMP sessions.
+Rust Discord and Matrix gateway for persistent, client-scoped OMP conversations.
 
-A permitted user mentions the bot in an allowed parent channel. The bridge creates a Discord thread, starts an OMP conversation for that thread, interrupts active work when a newer message arrives, and resumes the same saved OMP session across idle periods and daemon restarts.
+Discord maps one thread to one OMP conversation. Matrix supports room-scoped conversations and mention-started native threads. Both clients share durable SQLite state, bounded OMP concurrency, restart recovery, and the same process.
 
 ## Current behavior
 
@@ -12,17 +12,17 @@ A permitted user mentions the bot in an allowed parent channel. The bridge creat
 - durable SQLite session and turn state;
 - ordered, durable message admission with immediate interruption of active work and bounded global concurrency;
 - real OMP resume through its native RPC protocol;
-- one-shot Discord approval buttons for OMP writes and executable actions;
-- Discord prompts for OMP `ask` forms, choices, and text input, with answers returned to the waiting call;
+- Discord approval buttons and reply-based Matrix approvals for OMP writes and executable actions;
+- Discord interactive prompts and reply-based Matrix prompts, with answers returned to the waiting call;
 - one stationary activity card per active conversation run, including replacement turns, with assistant messages delivered as they complete;
 - minute-based topic/status title review, rate-limit-aware refresh, and queue-idle completion;
 - `status`, `models`, `model`, `stop`, `new`, and targeted `@Bot kick` controls inside threads;
-- duplicate Discord message rejection;
+- duplicate client event rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
 - bounded attachment metadata and Discord-safe response chunking;
 - on-demand OMP access to bounded parent-channel and same-parent thread message history.
 
-Attachment bytes are not downloaded by the bridge. OMP receives the Discord CDN URL, filename, content type, and byte count as untrusted prompt context.
+Discord attachments are passed as bounded CDN metadata. Matrix media is downloaded through the authenticated media API into the protected OMP session state directory.
 
 Activity cards show fixed, public labels for thinking, file inspection, tool
 execution, response writing, approval waits, interruption, retries, and compaction.
@@ -88,7 +88,7 @@ This is bot-wide profile/member-list activity, not a thread footer or an instant
 status guarantee. It does not rename threads or replace their activity cards.
 
 The seven-character revision is embedded at compile time, also shown by
-`omp-discord-bridge --version`; moving the checkout to another commit cannot change
+`omp-client-bridge --version`; moving the checkout to another commit cannot change
 a running binary's identity. Native builds derive it from Git, marking modified
 build inputs with `-dirty`. Source archives/container builds must supply
 `BRIDGE_BUILD_REVISION` with the source commit hash (optionally `-dirty`).
@@ -106,6 +106,25 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 `[VERSION] ([short commit])`. Neither value is read from the checkout at runtime.
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
+
+### Release 2026-11-19-2
+
+Rebuilds the multi-client release with the second release counter for the day.
+Behavior is unchanged from 2026-11-19-1.
+
+### Release 2026-11-19-1
+
+Refactors the Discord bridge around client-scoped conversations and adds an
+optional Matrix adapter. Matrix supports allowlisted rooms and users,
+mention-started native threads, durable per-thread OMP history, reply-based
+prompts and approvals, authenticated media, restart-safe event delivery, and
+thread-preserving output. Discord-only configurations remain supported.
+
+### Release 2026-11-16-2
+
+Adds bridge-backed Threadwatch chat control. The integrated reporter polls
+operator commands, admits them through the existing durable per-thread turn
+queue, acknowledges acceptance or rejection, and deduplicates retries.
 
 ### Release 2026-11-16-1
 
@@ -165,10 +184,10 @@ into an otherwise static executable.
 
 Artifacts are retained in a fresh `target/releases/vVERSION.XXXXXX/` directory:
 
-- `omp-discord-bridge-VERSION-linux-x86_64.tar.gz`: a versioned directory with
-  `omp-discord-bridge`, `bridge-local`, `.env.example`, example TOML configs,
-  `omp-discord-bridge.service`, README, and license.
-- `omp-discord-bridge-linux-x86_64`: the raw static executable used for updates.
+- `omp-client-bridge-VERSION-linux-x86_64.tar.gz`: a versioned directory with
+  `omp-client-bridge`, `bridge-local`, `.env.example`, example TOML configs,
+  `omp-client-bridge.service`, README, and license.
+- `omp-client-bridge-linux-x86_64`: the raw static executable used for updates.
 - `SHA256SUMS`: SHA-256 checksums of both assets, using those exact basenames.
 
 The fixed repository is `KeithHanson/rust-omp-discord-bridge` and the tag is
@@ -184,13 +203,13 @@ No service is installed or restarted by the release script.
 Clean Linux x86-64 release builds check the latest GitHub release in
 `KeithHanson/rust-omp-discord-bridge` every **420 seconds (7 minutes)** by default.
 Dirty builds never enable updates. Clean debug builds require
-`OMP_DISCORD_BRIDGE_AUTO_UPDATE=true`. Set
-`OMP_DISCORD_BRIDGE_AUTO_UPDATE=false` to opt out of release-build updates.
-The optional dedicated `OMP_DISCORD_BRIDGE_UPDATE_TOKEN` authenticates GitHub requests; it is not the
-Discord bot token.
+`OMP_CLIENT_BRIDGE_AUTO_UPDATE=true`. Set
+`OMP_CLIENT_BRIDGE_AUTO_UPDATE=false` to opt out of release-build updates.
+The optional dedicated `OMP_CLIENT_BRIDGE_UPDATE_TOKEN` authenticates GitHub requests; it is not a
+client access token.
 
 The updater requires a `vYYYY-MM-DD-N` tag, the raw
-`omp-discord-bridge-linux-x86_64` asset, and its matching entry in `SHA256SUMS`.
+`omp-client-bridge-linux-x86_64` asset, and its matching entry in `SHA256SUMS`.
 It verifies the checksum and candidate's `--version`, then runs a bounded
 `check-update` preflight to validate the selected configuration, token, and OMP
 probe **without migrating or otherwise modifying the live database**. Gateway
@@ -208,9 +227,9 @@ stop the service and restore the previous executable manually in that case.
 
 The executable's parent directory must be writable by the service account.
 Containers should opt out and use image rollouts instead. Rollover briefly
-disconnects the Discord gateway; messages during that gap may be missed because
-the bridge does not backfill them. This is safe work draining, not guaranteed
-zero-downtime message ingestion.
+disconnects both client adapters. Matrix resumes from its durable sync token;
+Discord gateway events during that gap may be missed because Discord does not
+backfill them. This is safe work draining, not guaranteed zero-downtime ingestion.
 
 ### Deploy release 2026-11-14-2
 
@@ -221,8 +240,8 @@ credentials, and session directory separate.
 git fetch origin --tags
 git checkout v2026-11-14-2
 cargo test --locked --all-targets
-cargo build --locked --release --bin omp-discord-bridge --target-dir target/candidate
-./target/candidate/release/omp-discord-bridge --version
+cargo build --locked --release --bin omp-client-bridge --target-dir target/candidate
+./target/candidate/release/omp-client-bridge --version
 ```
 
 Existing TOML files remain compatible. OMP 18.20.0 or newer is required.
@@ -231,17 +250,17 @@ when upgrading: it contains the bot's thread exclusions as well as session histo
 For containers, follow [the Docker upgrade instructions](docs/docker.md#upgrade-to-2026-11-14-2).
 
 The GitHub release also includes a static **Linux x86-64** bundle containing
-`omp-discord-bridge`, `bridge-local`, example configs, and the systemd unit.
+`omp-client-bridge`, `bridge-local`, example configs, and the systemd unit.
 OMP must still be installed and authenticated separately. Other platforms should
 build from the tag above; this bundle is not an ARM or macOS executable.
 
 ```bash
 gh release download v2026-11-14-2 --repo KeithHanson/rust-omp-discord-bridge \
-  --pattern 'omp-discord-bridge-2026-11-14-2-linux-x86_64.tar.gz' --pattern SHA256SUMS
+  --pattern 'omp-client-bridge-2026-11-14-2-linux-x86_64.tar.gz' --pattern SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf omp-discord-bridge-2026-11-14-2-linux-x86_64.tar.gz
-cd omp-discord-bridge-2026-11-14-2-linux-x86_64
-./omp-discord-bridge --version
+tar -xzf omp-client-bridge-2026-11-14-2-linux-x86_64.tar.gz
+cd omp-client-bridge-2026-11-14-2-linux-x86_64
+./omp-client-bridge --version
 ```
 
 For first installation, follow the configuration section below and adapt the
@@ -300,7 +319,7 @@ bot token from the application's Bot page in the Discord Developer Portal.
 The launcher parses `.env` without executing shell commands or exporting its
 token to OMP. It rejects group/world-readable environment files and writes
 generated configuration and a mode-600 token file beneath
-`~/.config/omp-discord-bridge/local-env/`. Edit `.env`, not these generated files.
+`~/.config/omp-client-bridge/local-env/`. Edit `.env`, not these generated files.
 Use `--env-file /absolute/path/to/.env` when launching from another directory.
 Blank required fields fail before starting the bridge. `OMP_MODEL` may remain
 blank to retain OMP's configured default.
@@ -313,8 +332,8 @@ and the project's approval policy. The launcher stays in the foreground.
 ### Direct TOML setup
 
 ```bash
-mkdir -p ~/.config/omp-discord-bridge
-cp config.example.toml ~/.config/omp-discord-bridge/config.toml
+mkdir -p ~/.config/omp-client-bridge
+cp config.example.toml ~/.config/omp-client-bridge/config.toml
 ```
 
 Edit every guild, channel, user, and path ID. Access lists may not be empty: configuration is default-deny. Each guild working directory must already exist and resolve beneath `omp.allowed_root`.
@@ -325,25 +344,48 @@ Store the Discord token in the dedicated file referenced by `discord.token_file`
 
 ```bash
 umask 077
-cat > ~/.config/omp-discord-bridge/discord-token
+cat > ~/.config/omp-client-bridge/discord-token
 ```
 
 Paste the token, press Enter, then `Ctrl-D`. Enforce the required permissions:
 
 ```bash
-chmod 600 ~/.config/omp-discord-bridge/discord-token
+chmod 600 ~/.config/omp-client-bridge/discord-token
 ```
 
 The bridge rejects empty token files, files larger than 4096 bytes, tokens containing whitespace, and—on Unix—files that grant group or other access. Keep the token file outside the repository; never put the token itself in TOML or a command-line argument.
 
+### Matrix setup
+
+Matrix is optional. Add `[matrix]` and one or more `[[matrix.rooms]]` policies as
+shown in `config.example.toml`. Each room and user is explicitly allowlisted;
+unlisted rooms, users, bot-authored events, and unsupported event types are
+ignored. Rooms must already exist and the access-token user must be joined.
+Set `require_mention = true` for a shared room: a room-level message then starts
+an OMP conversation only when its `m.mentions` metadata names the bot. The bot's
+reply and every subsequent event remain in a native Matrix thread rooted at that
+mention. Each root has independent durable OMP history. Messages already inside
+a native thread continue that thread without repeating the mention.
+
+Store the Matrix access token in the protected file referenced by
+`matrix.access_token_file` with mode `0600`. `matrix.session_store_path` holds the
+durable `/sync` token and is created mode `0600`; preserve it across restarts to
+avoid replaying room history. The first sync establishes the starting token and
+does not admit old messages.
+
+Matrix commands are `!status`, `!models`, `!model provider/model`, `!stop`, and
+`!new`. Ordinary messages enqueue OMP turns. Approval and prompt requests must be
+answered using a Matrix reply to the request event. Media is size-limited by
+`runtime.max_attachment_bytes`; unencrypted rooms only are supported.
+
 ### Integrated Threadwatch reporting
 
-The optional `[threadwatch]` table runs reporting inside the bridge process. It reads the bridge's configured SQLite database and OMP session directory, then sends sanitized records and heartbeats to the Threadwatch server through a durable queue:
+The optional `[threadwatch]` table runs bidirectional reporting inside the bridge process. It reads the bridge's configured SQLite database and OMP session directory, sends sanitized records and heartbeats through a durable queue, and polls for operator chat commands addressed to this bridge:
 
 ```toml
 [threadwatch]
 server_url = "http://192.168.192.183:8787"
-ingest_token_file = "~/.config/omp-discord-bridge/threadwatch-ingest-token"
+ingest_token_file = "~/.config/omp-client-bridge/threadwatch-ingest-token"
 bot_id = "hephaestus"
 bot_name = "Hephaestus"
 data_dir = "~/.local/state/threadwatch-collector"
@@ -351,7 +393,7 @@ collect_interval_ms = 2000
 heartbeat_interval_ms = 10000
 ```
 
-`server_url` must be a plain HTTP origin. `bot_id` is a stable ASCII identifier; never reuse one for a different bridge. The ingestion token file follows the same protected-file rules as the Discord token and must contain at least 32 non-whitespace characters. `check` validates this configuration and credential without contacting Threadwatch. A reporting outage is logged and retried without taking Discord offline.
+`server_url` must be a plain HTTP origin. `bot_id` is a stable ASCII identifier; never reuse one for a different bridge. The ingestion token file follows the same protected-file rules as the Discord token and must contain at least 32 non-whitespace characters. It authenticates both reporting and command polling; browser operators use a separate Threadwatch control token. Accepted commands enter the same durable turn queue as authorized human Discord messages, including interruption and queue-limit semantics. `check` validates this configuration and credential without contacting Threadwatch. Reporting and command-polling outages are logged and retried without taking Discord offline.
 
 For migration from a standalone Threadwatch collector:
 
@@ -370,37 +412,37 @@ The bridge launches the configured OMP executable and uses its normal authentica
 The check command validates configuration and SQLite access, loads the protected token file, and performs a real OMP RPC startup/clean-shutdown probe without sending a model prompt:
 
 ```bash
-cargo run -- --config ~/.config/omp-discord-bridge/config.toml check
+cargo run -- --config ~/.config/omp-client-bridge/config.toml check
 ```
 
 Start the gateway:
 
 ```bash
 RUST_LOG=info cargo run --release -- \
-  --config ~/.config/omp-discord-bridge/config.toml run
+  --config ~/.config/omp-client-bridge/config.toml run
 ```
 
 `run` is the default subcommand and may be omitted. Use a service manager for unattended operation.
 
 ### Boot service on this workstation
 
-`omp-discord-bridge.service` is configured for user `hephaestus` and this checkout.
-Its installed copy is `/etc/systemd/system/omp-discord-bridge.service`, enabled
+`omp-client-bridge.service` is configured for user `hephaestus` and this checkout.
+Its installed copy is `/etc/systemd/system/omp-client-bridge.service`, enabled
 for boot without requiring a login. It runs as the regular user, reads
-`~/.config/omp-discord-bridge/config.toml`, and restarts after failures.
+`~/.config/omp-client-bridge/config.toml`, and restarts after failures.
 It uses the release binary in this checkout; keep that path in place.
 The service does not read the repository's `.env` launcher configuration.
 
 ```bash
-systemctl status omp-discord-bridge
-journalctl -u omp-discord-bridge -f
-sudo systemctl restart omp-discord-bridge
-sudo systemctl disable --now omp-discord-bridge
+systemctl status omp-client-bridge
+journalctl -u omp-client-bridge -f
+sudo systemctl restart omp-client-bridge
+sudo systemctl disable --now omp-client-bridge
 ```
 
 After editing TOML or rebuilding the binary, restart the service. After editing
-the unit, reinstall it with `sudo install -m 644 omp-discord-bridge.service
-/etc/systemd/system/omp-discord-bridge.service`, run `sudo systemctl daemon-reload`,
+the unit, reinstall it with `sudo install -m 644 omp-client-bridge.service
+/etc/systemd/system/omp-client-bridge.service`, run `sudo systemctl daemon-reload`,
 then restart. Do not launch a second bridge manually against the same database.
 
 When this service carries your current conversation, build a candidate separately
@@ -416,10 +458,10 @@ has settled. Stopping the service during a turn interrupts its OMP process;
 recovery marks that turn uncertain rather than replaying it.
 
 ```bash
-sudo systemctl stop omp-discord-bridge
-install -m 755 target/activity-release/release/omp-discord-bridge target/release/
+sudo systemctl stop omp-client-bridge
+install -m 755 target/activity-release/release/omp-client-bridge target/release/
 install -m 755 target/activity-release/release/bridge-local target/release/
-sudo systemctl start omp-discord-bridge
+sudo systemctl start omp-client-bridge
 ```
 
 ### Scheduled improvement reviews
