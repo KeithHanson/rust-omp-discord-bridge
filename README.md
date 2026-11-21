@@ -107,6 +107,13 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-21-3
+
+Reloads hot-reloadable configuration immediately: watching `config.toml`, validating
+replacement snapshots, publishing last-known-good state atomically, and reloading
+the live default after `model default provider/model`. Restart-required changes
+are rejected without taking the running bridge down.
+
 ### Release 2026-11-19-2
 
 Rebuilds the multi-client release with the second release counter for the day.
