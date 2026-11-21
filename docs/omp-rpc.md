@@ -27,6 +27,14 @@ over `omp.model` and saved-session selection for subsequent conversation runs.
 policy. SQLite migration adds the nullable session field without modifying prior
 conversation files.
 
+`model default provider/model` sets the bridge-wide default by rewriting the
+`omp.model` line in the loaded config file (preserving comments and formatting),
+validating the pair against the catalog first. It does not change the session's own
+override or the running process; new sessions and override-cleared sessions pick up the
+new default on their next spawn, and title review (which already honors `omp.model` when
+`title_model` is unset) follows the same change on its next call. Changing the default
+still requires an idle session, since it writes a file shared by every thread.
+
 Verification of this feature used OMP 18.20.0 with the host authentication profile
 and isolated temporary workspace, SQLite, and session directory. The real catalog
 returned eight available models. A new conversation selected

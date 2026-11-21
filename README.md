@@ -613,6 +613,9 @@ Thread controls must be the complete message:
 - `models` (or `model`) — list available provider/model pairs and this thread's model override;
 - `model provider/model` — select an exact entry from that list for this thread;
 - `model default` — clear this thread's override;
+- `model default provider/model` — set the bridge-wide default model in the loaded `config.toml`
+  (operates on the shared config, so changes also affect other threads' future turns and new
+  sessions; this command does not change the session's own override). Requires an idle session;
 - `stop` — stop the thread and cancel its active turn;
 - `new` — after the active turn stops, discard queued turns and start a fresh OMP session;
 - `@Bot kick` — an authorized human mentions the specific bot and sends `kick`

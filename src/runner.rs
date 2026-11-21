@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex as StdMutex, Weak},
+    path::PathBuf,
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -296,6 +297,19 @@ async fn reconcile_thread_status(
     }
 }
 
+fn validate_model_selection(selection: &str) -> Result<(&str, &str)> {
+    let (provider, id) = selection
+        .split_once('/')
+        .filter(|(provider, id)| !provider.is_empty() && !id.is_empty())
+        .filter(|_| {
+            !selection
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '"' || ch == '\\')
+        })
+        .context("use `model provider/model` with an exact entry from `models`, or `model default`")?;
+    Ok((provider, id))
+}
+
 pub struct ThreadQueueRunner {
     store: Store,
     transport: Arc<dyn AgentTransport>,
@@ -307,6 +321,7 @@ pub struct ThreadQueueRunner {
     presence: Arc<PresenceTracker>,
     statuses: ThreadStatusReconciler,
     idle: Notify,
+    config_path: OnceLock<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -350,6 +365,7 @@ impl ThreadQueueRunner {
             active: StdMutex::new(HashMap::new()),
             presence: Arc::new(PresenceTracker::default()),
             idle: Notify::new(),
+            config_path: OnceLock::new(),
         })
     }
 
@@ -511,9 +527,51 @@ impl ThreadQueueRunner {
             }
         }
         response.push_str(
-            "\n\nUse `model provider/model` to select an exact entry or `model default` to clear the override. Changes require an idle session.",
+            "\n\nUse `model provider/model` to select an exact entry, `model default` to clear the override, or `model default provider/model` to set the bridge default. Changes require an idle session.",
         );
         Ok(response)
+    }
+
+    /// Set the bridge-wide default model. The path must be configured via
+    /// [`set_config_path`] before this method can write the config file.
+    pub fn set_config_path(&self, path: PathBuf) {
+        let _ = self.config_path.set(path);
+    }
+
+    fn config_path(&self) -> Result<PathBuf> {
+        self.config_path
+            .get()
+            .cloned()
+            .context("bridge configuration file path is unavailable")
+    }
+
+    /// Store a provider/model selection as the bridge-wide default in the
+    /// loaded config file. The selection is validated exactly like a session
+    /// override; changing the default does not touch the session's own
+    /// override, and both ops require an idle session.
+    pub async fn set_default_model(&self, thread_id: ThreadId, selection: &str) -> Result<String> {
+        let (provider, id) = validate_model_selection(selection)?;
+        if !self
+            .transport
+            .available_models()
+            .await?
+            .iter()
+            .any(|model| model.provider == provider && model.id == id)
+        {
+            bail!("model `{selection}` is unavailable; use `models` to list authenticated models");
+        }
+        // Same idle guard as a session override; the config file is shared by
+        // every thread, so a turn may not be about to pick up the new default.
+        let draining = self.draining.lock().await;
+        if draining.contains_key(&thread_id) {
+            bail!("wait for this session to become idle before changing the default model");
+        }
+        drop(draining);
+        let path = self.config_path()?;
+        crate::config::AppConfig::write_default_model(&path, selection)?;
+        Ok(format!(
+            "Default model set to `{selection}`. The session override (if any) is unchanged; future sessions and override-cleared sessions will use it."
+        ))
     }
 
     pub async fn set_model(&self, thread_id: ThreadId, selection: &str) -> Result<String> {
@@ -521,37 +579,45 @@ impl ThreadQueueRunner {
             .session(thread_id)
             .await?
             .context("no OMP session is mapped to this thread")?;
-        let model = if selection == "default" {
-            None
-        } else {
-            let (provider, id) = selection
-                .split_once('/')
-                .filter(|(provider, id)| !provider.is_empty() && !id.is_empty())
-                .filter(|_| !selection.chars().any(|ch| ch.is_whitespace() || ch.is_control()))
-                .context("use `model provider/model` with an exact entry from `models`, or `model default`")?;
-            if !self
-                .transport
-                .available_models()
-                .await?
-                .iter()
-                .any(|model| model.provider == provider && model.id == id)
-            {
-                bail!("model `{selection}` is unavailable; use `models` to list authenticated models");
+        let mut parts = selection.splitn(2, char::is_whitespace);
+        if parts.next() == Some("default") {
+            let rest = parts.next().map(str::trim).unwrap_or("");
+            if rest.is_empty() {
+                return self.clear_session_model(thread_id).await;
             }
-            Some(selection)
-        };
+            return self.set_default_model(thread_id, rest).await;
+        }
+        let (provider, id) = validate_model_selection(selection)?;
+        if !self
+            .transport
+            .available_models()
+            .await?
+            .iter()
+            .any(|model| model.provider == provider && model.id == id)
+        {
+            bail!("model `{selection}` is unavailable; use `models` to list authenticated models");
+        }
         // Hold the same lock as poke through the atomic store update. A drain
         // includes permit waits and final delivery even after running reaches zero.
         let draining = self.draining.lock().await;
         if draining.contains_key(&thread_id) {
             bail!("wait for this session to become idle before changing its model");
         }
-        self.store.set_session_model(thread_id, model).await?;
+        self.store.set_session_model(thread_id, Some(selection)).await?;
         drop(draining);
-        Ok(match model {
-            Some(model) => format!("Session model set to `{model}`. Conversation retained."),
-            None => "Session model reset to `default`. Conversation retained.".to_owned(),
-        })
+        Ok(format!("Session model set to `{selection}`. Conversation retained."))
+    }
+
+    async fn clear_session_model(&self, thread_id: ThreadId) -> Result<String> {
+        // Hold the same lock as poke through the atomic store update. A drain
+        // includes permit waits and final delivery even after running reaches zero.
+        let draining = self.draining.lock().await;
+        if draining.contains_key(&thread_id) {
+            bail!("wait for this session to become idle before changing its model");
+        }
+        self.store.set_session_model(thread_id, None).await?;
+        drop(draining);
+        Ok("Session model reset to `default`. Conversation retained.".to_owned())
     }
 
     pub async fn status(&self, thread_id: ThreadId) -> Result<String> {
@@ -2924,5 +2990,96 @@ mod tests {
         assert_eq!(outcome.status, TurnStatus::Aborted);
         transport.finish.add_permits(1);
         idle(&runner).await;
+    }
+
+    fn write_test_config(directory: &tempfile::TempDir) -> PathBuf {
+        let path = directory.path().join("config.toml");
+        let root = directory.path().display();
+        std::fs::write(
+            &path,
+            format!(
+                r#"[discord]
+token_file = "{root}/token"
+thread_auto_archive_minutes = 1440
+
+[[discord.guilds]]
+id = "123456789012345678"
+allowed_channels = ["234567890123456789"]
+allowed_users = ["345678901234567890"]
+cwd = "{root}"
+
+[omp]
+executable = "omp"
+session_dir = "{root}/sessions"
+allowed_root = "{root}"
+# model = "openai/old"
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn set_default_model_writes_config_and_keeps_session_override() {
+        let (directory, store) = fixture().await;
+        let config_path = write_test_config(&directory);
+        store.set_session_model(THREAD, Some("openai/shared")).await.unwrap();
+        let (observed, _incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        runner.set_config_path(config_path.clone());
+        let response = runner.set_model(THREAD, "default anthropic/shared").await.unwrap();
+        assert!(response.contains("Default model set to `anthropic/shared`"), "{response}");
+        let source = std::fs::read_to_string(&config_path).unwrap();
+        assert!(source.contains("model = \"anthropic/shared\""), "{source}");
+        assert!(source.contains("# model = \"openai/old\""), "{source}");
+        // The session override is untouched; only the configured default moved.
+        let session = store.session(THREAD).await.unwrap().unwrap();
+        assert_eq!(session.model.as_deref(), Some("openai/shared"));
+    }
+
+    #[tokio::test]
+    async fn set_default_model_rejects_bad_and_unknown_selections() {
+        let (directory, store) = fixture().await;
+        let config_path = write_test_config(&directory);
+        let (observed, _incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        runner.set_config_path(config_path.clone());
+        for selection in [
+            "default not-a-model",
+            "default openai/unknown",
+            "default openai/shared extra",
+        ] {
+            assert!(runner.set_model(THREAD, selection).await.is_err(), "{selection:?}");
+        }
+        let source = std::fs::read_to_string(&config_path).unwrap();
+        assert!(source.lines().all(|line| !line.trim().starts_with("model = \"openai/")), "{source}");
+    }
+
+    #[tokio::test]
+    async fn set_default_model_without_config_path_keeps_session() {
+        let (_directory, store) = fixture().await;
+        let (observed, _incoming) = mpsc::unbounded_channel();
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            Arc::new(ControlledTransport::new(observed, false)),
+            Arc::new(FakeMessenger::default()),
+            1_900,
+            1,
+        );
+        let error = runner.set_model(THREAD, "default openai/shared").await.unwrap_err();
+        assert!(error.to_string().contains("configuration file path"), "{error}");
     }
 }

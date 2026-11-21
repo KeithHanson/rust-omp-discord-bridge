@@ -185,6 +185,56 @@ impl AppConfig {
             .with_context(|| format!("failed to parse configuration {}", path.display()))?;
         Self::from_raw(raw)
     }
+    /// Replace the `omp.model` key in the file in place, preserving
+    /// surrounding comments and formatting. The file must already exist;
+    /// the change is re-validated with [`AppConfig::load`] before it is
+    /// reported as applied.
+    pub fn write_default_model(path: &Path, model: &str) -> Result<()> {
+        if model.is_empty()
+            || model.contains('"')
+            || model.contains('\\')
+            || model.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            bail!("invalid omp.model selection {model:?}");
+        }
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("failed to read configuration {}", path.display()))?;
+        let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
+        let heading = lines
+            .iter()
+            .position(|line| line.trim() == "[omp]")
+            .context("configuration has no [omp] section")?;
+        let section_end = lines[heading + 1..]
+            .iter()
+            .position(|line| line.trim_start().starts_with('['))
+            .map(|offset| heading + 1 + offset)
+            .unwrap_or(lines.len());
+        let replacement = format!("model = {:?}", model);
+        let mut replaced = false;
+        for index in (heading + 1)..section_end {
+            let trimmed = lines[index].trim();
+            if let Some(rest) = trimmed.strip_prefix("model") {
+                if !trimmed.starts_with("title_model")
+                    && rest.trim_start().starts_with('=')
+                {
+                    lines[index] = replacement.clone();
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if !replaced {
+            lines.insert(heading + 1, replacement);
+        }
+        let mut updated = lines.join("\n");
+        if source.ends_with('\n') {
+            updated.push('\n');
+        }
+        fs::write(path, updated)
+            .with_context(|| format!("failed to write configuration {}", path.display()))?;
+        AppConfig::load(path)?;
+        Ok(())
+    }
 
     fn from_raw(raw: RawConfig) -> Result<Self> {
         if raw.discord.guilds.is_empty() {
@@ -618,6 +668,70 @@ mod tests {
         assert_invalid_history_runtime(path, "timeout_seconds", |runtime| {
             runtime.discord_history_timeout_seconds = 0;
         });
+    }
+
+    fn valid_config_toml(root: &Path) -> String {
+        format!(
+            r#"[discord]
+token_file = "{}"
+thread_auto_archive_minutes = 1440
+
+[[discord.guilds]]
+id = "123456789012345678"
+allowed_channels = ["234567890123456789"]
+allowed_users = ["345678901234567890"]
+cwd = "{}"
+
+[omp]
+executable = "omp"
+session_dir = "{}"
+allowed_root = "{}"
+# model = "openai-codex/old"
+# title_model = "openai-codex/title"
+"#,
+            root.join("token").display(),
+            root.display(),
+            root.join("sessions").display(),
+            root.display(),
+        )
+    }
+
+    #[test]
+    fn write_default_model_inserts_and_replaces_model_line() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("config.toml");
+        fs::write(&path, valid_config_toml(root.path())).expect("write config");
+
+        AppConfig::write_default_model(&path, "openai-codex/new").expect("write model");
+        let source = fs::read_to_string(&path).expect("read back");
+        assert!(source.contains("model = \"openai-codex/new\""), "{source}");
+        assert!(source.contains("# model = \"openai-codex/old\""), "{source}");
+        assert!(source.contains("# title_model = \"openai-codex/title\""), "{source}");
+        let reloaded = AppConfig::load(&path).expect("reload");
+        assert_eq!(reloaded.omp.model.as_deref(), Some("openai-codex/new"));
+
+        // A real model line is replaced in place, keeping comments intact.
+        let path = root.path().join("config.toml");
+        fs::write(
+            &path,
+            valid_config_toml(root.path()).replace(
+                "# model = \"openai-codex/old\"",
+                "model = \"openai-codex/old\"",
+            ),
+        )
+        .expect("write config with real model line");
+        AppConfig::write_default_model(&path, "openai-codex/changed").expect("replace model");
+        let source = fs::read_to_string(&path).expect("read back");
+        assert!(source.contains("model = \"openai-codex/changed\""), "{source}");
+        assert!(!source.lines().any(|line| line.trim() == "model = \"openai-codex/old\""), "{source}");
+        assert!(source.contains("# title_model = \"openai-codex/title\""), "{source}");
+        assert_eq!(
+            AppConfig::load(&path).expect("reload").omp.model.as_deref(),
+            Some("openai-codex/changed")
+        );
+
+        assert!(AppConfig::write_default_model(&path, "bad value").is_err());
+        assert!(AppConfig::write_default_model(&path, "").is_err());
     }
 
     #[test]

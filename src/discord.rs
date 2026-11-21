@@ -98,6 +98,7 @@ pub async fn run(config: AppConfig, store: Store, config_path: &std::path::Path)
         config.runtime.discord_message_limit,
         config.runtime.max_concurrency,
     );
+    runner.set_config_path(config_path.to_path_buf());
     let bot_user_id = Arc::new(AtomicU64::new(0));
     let presence = runner.subscribe_presence();
     let (presence_target, presence_targets) = watch::channel(None);
@@ -1400,7 +1401,7 @@ impl DiscordHandler {
         send_without_mentions(
             http,
             input.thread_id,
-            "OMP session created. Controls: `status`, `models`, `model provider/model`, `model default`, `stop`, `new`, and `@Bot kick` (humans only).",
+            "OMP session created. Controls: `status`, `models`, `model provider/model`, `model default`, `model default provider/model`, `stop`, `new`, and `@Bot kick` (humans only).",
         )
         .await?;
         if matches!(
@@ -2601,7 +2602,7 @@ mod tests {
     #[tokio::test]
     async fn bots_never_control_or_approve_even_when_human_allowlisted() {
         let policy = routing_policy();
-        for command in ["status", "stop", "new", "/stop", "abort", "models", "/model", "model anthropic/claude-sonnet-4-5", "model default"] {
+        for command in ["status", "stop", "new", "/stop", "abort", "models", "/model", "model anthropic/claude-sonnet-4-5", "model default", "model default anthropic/claude-sonnet-4-5"] {
             for content in [
                 command.to_owned(),
                 format!("<@9> {command}"),
@@ -3494,6 +3495,10 @@ mod tests {
         assert_eq!(
             addressed_control("<@9> model provider/model", 9),
             Some(Control::Model("provider/model".into()))
+        );
+        assert_eq!(
+            parse_control("model default anthropic/claude-sonnet-4-5"),
+            Some(Control::Model("default anthropic/claude-sonnet-4-5".into()))
         );
     }
 
