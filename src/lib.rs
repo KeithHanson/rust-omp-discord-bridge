@@ -2,6 +2,7 @@ mod activity;
 pub mod config;
 pub mod clients;
 pub mod domain;
+pub mod live_config;
 pub mod omp;
 mod presence;
 pub mod render;

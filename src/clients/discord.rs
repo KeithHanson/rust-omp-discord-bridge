@@ -36,6 +36,7 @@ use tokio::{
 use crate::{
     config::{AppConfig, GuildPolicy},
     domain::{ChannelId, ClientKind, GuildId, MessageId, NewSession, SessionStatus, ThreadId, UserId},
+    live_config::LiveConfig,
     omp::{ApprovalRequest, OmpTransport},
     presence::PresenceSnapshot,
     render::{chunk_message, thread_name},
@@ -71,15 +72,15 @@ impl ReviewTitle for TitleReviewer {
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run(config: AppConfig, store: Store, command_receiver: mpsc::Receiver<ControlCommand>, config_path: &std::path::Path, permits: Arc<Semaphore>) -> Result<()> {
+pub async fn run(live_config: LiveConfig, store: Store, command_receiver: mpsc::Receiver<ControlCommand>, config_path: &std::path::Path, permits: Arc<Semaphore>) -> Result<()> {
+    let config = live_config.load();
     let token = config.discord.load_token()?;
-    let config = Arc::new(config);
     let http = Arc::new(Http::new(&token));
     let approvals = Arc::new(ApprovalBroker::default());
     let prompts = Arc::new(PromptBroker::default());
     let messenger = Arc::new(DiscordMessenger {
         title_http: TitleHttp::new(&http)?,
-        reviewer: Arc::new(TitleReviewer::new(config.omp.clone(), store.clone())),
+        reviewer: Arc::new(TitleReviewer::from_live(live_config.clone(), store.clone())),
         http: Arc::clone(&http),
         config: Arc::clone(&config),
         store: store.clone(),
@@ -87,12 +88,7 @@ pub async fn run(config: AppConfig, store: Store, command_receiver: mpsc::Receiv
         prompts: Arc::clone(&prompts),
         titles: Mutex::new(HashMap::new()),
     });
-    let transport = Arc::new(OmpTransport::new(
-        config.omp.clone(),
-        Duration::from_secs(config.runtime.turn_timeout_seconds),
-        config.runtime.max_response_bytes,
-        config.runtime.discord_history_max_days,
-    ));
+    let transport = Arc::new(OmpTransport::from_live(live_config.clone()));
     let runner = ThreadQueueRunner::new_with_permits(
         store.clone(),
         transport,
@@ -101,6 +97,7 @@ pub async fn run(config: AppConfig, store: Store, command_receiver: mpsc::Receiv
         permits,
     );
     runner.set_config_path(config_path.to_path_buf());
+    runner.set_live_config(live_config);
     let bot_user_id = Arc::new(AtomicU64::new(0));
     let presence = runner.subscribe_presence();
     let (presence_target, presence_targets) = watch::channel(None);

@@ -3,7 +3,8 @@ use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use omp_client_bridge::{
-    clients, config::AppConfig, omp::OmpTransport, store::Store, threadwatch,
+    clients, config::AppConfig, live_config::{LiveConfig, spawn_watcher}, omp::OmpTransport,
+    store::Store, threadwatch,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -116,7 +117,10 @@ async fn execute(cli: Cli) -> Result<()> {
                     }
                 })
             });
-            let result = clients::run(config, store, command_receiver, &config_path).await;
+            let live_config = LiveConfig::new(config);
+            let watcher = spawn_watcher(config_path.clone(), live_config.clone())?;
+            let result = clients::run(live_config, store, command_receiver, &config_path).await;
+            watcher.abort();
             if let Some(task) = reporting {
                 task.abort();
             }

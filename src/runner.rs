@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     activity::ActivityReporter,
     domain::{ConversationId, MessageId, SessionStatus, ThreadId, Turn, TurnStatus},
+    live_config::LiveConfig,
     omp::{AgentTransport, ApprovalRequest, OmpTurnError, OmpUi, TurnControl, TurnInput, UploadRequest},
     presence::{PresenceSnapshot, PresenceTracker, WorkingPresence},
     render::chunk_message,
@@ -337,6 +338,7 @@ pub struct ThreadQueueRunner {
     statuses: ThreadStatusReconciler,
     idle: Notify,
     config_path: OnceLock<PathBuf>,
+    live_config: OnceLock<LiveConfig>,
 }
 
 #[derive(Clone)]
@@ -397,6 +399,7 @@ impl ThreadQueueRunner {
             presence: Arc::new(PresenceTracker::default()),
             idle: Notify::new(),
             config_path: OnceLock::new(),
+            live_config: OnceLock::new(),
         })
     }
 
@@ -595,6 +598,10 @@ impl ThreadQueueRunner {
         let _ = self.config_path.set(path);
     }
 
+    pub fn set_live_config(&self, config: LiveConfig) {
+        let _ = self.live_config.set(config);
+    }
+
     fn config_path(&self) -> Result<PathBuf> {
         self.config_path
             .get()
@@ -631,8 +638,11 @@ impl ThreadQueueRunner {
         drop(draining);
         let path = self.config_path()?;
         crate::config::AppConfig::write_default_model(&path, selection)?;
+        if let Some(config) = self.live_config.get() {
+            config.reload(&path)?;
+        }
         Ok(format!(
-            "Default model set to `{selection}`. The session override (if any) is unchanged; future sessions and override-cleared sessions will use it."
+            "Default model set to `{selection}`. The live bridge configuration was reloaded; the session override (if any) is unchanged."
         ))
     }
 
@@ -3164,8 +3174,12 @@ allowed_root = "{root}"
             1,
         );
         runner.set_config_path(config_path.clone());
+        let live_config = LiveConfig::new(crate::config::AppConfig::load(&config_path).unwrap());
+        runner.set_live_config(live_config.clone());
         let response = runner.set_model(THREAD, "default anthropic/shared").await.unwrap();
         assert!(response.contains("Default model set to `anthropic/shared`"), "{response}");
+        assert!(response.contains("live bridge configuration was reloaded"), "{response}");
+        assert_eq!(live_config.load().omp.model.as_deref(), Some("anthropic/shared"));
         let source = std::fs::read_to_string(&config_path).unwrap();
         assert!(source.contains("model = \"anthropic/shared\""), "{source}");
         assert!(source.contains("# model = \"openai/old\""), "{source}");

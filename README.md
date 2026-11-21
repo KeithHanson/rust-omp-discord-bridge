@@ -340,6 +340,16 @@ Edit every guild, channel, user, and path ID. Access lists may not be empty: con
 
 The Discord history tools require a per-call integer `days` value from 1 through `runtime.discord_history_max_days`. A request fails rather than returning partial history if it exceeds `runtime.discord_history_max_messages`, `runtime.discord_history_max_bytes`, or `runtime.discord_history_timeout_seconds`.
 
+The running bridge watches the parent directory of `config.toml`, validates each
+replacement, and atomically publishes a complete last-known-good snapshot.
+`omp.model`, `omp.title_model`, `omp.thinking_level`,
+`runtime.max_response_bytes`, `runtime.discord_history_max_days`, and
+`runtime.turn_timeout_seconds` apply to subsequent operations without a restart.
+Invalid files and changes to process-owned settings are rejected without changing
+the active snapshot. Discord/Matrix identity and policy, executable and state
+paths, concurrency, remaining runtime limits, and Threadwatch settings require a
+controlled restart.
+
 Store the Discord token in the dedicated file referenced by `discord.token_file`. Enter it interactively so it does not appear in shell history:
 
 ```bash
@@ -440,10 +450,12 @@ sudo systemctl restart omp-client-bridge
 sudo systemctl disable --now omp-client-bridge
 ```
 
-After editing TOML or rebuilding the binary, restart the service. After editing
-the unit, reinstall it with `sudo install -m 644 omp-client-bridge.service
-/etc/systemd/system/omp-client-bridge.service`, run `sudo systemctl daemon-reload`,
-then restart. Do not launch a second bridge manually against the same database.
+After changing a restart-required TOML setting or rebuilding the binary, restart
+the service. Hot-reloadable settings are listed in the configuration section
+above. After editing the unit, reinstall it with `sudo install -m 644
+omp-client-bridge.service /etc/systemd/system/omp-client-bridge.service`, run
+`sudo systemctl daemon-reload`, then restart. Do not launch a second bridge
+manually against the same database.
 
 When this service carries your current conversation, build a candidate separately
 so the running release stays untouched:
@@ -655,9 +667,10 @@ Thread controls must be the complete message:
 - `models` (or `model`) — list available provider/model pairs and this thread's model override;
 - `model provider/model` — select an exact entry from that list for this thread;
 - `model default` — clear this thread's override;
-- `model default provider/model` — set the bridge-wide default model in the loaded `config.toml`
-  (operates on the shared config, so changes also affect other threads' future turns and new
-  sessions; this command does not change the session's own override). Requires an idle session;
+- `model default provider/model` — set and immediately publish the bridge-wide
+  default model in the loaded `config.toml` (operates on the shared config, so
+  changes also affect other threads' future turns and new sessions; this command
+  does not change the session's own override). Requires an idle session;
 - `stop` — stop the thread and cancel its active turn;
 - `new` — after the active turn stops, discard queued turns and start a fresh OMP session;
 - `@Bot kick` — an authorized human mentions the specific bot and sends `kick`
