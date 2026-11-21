@@ -26,6 +26,7 @@ use tokio_util::{
 use crate::{
     config::OmpConfig,
     domain::{Session, ThreadId, Turn, TurnStatus},
+    live_config::LiveConfig,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1_048_576;
@@ -173,6 +174,7 @@ pub struct OmpTransport {
     turn_timeout: Duration,
     max_response_bytes: usize,
     discord_history_max_days: u16,
+    live_config: Option<LiveConfig>,
 }
 
 impl OmpTransport {
@@ -187,15 +189,33 @@ impl OmpTransport {
             turn_timeout,
             max_response_bytes,
             discord_history_max_days,
+            live_config: None,
         }
+    }
+
+    pub fn from_live(live_config: LiveConfig) -> Self {
+        let config = live_config.load();
+        Self {
+            config: config.omp.clone(),
+            turn_timeout: Duration::from_secs(config.runtime.turn_timeout_seconds),
+            max_response_bytes: config.runtime.max_response_bytes,
+            discord_history_max_days: config.runtime.discord_history_max_days,
+            live_config: Some(live_config),
+        }
+    }
+
+    fn live(&self) -> Option<Arc<crate::config::AppConfig>> {
+        self.live_config.as_ref().map(LiveConfig::load)
     }
 
     pub async fn available_models(&self) -> anyhow::Result<Vec<AvailableModel>> {
         // OMP's chat catalog uses ModelRegistry.getAvailable(), including
         // configured credentials and extension-provided models.
-        let mut process = Command::new(&self.config.executable)
+        let live = self.live();
+        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let mut process = Command::new(&config.executable)
             .args(["models", "--json"])
-            .current_dir(&self.config.allowed_root)
+            .current_dir(&config.allowed_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -232,10 +252,12 @@ impl OmpTransport {
     }
 
     pub async fn probe(&self) -> Result<(), OmpTurnError> {
+        let live = self.live();
+        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
         let mut process = bounded(
             STARTUP_TIMEOUT,
             "spawning OMP",
-            self.spawn(None, &self.config.allowed_root, None),
+            self.spawn(None, &config.allowed_root, None),
         )
         .await?;
         let result = async {
@@ -265,6 +287,12 @@ impl OmpTransport {
         cancellation: CancellationToken,
         ui: &dyn OmpUi,
     ) -> Result<OmpTurnResult, OmpTurnError> {
+        let live = self.live();
+        let omp_config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let discord_history_max_days = live
+            .as_ref()
+            .map(|config| config.runtime.discord_history_max_days)
+            .unwrap_or(self.discord_history_max_days);
         if cancellation.is_cancelled() {
             bounded(
                 IO_TIMEOUT,
@@ -302,11 +330,11 @@ impl OmpTransport {
             let startup = bounded(STARTUP_TIMEOUT, "initializing OMP RPC", async {
                 expect_ready(&mut frames).await?;
                 if let Some(model) = session.model.as_deref() {
-                    set_session_model(&mut input, &mut frames, model, ui, self.discord_history_max_days)
+                    set_session_model(&mut input, &mut frames, model, ui, discord_history_max_days)
                         .await?;
                     // set_model resets thinking to the selected model's default.
                     // Reapply the bridge's explicit thinking configuration.
-                    if let Some(level) = self.config.thinking_level.as_deref() {
+                    if let Some(level) = omp_config.thinking_level.as_deref() {
                         startup_command(
                             &mut input,
                             &mut frames,
@@ -316,13 +344,12 @@ impl OmpTransport {
                                 "level": level,
                             }),
                             ui,
-                            self.discord_history_max_days,
+                            discord_history_max_days,
                         )
                         .await?;
                     }
                 }
-                register_host_tools(&mut input, &mut frames, ui, self.discord_history_max_days)
-                    .await
+                register_host_tools(&mut input, &mut frames, ui, discord_history_max_days).await
             });
             tokio::select! {
                 biased;
@@ -396,6 +423,17 @@ impl OmpTransport {
         W: AsyncWrite + Unpin + Send,
         R: AsyncRead + Unpin + Send,
     {
+        let live = self.live();
+        let runtime = live.as_ref().map(|config| &config.runtime);
+        let turn_timeout = runtime
+            .map(|config| Duration::from_secs(config.turn_timeout_seconds))
+            .unwrap_or(self.turn_timeout);
+        let max_response_bytes = runtime
+            .map(|config| config.max_response_bytes)
+            .unwrap_or(self.max_response_bytes);
+        let discord_history_max_days = runtime
+            .map(|config| config.discord_history_max_days)
+            .unwrap_or(self.discord_history_max_days);
         let mut pending = Vec::with_capacity(MAX_PENDING_PROMPTS);
         let mut requests = Vec::new();
         let mut active = None;
@@ -409,7 +447,7 @@ impl OmpTransport {
         let mut settled = false;
         let mut drain_queue = true;
         let mut abort_deadline = None;
-        let mut deadline = Instant::now() + self.turn_timeout;
+        let mut deadline = Instant::now() + turn_timeout;
         let mut abort_acknowledged = false;
 
         if cancellation.is_cancelled() {
@@ -423,7 +461,7 @@ impl OmpTransport {
             .await?;
             return Err(OmpTurnError::Rejected("stopped before dispatch".to_owned()));
         }
-        dispatch_prompt(input, &mut pending, turns.first, false, self.turn_timeout).await?;
+        dispatch_prompt(input, &mut pending, turns.first, false, turn_timeout).await?;
         request_state(input, &mut state_request, &mut state_sequence).await?;
 
         loop {
@@ -447,12 +485,11 @@ impl OmpTransport {
                             .await?;
                         } else {
                             ui.activity("Interrupting");
-                            dispatch_prompt(input, &mut pending, &turn, true, self.turn_timeout)
-                                .await?;
+                            dispatch_prompt(input, &mut pending, &turn, true, turn_timeout).await?;
                             cancel_requests(input, &mut requests).await?;
                             settled = false;
                             state_dirty = true;
-                            deadline = Instant::now() + self.turn_timeout;
+                            deadline = Instant::now() + turn_timeout;
                         }
                         continue;
                     }
@@ -571,7 +608,7 @@ impl OmpTransport {
                             cancel_service_request(&frame, &mut requests);
                         }
                         Some("host_tool_call" | "extension_ui_request") => {
-                            let request = ServiceRequest::new(frame, ui, self.discord_history_max_days)?;
+                            let request = ServiceRequest::new(frame, ui, discord_history_max_days)?;
                             if abort_deadline.is_some()
                                 || (pending.len() == MAX_PENDING_PROMPTS
                                     && pending.first().is_some_and(|prompt| active == Some(prompt.turn_id)))
@@ -770,7 +807,7 @@ impl OmpTransport {
                                 active
                             };
                             if let Some(prompt) = pending.iter_mut().find(|prompt| Some(prompt.turn_id) == owner) {
-                                if let Some(message) = prompt.capture(&frame, self.max_response_bytes)? {
+                                if let Some(message) = prompt.capture(&frame, max_response_bytes)? {
                                     ui.message(&prompt.output[message])?;
                                 }
                             } else if frame_has_text(&frame) {
@@ -798,17 +835,19 @@ impl OmpTransport {
         cwd: &std::path::Path,
         model: Option<&str>,
     ) -> Result<Child, OmpTurnError> {
-        tokio::fs::create_dir_all(&self.config.session_dir)
+        let live = self.live();
+        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        tokio::fs::create_dir_all(&config.session_dir)
             .await
             .map_err(|error| {
                 OmpTurnError::Rejected(format!("failed to create OMP session directory: {error}"))
             })?;
-        let mut command = Command::new(&self.config.executable);
+        let mut command = Command::new(&config.executable);
         command
             .arg("--mode")
             .arg("rpc-ui")
             .arg("--session-dir")
-            .arg(&self.config.session_dir)
+            .arg(&config.session_dir)
             .arg("--cwd")
             .arg(cwd)
             .arg("--no-title")
@@ -819,16 +858,16 @@ impl OmpTransport {
         if let Some(path) = resume_path {
             command.arg("--resume").arg(path);
         }
-        if let Some(model) = model.or(self.config.model.as_deref()) {
+        if let Some(model) = model.or(config.model.as_deref()) {
             command.arg("--model").arg(model);
         }
-        if let Some(level) = &self.config.thinking_level {
+        if let Some(level) = &config.thinking_level {
             command.arg("--thinking").arg(level);
         }
         let mut child = command.spawn().map_err(|error| {
             OmpTurnError::Rejected(format!(
                 "failed to start {}: {error}",
-                self.config.executable.display()
+                config.executable.display()
             ))
         })?;
         if let Some(mut stderr) = child.stderr.take() {
@@ -897,7 +936,9 @@ impl OmpTransport {
     }
 
     async fn canonical_session_root(&self) -> Result<PathBuf, OmpTurnError> {
-        tokio::fs::canonicalize(&self.config.session_dir)
+        let live = self.live();
+        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        tokio::fs::canonicalize(&config.session_dir)
             .await
             .map_err(|error| {
                 OmpTurnError::Rejected(format!("failed to resolve OMP session directory: {error}"))
@@ -908,7 +949,9 @@ impl OmpTransport {
 #[async_trait]
 impl AgentTransport for OmpTransport {
     async fn usage(&self) -> anyhow::Result<String> {
-        crate::usage::fetch(&self.config.executable, &self.config.allowed_root).await
+        let live = self.live();
+        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        crate::usage::fetch(&config.executable, &config.allowed_root).await
     }
 
     async fn available_models(&self) -> anyhow::Result<Vec<AvailableModel>> {
@@ -3619,5 +3662,61 @@ mod tests {
             assert_eq!(command["tools"][3]["parameters"]["additionalProperties"], false);
             assert_eq!(command["tools"].as_array().unwrap().len(), 4);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_default_model_is_used_by_the_next_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-omp");
+        let arguments = directory.path().join("arguments");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", arguments.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[discord]
+token_file = "{root}/token"
+thread_auto_archive_minutes = 1440
+
+[[discord.guilds]]
+id = "123456789012345678"
+allowed_channels = ["234567890123456789"]
+allowed_users = ["345678901234567890"]
+cwd = "{root}"
+
+[omp]
+executable = "{executable}"
+session_dir = "{root}/sessions"
+allowed_root = "{root}"
+model = "openai/old"
+"#,
+                root = directory.path().display(),
+                executable = executable.display(),
+            ),
+        )
+        .unwrap();
+        let live_config = LiveConfig::new(crate::config::AppConfig::load(&config_path).unwrap());
+        let transport = OmpTransport::from_live(live_config.clone());
+        crate::config::AppConfig::write_default_model(
+            &config_path,
+            "rtx-inkling/inkling-2-mini",
+        )
+        .unwrap();
+        live_config.reload(&config_path).unwrap();
+
+        let mut child = transport.spawn(None, directory.path(), None).await.unwrap();
+        child.wait().await.unwrap();
+        let arguments = std::fs::read_to_string(arguments).unwrap();
+        assert!(arguments.contains("--model\nrtx-inkling/inkling-2-mini\n"), "{arguments}");
     }
 }

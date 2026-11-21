@@ -19,7 +19,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{config::OmpConfig, domain::Session, store::Store};
+use crate::{config::OmpConfig, domain::Session, live_config::LiveConfig, store::Store};
 
 const MAX_SESSION_BYTES: u64 = 262_144;
 const MAX_VISIBLE_CHARS: usize = 24_576;
@@ -59,6 +59,7 @@ pub struct ReviewedTitle {
 #[derive(Clone)]
 pub struct TitleReviewer {
     config: OmpConfig,
+    live_config: Option<LiveConfig>,
     store: Store,
     gate: Arc<Semaphore>,
     secrets: Arc<Vec<String>>,
@@ -66,6 +67,15 @@ pub struct TitleReviewer {
 
 impl TitleReviewer {
     pub fn new(config: OmpConfig, store: Store) -> Self {
+        Self::build(config, None, store)
+    }
+
+    pub fn from_live(live_config: LiveConfig, store: Store) -> Self {
+        let config = live_config.load().omp.clone();
+        Self::build(config, Some(live_config), store)
+    }
+
+    fn build(config: OmpConfig, live_config: Option<LiveConfig>, store: Store) -> Self {
         let secrets = env::vars_os()
             .filter_map(|(key, value)| {
                 let key = key.to_string_lossy().to_ascii_uppercase();
@@ -79,6 +89,7 @@ impl TitleReviewer {
             .collect();
         Self {
             config,
+            live_config,
             store,
             gate: Arc::new(Semaphore::new(1)),
             secrets: Arc::new(secrets),
@@ -88,13 +99,15 @@ impl TitleReviewer {
     /// Re-fetches the session and bounded evidence after acquiring the review permit.
     /// Call this again after any Discord rate-limit wait; never reuse a stale result.
     pub async fn review(&self, session: &Session) -> Result<ReviewedTitle> {
+        let live = self.live_config.as_ref().map(LiveConfig::load);
+        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
         let _permit = self.gate.acquire().await.context("title reviewer closed")?;
         let session = self.store.session(session.thread_id).await?
             .context("title review session no longer exists")?;
         let counts = self.store.counts(session.thread_id).await?;
         let turns = self.store.title_context(session.thread_id).await?;
         let visible = match session.omp_session_path.as_deref() {
-            Some(path) => session_messages(&self.config.session_dir, path, &self.secrets).await?,
+            Some(path) => session_messages(&config.session_dir, path, &self.secrets).await?,
             None => Vec::new(),
         };
         let turns: Vec<Value> = turns.into_iter().map(|turn| json!({
@@ -109,24 +122,24 @@ impl TitleReviewer {
             "recent_visible_messages_oldest_first": visible,
             "context_is_bounded": true,
         }))?;
-        let root = tokio::fs::canonicalize(&self.config.allowed_root).await
+        let root = tokio::fs::canonicalize(&config.allowed_root).await
             .context("invalid title review allowed root")?;
         let cwd = tokio::fs::canonicalize(&session.cwd).await
             .context("invalid title review working directory")?;
         if !cwd.starts_with(&root) {
             bail!("title review working directory is outside allowed root");
         }
-        self.ask(&prompt, &cwd).await
+        self.ask(&prompt, &cwd, config).await
     }
 
-    fn command(&self, cwd: &Path) -> Command {
-        let mut command = Command::new(&self.config.executable);
+    fn command(&self, cwd: &Path, config: &OmpConfig) -> Command {
+        let mut command = Command::new(&config.executable);
         command.args([
             "--print", "--mode", "json", "--no-session", "--no-tools",
             "--no-extensions", "--no-skills", "--no-rules", "--no-context-files",
             "--no-title", "--no-lsp", "--max-time", "45s", "--system-prompt", SYSTEM,
         ]);
-        if let Some(model) = self.config.title_model.as_deref().or(self.config.model.as_deref()) {
+        if let Some(model) = config.title_model.as_deref().or(config.model.as_deref()) {
             command.args(["--model", model]);
         }
         for (key, _) in env::vars_os() {
@@ -142,8 +155,8 @@ impl TitleReviewer {
         command
     }
 
-    async fn ask(&self, prompt: &[u8], cwd: &Path) -> Result<ReviewedTitle> {
-        let mut child = self.command(cwd).spawn().context("could not start title reviewer")?;
+    async fn ask(&self, prompt: &[u8], cwd: &Path, config: &OmpConfig) -> Result<ReviewedTitle> {
+        let mut child = self.command(cwd, config).spawn().context("could not start title reviewer")?;
         let mut stdin = child.stdin.take().context("title reviewer stdin unavailable")?;
         let stdout = child.stdout.take().context("title reviewer stdout unavailable")?;
         let result = timeout(REVIEW_TIMEOUT, async {
@@ -413,14 +426,14 @@ mod tests {
             title_model: None, thinking_level: None,
         };
         let mut reviewer = TitleReviewer::new(config, store);
-        let command = reviewer.command(directory.path());
+        let command = reviewer.command(directory.path(), &reviewer.config);
         let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_string_lossy()).collect();
         assert!(args.windows(2).any(|pair| pair == ["--model", "primary"]));
         for flag in ["--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-rules", "--no-context-files", "--no-title", "--no-lsp"] {
             assert!(args.iter().any(|arg| arg == flag));
         }
         reviewer.config.title_model = Some("reviewer".into());
-        let command = reviewer.command(directory.path());
+        let command = reviewer.command(directory.path(), &reviewer.config);
         let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_string_lossy()).collect();
         assert!(args.windows(2).any(|pair| pair == ["--model", "reviewer"]));
         let cloned = reviewer.clone();

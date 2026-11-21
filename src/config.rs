@@ -23,14 +23,14 @@ pub struct AppConfig {
     pub threadwatch: Option<ThreadwatchConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscordConfig {
     pub token_file: PathBuf,
     pub thread_auto_archive_minutes: u16,
     pub guilds: Vec<GuildPolicy>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuildPolicy {
     pub id: GuildId,
     pub allowed_channels: HashSet<ChannelId>,
@@ -38,7 +38,7 @@ pub struct GuildPolicy {
     pub cwd: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixConfig {
     pub homeserver_url: reqwest::Url,
     pub access_token_file: PathBuf,
@@ -46,7 +46,7 @@ pub struct MatrixConfig {
     pub rooms: Vec<MatrixRoomPolicy>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixRoomPolicy {
     pub id: String,
     pub allowed_users: HashSet<String>,
