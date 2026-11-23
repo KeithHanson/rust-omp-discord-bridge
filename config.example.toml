@@ -15,6 +15,7 @@ cwd = "~/src/project"
 # [matrix]
 # homeserver_url = "https://matrix.example.org"
 # access_token_file = "~/.config/omp-client-bridge/matrix-token"
+# ca_file = "~/.config/omp-client-bridge/matrix-ca.pem"   # optional: PEM bundle for a private/self-signed CA
 # session_store_path = "~/.local/state/omp-client-bridge/matrix-sync-token"
 #
 # [[matrix.rooms]]

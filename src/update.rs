@@ -21,7 +21,7 @@ mod supported {
 
     const REPOSITORY: &str = "KeithHanson/rust-omp-discord-bridge";
     const ASSET: &str = "omp-client-bridge-linux-x86_64";
-    const POLL_INTERVAL: Duration = Duration::from_secs(420);
+    const POLL_INTERVAL: Duration = Duration::from_secs(60);
     const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
     const METADATA_LIMIT: usize = 1024 * 1024;
     const CHECKSUM_LIMIT: usize = 64 * 1024;

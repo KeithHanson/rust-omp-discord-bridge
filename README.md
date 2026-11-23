@@ -193,7 +193,9 @@ at `HEAD`. Publishing also checks that GitHub's tag resolves to the same commit.
 `--dry-run` performs the local build, static-link/version checks, and packaging
 without contacting GitHub. `--help` prints usage without building. Builds use a
 snapshot of the committed tree, locked Cargo dependencies, and static musl linking;
-neither local secrets nor ignored source files enter the package.
+neither local secrets nor ignored source files enter the package. The build cache is
+persistent (`target/release-build/`), so released binaries are only relinked from the
+tagged tree: dependency crates are not rebuilt unless their inputs change.
 The final link uses the selected Rust toolchain's bundled `rust-lld`; `musl-gcc`
 compiles C dependencies. This avoids host linker specs injecting an ELF interpreter
 into an otherwise static executable.
@@ -217,7 +219,7 @@ No service is installed or restarted by the release script.
 ### Automatic binary updates
 
 Clean Linux x86-64 release builds check the latest GitHub release in
-`KeithHanson/rust-omp-discord-bridge` every **420 seconds (7 minutes)** by default.
+`KeithHanson/rust-omp-discord-bridge` every **60 seconds** by default.
 Dirty builds never enable updates. Clean debug builds require
 `OMP_CLIENT_BRIDGE_AUTO_UPDATE=true`. Set
 `OMP_CLIENT_BRIDGE_AUTO_UPDATE=false` to opt out of release-build updates.
@@ -408,6 +410,11 @@ Store the Matrix access token in the protected file referenced by
 durable `/sync` token and is created mode `0600`; preserve it across restarts to
 avoid replaying room history. The first sync establishes the starting token and
 does not admit old messages.
+
+If the homeserver uses a private or self-signed CA, add `matrix.ca_file` pointing
+at a PEM certificate bundle (one or more PEM-encoded certificates); the bridge
+validates it at startup and adds those roots to its TLS connections. Omit
+`matrix.ca_file` to trust the operating system's standard roots.
 
 Matrix commands are `!status`, `!models`, `!model provider/model`, `!stop`, and
 `!new`. Ordinary messages enqueue OMP turns. Approval and prompt requests must be

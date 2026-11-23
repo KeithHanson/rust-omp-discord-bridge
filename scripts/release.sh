@@ -102,21 +102,31 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 mkdir -- "$work/source"
-# Build only the tagged tree: ignored files and concurrent checkout edits cannot
-# accidentally become part of a release carrying this commit's identity.
+# Packaging files come from the tagged tree so the release carries exactly the
+# committed files, never ignored or working-tree state.
 git archive "$commit" | tar -xf - -C "$work/source"
+# Build the same tagged tree from a persistent cache directory: dependency crates
+# are cached across releases, so only workspace crates relink. The source path is
+# stable and each extraction carries the commit's mtimes, so cargo's fingerprints
+# survive; only the committed VERSION/source actually drive a rebuild.
+build_cache="$root/target/release-build"
+build_source="$build_cache/source"
+build_target="$build_cache/target"
+rm -rf -- "$build_source"
+mkdir -p -- "$build_source" "$build_target"
+git archive "$commit" | tar -xf - -C "$build_source"
 (
-    cd -- "$work/source"
+    cd -- "$build_source"
     export BRIDGE_BUILD_REVISION="$commit"
     export CC_x86_64_unknown_linux_musl=musl-gcc
     # musl-gcc's specs can inject an ELF interpreter into Rust static PIEs.
     # Use Rust's bundled linker for the final link; musl-gcc only compiles C.
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$linker"
     export CARGO_ENCODED_RUSTFLAGS=$'-C\x1ftarget-feature=+crt-static'
-    cargo build --locked --release --bins --target "$target" --target-dir "$work/build"
+    cargo build --locked --release --bins --target "$target" --target-dir "$build_target"
 )
 
-binaries="$work/build/$target/release"
+binaries="$build_target/$target/release"
 for binary in omp-client-bridge bridge-local; do
     headers=$(readelf --program-headers "$binaries/$binary")
     dynamic=$(readelf --dynamic "$binaries/$binary")

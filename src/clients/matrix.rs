@@ -2,7 +2,7 @@ use std::{collections::HashMap, io::Write, path::{Path, PathBuf}, sync::Arc, tim
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use reqwest::{Client, Method, Url};
+use reqwest::{Certificate, Client, Method, Url};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -27,8 +27,21 @@ struct MatrixHttp {
 
 impl MatrixHttp {
     fn new(config: &MatrixConfig) -> Result<Self> {
+        let mut builder = Client::builder().timeout(Duration::from_secs(45));
+        if let Some(ca_file) = &config.ca_file {
+            let pem = std::fs::read(ca_file)
+                .with_context(|| format!("failed to read matrix.ca_file {}", ca_file.display()))?;
+            let certs = Certificate::from_pem_bundle(&pem)
+                .with_context(|| format!("matrix.ca_file {} is not a valid PEM certificate bundle", ca_file.display()))?;
+            if certs.is_empty() {
+                bail!("matrix.ca_file {} contains no certificates", ca_file.display());
+            }
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
         Ok(Self {
-            client: Client::builder().timeout(Duration::from_secs(45)).build()?,
+            client: builder.build()?,
             homeserver: config.homeserver_url.clone(),
             token: Arc::from(config.load_access_token()?),
         })
@@ -531,5 +544,37 @@ mod tests {
             "$response"
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn http_client_builds_with_a_valid_ca_file_and_rejects_garbage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDBTCCAe2gAwIBAgIUDmDWBXuEwtYwCA6GjA33t8u4NZswDQYJKoZIhvcNAQEL\nBQAwEjEQMA4GA1UEAwwHdGVzdC1jYTAeFw0yNjExMjMyMTI5NDdaFw0yNjExMjQy\nMTI5NDdaMBIxEDAOBgNVBAMMB3Rlc3QtY2EwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQDkugkvKLyuKPvHVnkf9/s45wzjm2cDjBvzzfcj47cebzD6zkBZ\ncO63L9udAEZpOt4VEilTCPEnmypT38ayZPYGFbE4PIEMGe9TWfCGmGVQiU54XTtI\naB5nCNCUOeTQI4n0Kxgcp0EthmDG3hrS5vIiSfzhejJKk28Kcry8g2ZE8+A0igtP\nPBfyLdRwT9fn8U/YhtZZOP48S77JNEdm6mlr7smHZK2CGc7/zJL4SBPJuREsiXzM\nfhUPjKkRIPTgTD8+kh2OPOfacFpV97aZLL21ZBrkbS29wwyo/ZyXDqjHRr2uuzso\n+r1wVZTdjq5F6WBoOm8tjX1vE16A++JbeQQVAgMBAAGjUzBRMB0GA1UdDgQWBBSv\n/dwlao/IY3F3lGBTQ3Ar9LchJTAfBgNVHSMEGDAWgBSv/dwlao/IY3F3lGBTQ3Ar\n9LchJTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAWWAe7Ichn\ntQ803tD01wO2okGYr62JgdHWLn+jZJMJazpNjqx5Wl9WrFgxuoai4QGAiQrrQW73\n+Rxjc3w8W8ucyjOVDaLz3VxGgTUxcpjeGNi59a0YqlSximnv1AW3ANhKHi8VjBSY\nHCk1GZY5qzxYvEe2eeQRT0406Qv4iXOYP3VoUuaG2x8c+0jKnui8pYUsuEkeyKFQ\n6uY4TnMLQF30IFCeCQgOQKtRgtKzJq04K6b6qFNUACPO+jl5J74nqd+ANcW+smi+\nIpMOiegO4JntUgzkpj/aQ/zGCeaK8b7I72xl8jPXKSxoeAA2uS/Fl4PqxIrhqz8L\nHbjgyJmO5/0w\n-----END CERTIFICATE-----\n";
+
+        let root = tempfile::tempdir().unwrap();
+        let token = root.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let ca_file = root.path().join("ca.pem");
+        std::fs::write(&ca_file, TEST_CA_PEM).unwrap();
+        let config = MatrixConfig {
+            homeserver_url: Url::parse("https://matrix.example.org").unwrap(),
+            access_token_file: token.clone(),
+            ca_file: Some(ca_file.clone()),
+            session_store_path: root.path().join("store"),
+            rooms: vec![],
+        };
+        MatrixHttp::new(&config).unwrap();
+
+        let garbage = root.path().join("garbage.pem");
+        std::fs::write(&garbage, "not a certificate").unwrap();
+        let bad = MatrixConfig {
+            ca_file: Some(garbage),
+            ..config.clone()
+        };
+        assert!(MatrixHttp::new(&bad).is_err(), "garbage PEM must fail client construction");
     }
 }

@@ -42,6 +42,7 @@ pub struct GuildPolicy {
 pub struct MatrixConfig {
     pub homeserver_url: reqwest::Url,
     pub access_token_file: PathBuf,
+    pub ca_file: Option<PathBuf>,
     pub session_store_path: PathBuf,
     pub rooms: Vec<MatrixRoomPolicy>,
 }
@@ -125,6 +126,8 @@ struct RawGuildPolicy {
 struct RawMatrixConfig {
     homeserver_url: String,
     access_token_file: PathBuf,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
     session_store_path: PathBuf,
     rooms: Vec<RawMatrixRoomPolicy>,
 }
@@ -344,6 +347,28 @@ impl AppConfig {
                 {
                     bail!("matrix.homeserver_url must be an HTTP(S) origin");
                 }
+                // Optional custom CA certificate bundle (PEM) for the homeserver's TLS chain.
+                let ca_file = matrix
+                    .ca_file
+                    .map(|path| -> Result<PathBuf> {
+                        let expanded = expand_home(&path)?;
+                        let metadata = fs::metadata(&expanded).with_context(|| {
+                            format!("matrix.ca_file {} does not exist", expanded.display())
+                        })?;
+                        if !metadata.is_file() {
+                            bail!("matrix.ca_file {} is not a regular file", expanded.display());
+                        }
+                        let pem = fs::read(&expanded)
+                            .with_context(|| format!("failed to read matrix.ca_file {}", expanded.display()))?;
+                        let certs = reqwest::Certificate::from_pem_bundle(&pem).with_context(|| {
+                            format!("matrix.ca_file {} is not a valid PEM certificate bundle", expanded.display())
+                        })?;
+                        if certs.is_empty() {
+                            bail!("matrix.ca_file {} contains no certificates", expanded.display());
+                        }
+                        Ok(expanded)
+                    })
+                    .transpose()?;
                 if matrix.rooms.is_empty() {
                     bail!("matrix.rooms must contain at least one policy");
                 }
@@ -379,6 +404,7 @@ impl AppConfig {
                 Ok(MatrixConfig {
                     homeserver_url,
                     access_token_file: expand_home(&matrix.access_token_file)?,
+                    ca_file,
                     session_store_path: expand_home(&matrix.session_store_path)?,
                     rooms,
                 })
@@ -745,6 +771,7 @@ mod tests {
         let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
         raw.matrix = Some(RawMatrixConfig {
             homeserver_url: "http://matrix.example:8008".to_owned(),
+            ca_file: None,
             access_token_file: root.path().join("matrix-token"),
             session_store_path: root.path().join("matrix-store"),
             rooms: vec![RawMatrixRoomPolicy {
@@ -763,6 +790,63 @@ mod tests {
         assert!(!matrix.rooms[0].permits("@intruder:matrix.example"));
     }
 
+
+    #[test]
+    fn matrix_ca_file_is_optional_and_validated() {
+        const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDBTCCAe2gAwIBAgIUDmDWBXuEwtYwCA6GjA33t8u4NZswDQYJKoZIhvcNAQEL\nBQAwEjEQMA4GA1UEAwwHdGVzdC1jYTAeFw0yNjExMjMyMTI5NDdaFw0yNjExMjQy\nMTI5NDdaMBIxEDAOBgNVBAMMB3Rlc3QtY2EwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQDkugkvKLyuKPvHVnkf9/s45wzjm2cDjBvzzfcj47cebzD6zkBZ\ncO63L9udAEZpOt4VEilTCPEnmypT38ayZPYGFbE4PIEMGe9TWfCGmGVQiU54XTtI\naB5nCNCUOeTQI4n0Kxgcp0EthmDG3hrS5vIiSfzhejJKk28Kcry8g2ZE8+A0igtP\nPBfyLdRwT9fn8U/YhtZZOP48S77JNEdm6mlr7smHZK2CGc7/zJL4SBPJuREsiXzM\nfhUPjKkRIPTgTD8+kh2OPOfacFpV97aZLL21ZBrkbS29wwyo/ZyXDqjHRr2uuzso\n+r1wVZTdjq5F6WBoOm8tjX1vE16A++JbeQQVAgMBAAGjUzBRMB0GA1UdDgQWBBSv\n/dwlao/IY3F3lGBTQ3Ar9LchJTAfBgNVHSMEGDAWgBSv/dwlao/IY3F3lGBTQ3Ar\n9LchJTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAWWAe7Ichn\ntQ803tD01wO2okGYr62JgdHWLn+jZJMJazpNjqx5Wl9WrFgxuoai4QGAiQrrQW73\n+Rxjc3w8W8ucyjOVDaLz3VxGgTUxcpjeGNi59a0YqlSximnv1AW3ANhKHi8VjBSY\nHCk1GZY5qzxYvEe2eeQRT0406Qv4iXOYP3VoUuaG2x8c+0jKnui8pYUsuEkeyKFQ\n6uY4TnMLQF30IFCeCQgOQKtRgtKzJq04K6b6qFNUACPO+jl5J74nqd+ANcW+smi+\nIpMOiegO4JntUgzkpj/aQ/zGCeaK8b7I72xl8jPXKSxoeAA2uS/Fl4PqxIrhqz8L\nHbjgyJmO5/0w\n-----END CERTIFICATE-----\n";
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let cwd = root.path().join("room");
+        fs::create_dir_all(&cwd).expect("room cwd");
+
+        let matrix = |ca_file: Option<PathBuf>| RawMatrixConfig {
+            homeserver_url: "http://matrix.example:8008".to_owned(),
+            ca_file,
+            access_token_file: root.path().join("matrix-token"),
+            session_store_path: root.path().join("matrix-store"),
+            rooms: vec![RawMatrixRoomPolicy {
+                id: "!opaque-room-id".to_owned(),
+                allowed_users: vec!["@operator:matrix.example".to_owned()],
+                require_mention: false,
+                cwd: cwd.clone(),
+            }],
+        };
+
+        let good = root.path().join("ca.pem");
+        fs::write(&good, TEST_CA_PEM).expect("fixture cert");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.matrix = Some(matrix(Some(good.clone())));
+        let config = AppConfig::from_raw(raw).expect("valid Matrix config with ca_file");
+        assert_eq!(
+            config.matrix.as_ref().expect("Matrix config").ca_file.as_deref(),
+            Some(good.as_path())
+        );
+
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.matrix = Some(matrix(None));
+        let config = AppConfig::from_raw(raw).expect("valid Matrix config without ca_file");
+        assert!(config.matrix.as_ref().expect("Matrix config").ca_file.is_none());
+
+        let missing = root.path().join("missing-ca.pem");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.matrix = Some(matrix(Some(missing)));
+        let error = AppConfig::from_raw(raw).expect_err("missing ca_file must fail");
+        assert!(format!("{error:#}").contains("matrix.ca_file"), "{error}");
+
+        let garbage = root.path().join("garbage.pem");
+        fs::write(&garbage, "not a certificate").expect("fixture cert");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.matrix = Some(matrix(Some(garbage)));
+        let error = AppConfig::from_raw(raw).expect_err("garbage PEM must fail");
+        assert!(format!("{error:#}").contains("matrix.ca_file"), "{error}");
+
+        let dir = root.path().join("ca-dir");
+        fs::create_dir_all(&dir).expect("dir fixture");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.matrix = Some(matrix(Some(dir)));
+        let error = AppConfig::from_raw(raw).expect_err("directory ca_file must fail");
+        assert!(format!("{error:#}").contains("not a regular file"), "{error}");
+    }
 
     fn raw_with_runtime(root: &Path, runtime: RawRuntimeConfig) -> RawConfig {
         RawConfig {
