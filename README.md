@@ -107,6 +107,15 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-23-2
+
+Makes Discord config optional. A bridge with neither `[discord]` nor `[matrix]`
+boots idle with a startup warning instead of failing at config load, while
+config/database/OMP startup remain validated. A `[matrix]`-only bridge skips
+the Discord client, its token check, and Discord-derived Threadwatch
+title/avatar lookups. Existing Discord and Matrix-only configurations are
+unchanged; an empty `[discord]` section still fails validation.
+
 ### Release 2026-11-21-3
 
 Reloads hot-reloadable configuration immediately: watching `config.toml`, validating
