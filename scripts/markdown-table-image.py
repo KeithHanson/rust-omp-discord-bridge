@@ -7,8 +7,9 @@
 
 Usage: markdown-table-image input.md output.png --title 'Comparison'
 Use - for stdin. Tables split at 12 rows and 4 columns, repeating headers
-and the first column. Additional images receive -2, -3, etc. Dark PNGs use
-2x resolution. --manifest emits an ordered JSON array of text/image objects,
+and the first column. Pages taller than the height limit are split further;
+a single row that still overflows fails explicitly. Additional images receive
+-2, -3, etc. Dark PNGs use 2x resolution. --manifest emits an ordered JSON array of text/image objects,
 retaining surrounding Markdown and clickable table URLs after each table.
 Raw HTML is disabled, images become alt text, and network requests are blocked.
 Limits: 1 MiB input/title, 64 images, 4096 CSS pixels per image (8192 physical).
@@ -18,6 +19,7 @@ import argparse
 import html
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -104,24 +106,32 @@ def page_count(table, rows_per_image, columns_per_image):
     return groups * max(1, math.ceil((len(table["rows"]) - 1) / rows_per_image))
 
 
+def page_document(table, table_index, title, column_index, total_groups, columns, rows, row_offset, total_rows):
+    header, *_ = table["rows"]
+    cells = []
+    for row_index, row in enumerate([header, *rows]):
+        tag = "th" if row_index == 0 else "td"
+        cells.append("<tr>" + "".join(
+            f'<{tag} style="text-align:{row[c][1]}">{row[c][0]}</{tag}>' for c in columns
+        ) + "</tr>")
+    label = f"Table {table_index} · Columns {column_index}/{total_groups}"
+    if rows:
+        label += f" · Rows {row_offset + 1}–{min(row_offset + len(rows), total_rows)}/{total_rows}"
+    return ("<!doctype html><meta charset='utf-8'>"
+           "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'\">"
+           f"<style>{CSS}</style><article><h1>{html.escape(title)}</h1>"
+           f"<table>{''.join(cells)}</table><footer>{label}</footer></article>")
+
+
 def documents(table, table_index, title, rows_per_image, columns_per_image):
     header, *rows = table["rows"]
     groups = column_groups(len(header), columns_per_image)
     for column_index, columns in enumerate(groups, 1):
         for start in range(0, max(len(rows), 1), rows_per_image):
-            cells = []
-            for row_index, row in enumerate([header, *rows[start:start + rows_per_image]]):
-                tag = "th" if row_index == 0 else "td"
-                cells.append("<tr>" + "".join(
-                    f'<{tag} style="text-align:{row[c][1]}">{row[c][0]}</{tag}>' for c in columns
-                ) + "</tr>")
-            label = f"Table {table_index} · Columns {column_index}/{len(groups)}"
-            if rows:
-                label += f" · Rows {start + 1}–{min(start + rows_per_image, len(rows))}/{len(rows)}"
-            yield ("<!doctype html><meta charset='utf-8'>"
-                   "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'\">"
-                   f"<style>{CSS}</style><article><h1>{html.escape(title)}</h1>"
-                   f"<table>{''.join(cells)}</table><footer>{label}</footer></article>")
+            yield page_document(
+                table, table_index, title, column_index, len(groups),
+                columns, rows[start:start + rows_per_image], start, len(rows),
+            )
 
 
 def manifest_parts(source, tables, image_paths):
@@ -175,24 +185,50 @@ def render(source, output, title, rows_per_image, columns_per_image, manifest):
             page = context.new_page()
             page.set_default_timeout(15000)
             for table_index, table in enumerate(tables, 1):
+                header, *rows = table["rows"]
+                groups = column_groups(len(header), columns_per_image)
+                total_groups = len(groups)
                 paths = []
-                for document in documents(table, table_index, title, rows_per_image, columns_per_image):
-                    index = len(created) + 1
-                    path = output if index == 1 else output.with_stem(f"{output.stem}-{index}")
-                    if path.is_symlink() or path.resolve().parent != directory:
-                        raise RenderError("Output path must stay within the output directory")
+
+                def emit_page(column_index, columns, row_start, row_end):
+                    # Emit images for rows[row_start:row_end], splitting the range
+                    # on overflow so no single image exceeds the height limit.
+                    document = page_document(
+                        table, table_index, title, column_index, total_groups,
+                        columns, rows[row_start:row_end], row_start, len(rows),
+                    )
                     page.set_content(document, wait_until="load")
                     article = page.locator("article")
                     bounds = article.bounding_box()
-                    if not bounds or bounds["height"] > MAX_HEIGHT:
+                    if bounds and bounds["height"] <= MAX_HEIGHT:
+                        if len(created) >= MAX_IMAGES:
+                            raise RenderError("Table output exceeds the 64 image limit")
+                        index = len(created) + 1
+                        path = output if index == 1 else output.with_stem(f"{output.stem}-{index}")
+                        if path.is_symlink() or path.resolve().parent != directory:
+                            raise RenderError("Output path must stay within the output directory")
+                        # Open first without following symlinks; screenshots are bounded above.
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                        created.append(path)
+                        with os.fdopen(fd, "wb") as destination:
+                            destination.write(article.screenshot())
+                        return [path]
+                    if row_end - row_start <= 1:
                         raise RenderError("Table image exceeds the 4096 pixel height limit")
-                    # Open first without following symlinks; screenshots are bounded above.
-                    import os
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-                    created.append(path)
-                    with os.fdopen(fd, "wb") as destination:
-                        destination.write(article.screenshot())
-                    paths.append(path)
+                    mid = row_start + (row_end - row_start + 1) // 2
+                    return (emit_page(column_index, columns, row_start, mid)
+                            + emit_page(column_index, columns, mid, row_end))
+
+                for column_index, columns in enumerate(groups, 1):
+                    if not rows:
+                        # A header-only table still renders one page.
+                        paths.extend(emit_page(column_index, columns, 0, 0))
+                    else:
+                        start = 0
+                        while start < len(rows):
+                            end = min(start + rows_per_image, len(rows))
+                            paths.extend(emit_page(column_index, columns, start, end))
+                            start = end
                 image_paths.append(paths)
             browser.close()
     except BaseException:
