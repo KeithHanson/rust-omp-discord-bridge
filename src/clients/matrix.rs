@@ -147,6 +147,60 @@ fn thread_relation(root_event_id: &str) -> Value {
     })
 }
 
+// A kick takes the corresponding write lock before persisting the exclusion.
+// Holding this guard through delivery lets already-started sends finish first.
+async fn thread_access(store: &Store, thread_id: ThreadId) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+    let guard = store.thread_access(thread_id).read_owned().await;
+    if store.is_thread_excluded(thread_id).await? {
+        bail!("bot was kicked from this thread");
+    }
+    Ok(guard)
+}
+
+/// Upload bytes to the room media store, returning the mxc URI.
+async fn upload_media(
+    http: &MatrixHttp,
+    data: &[u8],
+    content_type: &str,
+    filename: &str,
+) -> Result<String> {
+    let mut url = http.endpoint(&["_matrix", "media", "v3", "upload"])?;
+    url.query_pairs_mut().append_pair("filename", filename);
+    let response = http
+        .client
+        .post(url)
+        .bearer_auth(&*http.token)
+        .header("content-type", content_type)
+        .body(data.to_vec())
+        .send()
+        .await
+        .context("Matrix media upload request failed")?;
+    let status = response.status();
+    let bytes = response.bytes().await.context("failed to read Matrix media upload response")?;
+    if !status.is_success() {
+        let detail = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| {
+                let text = String::from_utf8_lossy(&bytes);
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    "Matrix server returned no error detail".to_owned()
+                } else {
+                    trimmed.chars().take(256).collect()
+                }
+            });
+        bail!("Matrix media upload returned {status}: {detail}");
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .context("Matrix media upload response was not valid JSON")?;
+    value
+        .get("content_uri")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("Matrix media upload omitted content_uri")
+}
+
 struct MatrixMessenger {
     http: MatrixHttp,
     store: Store,
@@ -180,26 +234,38 @@ impl MatrixMessenger {
 #[async_trait]
 impl ThreadMessenger for MatrixMessenger {
     async fn send(&self, thread_id: ThreadId, content: &str) -> Result<()> {
+        let _access = thread_access(&self.store, thread_id).await?;
         self.send_text(thread_id, content).await?;
         Ok(())
     }
     async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()> { self.send(thread_id, content).await }
     async fn send_image(&self, thread_id: ThreadId, data: Vec<u8>, filename: String) -> Result<()> {
-        let mut url = self.http.endpoint(&["_matrix", "media", "v3", "upload"])?;
-        url.query_pairs_mut().append_pair("filename", &filename);
-        let response = self.http.client.post(url).bearer_auth(&*self.http.token).header("content-type", "image/png").body(data).send().await?;
-        let status = response.status();
-        let value: Value = response.json().await?;
-        if !status.is_success() { bail!("Matrix media upload returned {status}"); }
-        let uri = value.get("content_uri").and_then(Value::as_str).context("Matrix media upload omitted content_uri")?;
-        self.send_content(thread_id, json!({"msgtype":"m.image","body":filename,"url":uri})).await?;
+        let _access = thread_access(&self.store, thread_id).await?;
+        let uri = upload_media(&self.http, &data, "image/png", &filename).await?;
+        let image_size = data.len();
+        self.send_content(
+            thread_id,
+            json!({
+                "msgtype": "m.image",
+                "body": filename,
+                "filename": filename,
+                "url": uri,
+                "info": {
+                    "mimetype": "image/png",
+                    "size": image_size,
+                },
+            }),
+        )
+        .await?;
         Ok(())
     }
     async fn create_activity(&self, thread_id: ThreadId, content: &str, _finished: bool) -> Result<MessageId> {
+        let _access = thread_access(&self.store, thread_id).await?;
         let event = self.send_text(thread_id, content).await?;
         self.store.ensure_event(&EventId::scoped(ClientKind::Matrix, event)?).await
     }
     async fn edit_activity(&self, thread_id: ThreadId, message_id: MessageId, content: &str, _finished: bool) -> Result<MessageId> {
+        let _access = thread_access(&self.store, thread_id).await?;
         let activity_event = self
             .store
             .event_native_id(ClientKind::Matrix, message_id)
@@ -221,13 +287,17 @@ impl ThreadMessenger for MatrixMessenger {
         Ok(message_id)
     }
     async fn confirm(&self, thread_id: ThreadId, request: ApprovalRequest) -> bool {
+        let Ok(access) = thread_access(&self.store, thread_id).await else { return false; };
         let text = format!("Approval required: {request:?}\nReply to this message with approve or deny.");
         let Ok(event) = self.send_text(thread_id, &text).await else { return false; };
+        drop(access);
         self.replies.wait(event).await.is_some_and(|reply| matches!(reply.trim().to_ascii_lowercase().as_str(), "approve" | "approved" | "yes"))
     }
     async fn prompt(&self, thread_id: ThreadId, request: Value) -> Value {
+        let Ok(access) = thread_access(&self.store, thread_id).await else { return Value::Null; };
         let text = format!("Input required:\n{request}\nReply to this message.");
         let Ok(event) = self.send_text(thread_id, &text).await else { return Value::Null; };
+        drop(access);
         self.replies.wait(event).await.map(Value::String).unwrap_or(Value::Null)
     }
     async fn notify(&self, thread_id: ThreadId, message: &str) { let _ = self.send(thread_id, message).await; }
@@ -258,18 +328,15 @@ impl ThreadMessenger for MatrixMessenger {
         Ok(value.get("joined").and_then(Value::as_object).map(|joined| joined.keys().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default())
     }
     async fn upload_file(&self, thread_id: ThreadId, request: UploadRequest) -> Result<String> {
+        let _access = thread_access(&self.store, thread_id).await?;
         let data = tokio::fs::read(&request.path).await?;
         let filename = request.path.file_name().and_then(|name| name.to_str()).unwrap_or("upload").to_owned();
-        let mut url = self.http.endpoint(&["_matrix", "media", "v3", "upload"])?;
-        url.query_pairs_mut().append_pair("filename", &filename);
-        let response = self.http.client.post(url).bearer_auth(&*self.http.token).header("content-type", "application/octet-stream").body(data).send().await?;
-        let status = response.status(); let value: Value = response.json().await?;
-        if !status.is_success() { bail!("Matrix media upload returned {status}"); }
-        let uri = value.get("content_uri").and_then(Value::as_str).context("Matrix media upload omitted content_uri")?;
+        let uri = upload_media(&self.http, &data, "application/octet-stream", &filename).await?;
         self.send_content(thread_id, json!({"msgtype":"m.file","body":filename,"url":uri})).await?;
-        Ok(uri.to_owned())
+        Ok(uri)
     }
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()> {
+        let _access = thread_access(&self.store, thread_id).await?;
         let target = self.target(thread_id).await?;
         let state_key = target.root_event_id.as_deref().unwrap_or("");
         let url = self.http.endpoint(&["_matrix", "client", "v3", "rooms", &target.room_id, "state", "io.omp.bridge.status", state_key])?;
@@ -543,6 +610,118 @@ mod tests {
             .unwrap(),
             "$response"
         );
+        server.join().unwrap();
+    }
+
+    /// Read one HTTP request; returns (head, body). Bodies are bounded by
+    /// content-length.
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        use std::io::Read;
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let head_end = loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 { panic!("request ended before headers completed") }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&request[..head_end]).to_string();
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok()).flatten()
+            })
+            .unwrap_or(0);
+        let mut body = request.split_off(head_end);
+        while body.len() < content_length {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 { break; }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body.truncate(content_length);
+        (head, body)
+    }
+
+    #[tokio::test]
+    async fn send_image_uploads_png_and_sends_image_event_with_info() {
+        use std::{net::TcpListener, thread};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            // Upload request
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (upload_head, _upload_body) = read_request(&mut stream);
+            assert!(upload_head.starts_with("POST /_matrix/media/v3/upload"));
+            assert!(upload_head.contains("filename=test.png"));
+            assert!(upload_head.to_ascii_lowercase().contains("content-type: image/png"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"content_uri\":\"mxc://test/test.png\"}").unwrap();
+            drop(stream);
+            // Message request
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (message_head, message_body) = read_request(&mut stream);
+            assert!(message_head.starts_with("PUT /_matrix/client/v3/rooms/"));
+            let event: Value = serde_json::from_slice(&message_body).unwrap();
+            assert_eq!(event["msgtype"], "m.image");
+            assert_eq!(event["filename"], "test.png");
+            assert_eq!(event["url"], "mxc://test/test.png");
+            assert_eq!(event["info"]["mimetype"], "image/png");
+            assert_eq!(event["info"]["size"], 4);
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"event_id\":\"$response\"}").unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().join("store.sqlite")).await.unwrap();
+        let thread_id = ThreadId::new(1);
+        let http = MatrixHttp {
+            client: Client::builder().no_proxy().build().unwrap(),
+            homeserver: Url::parse(&format!("http://{address}")).unwrap(),
+            token: Arc::from("test-token"),
+        };
+        let targets = Arc::new(RwLock::new(HashMap::from([(thread_id, MatrixTarget {
+            room_id: "!room:example.org".to_owned(),
+            root_event_id: None,
+        })])));
+        let replies = Arc::new(ReplyBroker::default());
+        let messenger = MatrixMessenger { http, store, targets, replies };
+        messenger.send_image(thread_id, vec![1, 2, 3, 4], "test.png".to_owned()).await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_image_reports_upload_failure_detail() {
+        use std::{net::TcpListener, thread};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (upload_head, _upload_body) = read_request(&mut stream);
+            assert!(upload_head.starts_with("POST /_matrix/media/v3/upload"));
+            stream.write_all(b"HTTP/1.1 413 Request Entity Too Large\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":\"too large\"}").unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().join("store.sqlite")).await.unwrap();
+        let thread_id = ThreadId::new(1);
+        let http = MatrixHttp {
+            client: Client::builder().no_proxy().build().unwrap(),
+            homeserver: Url::parse(&format!("http://{address}")).unwrap(),
+            token: Arc::from("test-token"),
+        };
+        let targets = Arc::new(RwLock::new(HashMap::from([(thread_id, MatrixTarget {
+            room_id: "!room:example.org".to_owned(),
+            root_event_id: None,
+        })])));
+        let replies = Arc::new(ReplyBroker::default());
+        let messenger = MatrixMessenger { http, store, targets, replies };
+        let error = messenger.send_image(thread_id, vec![1], "test.png".to_owned()).await.unwrap_err();
+        assert!(error.to_string().contains("413"), "error must include the status: {error}");
+        assert!(error.to_string().contains("too large"), "error must include the server detail: {error}");
         server.join().unwrap();
     }
 
