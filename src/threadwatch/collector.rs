@@ -460,6 +460,16 @@ fn thread_payload(thread: &Value, bridge: &Bridge, sanitizer: &Sanitizer) -> Res
     {
         payload["avatarUrl"] = json!(avatar);
     }
+    if let Some(model) = thread["model"]
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        let model = sanitizer.text(model).trim().to_owned();
+        if !model.is_empty() && model.encode_utf16().count() <= 200 {
+            payload["model"] = json!(model);
+        }
+    }
     if let Some(title) = thread["shortTitle"]
         .as_str()
         .filter(|title| !title.trim().is_empty())
@@ -1032,4 +1042,42 @@ pub async fn run(config: Config, once: bool) -> Result<()> {
     result
         .and(signal_result)
         .context("Collector did not complete successfully; saved deliveries remain available for retry")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bridge::Bridge;
+    use super::super::sanitize::Sanitizer;
+    use super::thread_payload;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
+
+    fn bridge() -> Bridge {
+        Bridge {
+            id: "bot".into(),
+            name: "Test bot".into(),
+            database_path: "/state/bridge.sqlite".into(),
+            session_dir: "/state/sessions".into(),
+            bot_token_file: None,
+        }
+    }
+
+    fn encoded_thread_id() -> String {
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&["bridge", "bot", "thread"]).unwrap())
+    }
+
+    #[test]
+    fn thread_payload_forwards_the_session_model() {
+        let sanitizer = Sanitizer::new(vec![]);
+        let thread = json!({"id":encoded_thread_id(),"title":"Task","status":"working","updatedAt":1000,"model":"anthropic/claude-sonnet-4-5"});
+        let payload = thread_payload(&thread, &bridge(), &sanitizer).unwrap();
+        assert_eq!(payload["model"], "anthropic/claude-sonnet-4-5");
+        let thread = json!({"id":encoded_thread_id(),"title":"Task","status":"working","updatedAt":1000,"model":"   "});
+        let payload = thread_payload(&thread, &bridge(), &sanitizer).unwrap();
+        assert!(payload.get("model").is_none());
+        let thread =
+            json!({"id":encoded_thread_id(),"title":"Task","status":"working","updatedAt":1000});
+        let payload = thread_payload(&thread, &bridge(), &sanitizer).unwrap();
+        assert!(payload.get("model").is_none());
+    }
 }

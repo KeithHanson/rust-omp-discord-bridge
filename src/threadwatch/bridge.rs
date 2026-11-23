@@ -418,7 +418,7 @@ impl BridgeReader {
         )?;
         db.busy_timeout(Duration::from_millis(100))?;
         db.execute_batch("PRAGMA query_only=ON")?;
-        let mut sessions = db.prepare("SELECT thread_id,guild_id,omp_session_path,status,updated_at_ms FROM sessions ORDER BY thread_id")?;
+        let mut sessions = db.prepare("SELECT thread_id,guild_id,omp_session_path,status,updated_at_ms,model FROM sessions ORDER BY thread_id")?;
         let mut turns = db.prepare("SELECT status FROM turns WHERE thread_id=? ORDER BY created_at_ms DESC,id DESC LIMIT 1")?;
         let mut rows = sessions.query([])?;
         let mut degraded = false;
@@ -429,6 +429,7 @@ impl BridgeReader {
             let path: Option<String> = row.get(2)?;
             let session_status: String = row.get(3)?;
             let updated: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+            let model: Option<String> = row.get(5)?;
             let turn: Option<String> =
                 turns.query_row([&source_id], |row| row.get(0)).optional()?;
             let status = if session_status == "stopped" {
@@ -455,6 +456,16 @@ impl BridgeReader {
                 "titleSource":if old_title.is_some() { old["titleSource"].as_str().unwrap_or("session") } else { "fallback" },
                 "guildId":guild, "channelId":source_id, "status":status,
                 "updatedAt":(updated.max(0) as u64).max(old["updatedAt"].as_u64().unwrap_or(0)), "source":format!("bridge:{}",self.bridge.id)});
+            if let Some(model) = model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            {
+                let model = self.cache.sanitizer.text(model).trim().to_owned();
+                if !model.is_empty() && model.encode_utf16().count() <= 200 {
+                    thread["model"] = json!(model);
+                }
+            }
             if let Some(avatar) = avatar {
                 thread["avatarUrl"] = json!(avatar);
             }
