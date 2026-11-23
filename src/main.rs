@@ -70,7 +70,7 @@ fn collector_config(
             name: reporting.bot_name.clone(),
             database_path: config.runtime.database_path.clone(),
             session_dir: config.omp.session_dir.clone(),
-            bot_token_file: Some(config.discord.token_file.clone()),
+            bot_token_file: config.discord.as_ref().map(|d| d.token_file.clone()),
         },
         data_dir: reporting.data_dir.clone(),
         collect_interval: Duration::from_millis(reporting.collect_interval_ms),
@@ -83,6 +83,11 @@ async fn execute(cli: Cli) -> Result<()> {
 
     let config_path = expand_cli_home(cli.config)?;
     let config = AppConfig::load(&config_path)?;
+    if config.discord.is_none() && config.matrix.is_none() {
+        tracing::warn!(
+            "no Discord or Matrix client is configured; the bridge will start idle and will not respond to any client"
+        );
+    }
     let (command_sender, command_receiver) = tokio::sync::mpsc::channel(32);
     let collector = collector_config(&config, command_sender)?;
     if matches!(cli.command, Some(Command::CheckUpdate)) {
@@ -143,7 +148,9 @@ async fn execute(cli: Cli) -> Result<()> {
 }
 
 fn validate_client_tokens(config: &AppConfig) -> Result<()> {
-    drop(config.discord.load_token()?);
+    if let Some(discord) = &config.discord {
+        drop(discord.load_token()?);
+    }
     if let Some(matrix) = &config.matrix {
         drop(matrix.load_access_token()?);
     }

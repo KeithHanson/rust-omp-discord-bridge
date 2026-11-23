@@ -1,3 +1,6 @@
+# Optional Discord adapter. Omit this whole section (and its guilds) to run a
+# Matrix-only bridge; with neither Discord nor Matrix configured the bridge
+# boots idle with a startup warning.
 [discord]
 token_file = "~/.config/omp-client-bridge/discord-token"
 thread_auto_archive_minutes = 1440

@@ -74,7 +74,8 @@ const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn run(live_config: LiveConfig, store: Store, command_receiver: mpsc::Receiver<ControlCommand>, config_path: &std::path::Path, permits: Arc<Semaphore>) -> Result<()> {
     let config = live_config.load();
-    let token = config.discord.load_token()?;
+    let discord = config.discord.as_ref().context("Discord configuration is required")?;
+    let token = discord.load_token()?;
     let http = Arc::new(Http::new(&token));
     let approvals = Arc::new(ApprovalBroker::default());
     let prompts = Arc::new(PromptBroker::default());
@@ -134,7 +135,7 @@ pub async fn run(live_config: LiveConfig, store: Store, command_receiver: mpsc::
         result = client.start() => result.context("Discord client stopped"),
         result = auto_update(config_path, &runner, &admission) => result,
         result = &mut control => result,
-        signal = shutdown_signal() => {
+        signal = super::shutdown_signal() => {
             signal?;
             shard_manager.shutdown_all().await;
             Ok(())
@@ -293,29 +294,6 @@ async fn gateway_presence<T>(
     }
 }
 
-async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("failed to listen for SIGTERM")?;
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for shutdown signal")
-            }
-            received = terminate.recv() => {
-                received.context("SIGTERM listener closed unexpectedly")?;
-                Ok(())
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed to listen for shutdown signal")
-    }
-}
 
 #[derive(Default)]
 struct ApprovalBroker {
@@ -1418,7 +1396,7 @@ impl DiscordHandler {
         }
         let builder = CreateThread::new(format!("🛠️ {}", thread_name(&prompt)))
             .auto_archive_duration(AutoArchiveDuration::from(
-                self.config.discord.thread_auto_archive_minutes,
+                self.config.discord.as_ref().expect("Discord configuration is required").thread_auto_archive_minutes,
             ))
             .audit_log_reason("OMP Discord bridge session");
         let thread = builder
@@ -2406,10 +2384,10 @@ mod tests {
         let mut messenger = participants_messenger(root.path(), http).await;
         assert!(messenger.thread_status(ThreadId::new(4), "completed").await
             .unwrap_err().to_string().contains("unknown Discord thread"));
-        Arc::get_mut(&mut messenger.config).unwrap().discord.guilds[0].allowed_channels.clear();
+        Arc::get_mut(&mut messenger.config).unwrap().discord.as_mut().expect("discord").guilds[0].allowed_channels.clear();
         assert!(messenger.thread_status(ThreadId::new(3), "completed").await
             .unwrap_err().to_string().contains("not authorized"));
-        Arc::get_mut(&mut messenger.config).unwrap().discord.guilds.clear();
+        Arc::get_mut(&mut messenger.config).unwrap().discord.as_mut().expect("discord").guilds.clear();
         assert!(messenger.thread_status(ThreadId::new(3), "completed").await
             .unwrap_err().to_string().contains("unconfigured guild"));
         assert!(requests.join().unwrap().is_empty());
@@ -2520,11 +2498,11 @@ mod tests {
     fn routing_config(root: &std::path::Path) -> AppConfig {
         use crate::config::{DiscordConfig, OmpConfig, RuntimeConfig};
         AppConfig {
-            discord: DiscordConfig {
+            discord: Some(DiscordConfig {
                 token_file: root.join("unused-token"),
                 thread_auto_archive_minutes: 1440,
                 guilds: vec![routing_policy()],
-            },
+            }),
             matrix: None,
             omp: OmpConfig {
                 executable: root.join("must-not-run"),
@@ -2873,11 +2851,11 @@ mod tests {
             let thread = match case {
                 "unknown" => ThreadId::new(4),
                 "guild" => {
-                    Arc::make_mut(&mut messenger.config).discord.guilds.clear();
+                    Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds.clear();
                     ThreadId::new(3)
                 }
                 _ => {
-                    Arc::make_mut(&mut messenger.config).discord.guilds[0].allowed_channels.clear();
+                    Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds[0].allowed_channels.clear();
                     ThreadId::new(3)
                 }
             };
@@ -2987,7 +2965,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unknown Discord thread"));
-        Arc::get_mut(&mut messenger.config).unwrap().discord.guilds[0]
+        Arc::get_mut(&mut messenger.config).unwrap().discord.as_mut().expect("discord").guilds[0]
             .allowed_channels
             .clear();
         let error = messenger
@@ -2998,6 +2976,8 @@ mod tests {
         Arc::get_mut(&mut messenger.config)
             .unwrap()
             .discord
+            .as_mut()
+            .expect("discord")
             .guilds
             .clear();
         let error = messenger
@@ -3760,7 +3740,7 @@ mod tests {
             ]);
             let mut messenger = participants_messenger(root.path(), http).await;
             // Even another allowed parent is outside this session's scope.
-            Arc::make_mut(&mut messenger.config).discord.guilds[0].allowed_channels.insert(ChannelId::new(9));
+            Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds[0].allowed_channels.insert(ChannelId::new(9));
             let error = messenger.thread_history(ThreadId::new(3), ThreadId::new(4), 1).await.unwrap_err();
             assert!(error.to_string().contains("session's guild and authorized parent"), "{case}: {error}");
             assert_eq!(requests.join().unwrap().len(), 1);
@@ -3777,8 +3757,8 @@ mod tests {
             let mut days = 1;
             match case {
                 "unknown" => source = ThreadId::new(8),
-                "guild" => Arc::make_mut(&mut messenger.config).discord.guilds.clear(),
-                "parent" => Arc::make_mut(&mut messenger.config).discord.guilds[0].allowed_channels.clear(),
+                "guild" => Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds.clear(),
+                "parent" => Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds[0].allowed_channels.clear(),
                 "zero_days" => days = 0,
                 _ => days = 31,
             }

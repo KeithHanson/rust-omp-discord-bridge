@@ -372,6 +372,16 @@ chmod 600 ~/.config/omp-client-bridge/discord-token
 
 The bridge rejects empty token files, files larger than 4096 bytes, tokens containing whitespace, and—on Unix—files that grant group or other access. Keep the token file outside the repository; never put the token itself in TOML or a command-line argument.
 
+### Optional Discord adapter
+
+Discord is optional. Omit the `[discord]` section (and its `[[discord.guilds]]`
+policies) to run a Matrix-only bridge; the bridge then starts the Matrix
+adapter and no Discord client. If neither `[discord]` nor `[matrix]` is
+configured, the bridge boots idle with a startup warning and does not respond
+to any client — configuration, database access, and OMP startup are still
+validated. A bridge that omits `[discord]` also skips the Discord token check
+and the Discord-derived Threadwatch title/avatar lookups.
+
 ### Matrix setup
 
 Matrix is optional. Add `[matrix]` and one or more `[[matrix.rooms]]` policies as

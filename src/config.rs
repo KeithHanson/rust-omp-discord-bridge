@@ -16,7 +16,7 @@ use crate::domain::{ChannelId, GuildId, UserId};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    pub discord: DiscordConfig,
+    pub discord: Option<DiscordConfig>,
     pub matrix: Option<MatrixConfig>,
     pub omp: OmpConfig,
     pub runtime: RuntimeConfig,
@@ -94,7 +94,7 @@ pub struct RuntimeConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    discord: RawDiscordConfig,
+    discord: Option<RawDiscordConfig>,
     matrix: Option<RawMatrixConfig>,
     omp: RawOmpConfig,
     #[serde(default)]
@@ -276,50 +276,60 @@ impl AppConfig {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self> {
-        if raw.discord.guilds.is_empty() {
-            bail!("discord.guilds must contain at least one policy");
-        }
-        if !matches!(
-            raw.discord.thread_auto_archive_minutes,
-            60 | 1_440 | 4_320 | 10_080
-        ) {
-            bail!("discord.thread_auto_archive_minutes must be 60, 1440, 4320, or 10080");
-        }
-
         let allowed_root = canonical_directory(&raw.omp.allowed_root, "omp.allowed_root")?;
         let session_dir = expand_home(&raw.omp.session_dir)?;
         let database_path = expand_home(&raw.runtime.database_path)?;
 
-        let mut guild_ids = HashSet::new();
-        let mut guilds = Vec::with_capacity(raw.discord.guilds.len());
-        for policy in raw.discord.guilds {
-            let id = GuildId::from_str(&policy.id)
-                .with_context(|| format!("invalid Discord guild id `{}`", policy.id))?;
-            if !guild_ids.insert(id) {
-                bail!("discord guild {id} is configured more than once");
-            }
-            let allowed_channels = parse_nonempty_ids(
-                policy.allowed_channels,
-                "allowed_channels",
-                ChannelId::from_str,
-            )?;
-            let allowed_users =
-                parse_nonempty_ids(policy.allowed_users, "allowed_users", UserId::from_str)?;
-            let cwd = canonical_directory(&policy.cwd, "discord.guilds[].cwd")?;
-            if !cwd.starts_with(&allowed_root) {
-                bail!(
-                    "guild {id} cwd {} is outside omp.allowed_root {}",
-                    cwd.display(),
-                    allowed_root.display()
-                );
-            }
-            guilds.push(GuildPolicy {
-                id,
-                allowed_channels,
-                allowed_users,
-                cwd,
-            });
-        }
+        let discord = raw
+            .discord
+            .map(|config| -> Result<DiscordConfig> {
+                if config.guilds.is_empty() {
+                    bail!("discord.guilds must contain at least one policy");
+                }
+                if !matches!(
+                    config.thread_auto_archive_minutes,
+                    60 | 1_440 | 4_320 | 10_080
+                ) {
+                    bail!("discord.thread_auto_archive_minutes must be 60, 1440, 4320, or 10080");
+                }
+                let mut guild_ids = HashSet::new();
+                let mut guilds = Vec::with_capacity(config.guilds.len());
+                for policy in config.guilds {
+                    let id = GuildId::from_str(&policy.id)
+                        .with_context(|| format!("invalid Discord guild id `{}`", policy.id))?;
+                    if !guild_ids.insert(id) {
+                        bail!("discord guild {id} is configured more than once");
+                    }
+                    let allowed_channels = parse_nonempty_ids(
+                        policy.allowed_channels,
+                        "allowed_channels",
+                        ChannelId::from_str,
+                    )?;
+                    let allowed_users =
+                        parse_nonempty_ids(policy.allowed_users, "allowed_users", UserId::from_str)?;
+                    let cwd = canonical_directory(&policy.cwd, "discord.guilds[].cwd")?;
+                    if !cwd.starts_with(&allowed_root) {
+                        bail!(
+                            "guild {id} cwd {} is outside omp.allowed_root {}",
+                            cwd.display(),
+                            allowed_root.display()
+                        );
+                    }
+                    guilds.push(GuildPolicy {
+                        id,
+                        allowed_channels,
+                        allowed_users,
+                        cwd,
+                    });
+                }
+                let token_file = expand_home(&config.token_file)?;
+                Ok(DiscordConfig {
+                    token_file,
+                    thread_auto_archive_minutes: config.thread_auto_archive_minutes,
+                    guilds,
+                })
+            })
+            .transpose()?;
         let matrix = raw
             .matrix
             .map(|matrix| -> Result<MatrixConfig> {
@@ -450,11 +460,7 @@ impl AppConfig {
 
 
         Ok(Self {
-            discord: DiscordConfig {
-                token_file: expand_home(&raw.discord.token_file)?,
-                thread_auto_archive_minutes: raw.discord.thread_auto_archive_minutes,
-                guilds,
-            },
+            discord,
             matrix,
             omp: OmpConfig {
                 executable: expand_home(&raw.omp.executable)?,
@@ -483,6 +489,7 @@ impl AppConfig {
 
     pub fn guild_policy(&self, guild_id: GuildId) -> Option<&GuildPolicy> {
         self.discord
+            .as_ref()?
             .guilds
             .iter()
             .find(|policy| policy.id == guild_id)
@@ -635,7 +642,7 @@ mod tests {
     fn rejects_open_ended_access_lists() {
         let root = tempfile::tempdir().expect("tempdir");
         let raw = RawConfig {
-            discord: RawDiscordConfig {
+            discord: Some(RawDiscordConfig {
                 token_file: root.path().join("discord-token"),
                 thread_auto_archive_minutes: default_auto_archive_minutes(),
                 guilds: vec![RawGuildPolicy {
@@ -644,7 +651,7 @@ mod tests {
                     allowed_users: vec!["2".to_owned()],
                     cwd: root.path().to_owned(),
                 }],
-            },
+            }),
             matrix: None,
             omp: RawOmpConfig {
                 executable: default_omp_executable(),
@@ -671,7 +678,7 @@ mod tests {
         let allowed = tempfile::tempdir().expect("allowed tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
         let raw = RawConfig {
-            discord: RawDiscordConfig {
+            discord: Some(RawDiscordConfig {
                 token_file: allowed.path().join("discord-token"),
                 thread_auto_archive_minutes: default_auto_archive_minutes(),
                 guilds: vec![RawGuildPolicy {
@@ -680,7 +687,7 @@ mod tests {
                     allowed_users: vec!["3".to_owned()],
                     cwd: outside.path().to_owned(),
                 }],
-            },
+            }),
             matrix: None,
             omp: RawOmpConfig {
                 executable: default_omp_executable(),
@@ -702,7 +709,7 @@ mod tests {
     fn authorization_requires_matching_channel_and_user() {
         let root = tempfile::tempdir().expect("tempdir");
         let config = AppConfig::from_raw(RawConfig {
-            discord: RawDiscordConfig {
+            discord: Some(RawDiscordConfig {
                 token_file: root.path().join("discord-token"),
                 thread_auto_archive_minutes: default_auto_archive_minutes(),
                 guilds: vec![RawGuildPolicy {
@@ -711,7 +718,7 @@ mod tests {
                     allowed_users: vec!["3".to_owned()],
                     cwd: root.path().to_owned(),
                 }],
-            },
+            }),
             matrix: None,
             omp: RawOmpConfig {
                 executable: default_omp_executable(),
@@ -759,7 +766,7 @@ mod tests {
 
     fn raw_with_runtime(root: &Path, runtime: RawRuntimeConfig) -> RawConfig {
         RawConfig {
-            discord: RawDiscordConfig {
+            discord: Some(RawDiscordConfig {
                 token_file: root.join("discord-token"),
                 thread_auto_archive_minutes: default_auto_archive_minutes(),
                 guilds: vec![RawGuildPolicy {
@@ -768,7 +775,7 @@ mod tests {
                     allowed_users: vec!["3".to_owned()],
                     cwd: root.to_owned(),
                 }],
-            },
+            }),
             matrix: None,
             omp: RawOmpConfig {
                 executable: default_omp_executable(),
@@ -819,6 +826,42 @@ mod tests {
         assert_invalid_history_runtime(path, "timeout_seconds", |runtime| {
             runtime.discord_history_timeout_seconds = 0;
         });
+    }
+    #[test]
+    fn no_client_config_loads_without_discord_or_matrix() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.discord = None;
+        raw.matrix = None;
+        let config = AppConfig::from_raw(raw).expect("no-client config must load");
+        assert!(config.discord.is_none());
+        assert!(config.matrix.is_none());
+        assert!(config.guild_policy(GuildId::new(1)).is_none());
+    }
+
+    #[test]
+    fn omitted_discord_section_is_absent_but_present_empty_discord_section_fails() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[omp]\nexecutable = \"omp\"\nsession_dir = \"{}\"\nallowed_root = \"{}\"\n",
+                root.path().join("sessions").display(),
+                root.path().display(),
+            ),
+        )
+        .expect("write config");
+        let config = AppConfig::load(&path).expect("config without [discord] and [matrix] loads");
+        assert!(config.discord.is_none());
+        assert!(config.matrix.is_none());
+        let bad = format!(
+            "[discord]\n\n[omp]\nexecutable = \"omp\"\nsession_dir = \"{}\"\nallowed_root = \"{}\"\n",
+            root.path().join("sessions").display(),
+            root.path().display(),
+        );
+        fs::write(&path, bad).expect("write broken config");
+        assert!(AppConfig::load(&path).is_err(), "present-but-empty [discord] must fail");
     }
 
     fn valid_config_toml(root: &Path) -> String {

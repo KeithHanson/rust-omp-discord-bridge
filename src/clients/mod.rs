@@ -3,7 +3,7 @@ pub mod matrix;
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use crate::{live_config::LiveConfig, store::Store};
 use tokio::sync::{Semaphore, mpsc};
@@ -29,9 +29,39 @@ pub async fn run(
             }
         })
     });
-    let result = discord::run(live_config, store, command_receiver, config_path, permits).await;
+    let result = match config.discord {
+        Some(_) => discord::run(live_config, store, command_receiver, config_path, permits).await,
+        None => {
+            let _ = command_receiver;
+            shutdown_signal().await
+        }
+    };
     if let Some(task) = matrix {
         task.abort();
     }
     result
+}
+
+pub(crate) async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("failed to listen for SIGTERM")?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("failed to listen for shutdown signal")
+            }
+            received = terminate.recv() => {
+                received.context("SIGTERM listener closed unexpectedly")?;
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for shutdown signal")
+    }
 }
