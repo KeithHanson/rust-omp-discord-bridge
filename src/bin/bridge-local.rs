@@ -87,7 +87,10 @@ fn main() -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(token.as_bytes())?;
     drop(file);
-    let discord = validated.discord.as_ref().context("the local launcher requires a Discord configuration")?;
+    let discord = validated
+        .discord
+        .as_ref()
+        .context("the local launcher requires a Discord configuration")?;
     drop(discord.load_token()?);
     let binary = std::env::current_exe()?.with_file_name("omp-client-bridge");
     let error = Command::new(binary)

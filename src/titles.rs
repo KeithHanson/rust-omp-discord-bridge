@@ -100,9 +100,15 @@ impl TitleReviewer {
     /// Call this again after any Discord rate-limit wait; never reuse a stale result.
     pub async fn review(&self, session: &Session) -> Result<ReviewedTitle> {
         let live = self.live_config.as_ref().map(LiveConfig::load);
-        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let config = live
+            .as_ref()
+            .map(|config| &config.omp)
+            .unwrap_or(&self.config);
         let _permit = self.gate.acquire().await.context("title reviewer closed")?;
-        let session = self.store.session(session.thread_id).await?
+        let session = self
+            .store
+            .session(session.thread_id)
+            .await?
             .context("title review session no longer exists")?;
         let counts = self.store.counts(session.thread_id).await?;
         let turns = self.store.title_context(session.thread_id).await?;
@@ -110,11 +116,16 @@ impl TitleReviewer {
             Some(path) => session_messages(&config.session_dir, path, &self.secrets).await?,
             None => Vec::new(),
         };
-        let turns: Vec<Value> = turns.into_iter().map(|turn| json!({
-            "status": turn.status.as_str(),
-            "user": redact(&turn.prompt, &self.secrets),
-            "assistant": turn.response.map(|text| redact(&text, &self.secrets)),
-        })).collect();
+        let turns: Vec<Value> = turns
+            .into_iter()
+            .map(|turn| {
+                json!({
+                    "status": turn.status.as_str(),
+                    "user": redact(&turn.prompt, &self.secrets),
+                    "assistant": turn.response.map(|text| redact(&text, &self.secrets)),
+                })
+            })
+            .collect();
         let prompt = serde_json::to_vec(&json!({
             "session_status": session.status.as_str(),
             "queue": {"queued": counts.queued, "running": counts.running, "uncertain": counts.uncertain},
@@ -122,9 +133,11 @@ impl TitleReviewer {
             "recent_visible_messages_oldest_first": visible,
             "context_is_bounded": true,
         }))?;
-        let root = tokio::fs::canonicalize(&config.allowed_root).await
+        let root = tokio::fs::canonicalize(&config.allowed_root)
+            .await
             .context("invalid title review allowed root")?;
-        let cwd = tokio::fs::canonicalize(&session.cwd).await
+        let cwd = tokio::fs::canonicalize(&session.cwd)
+            .await
             .context("invalid title review working directory")?;
         if !cwd.starts_with(&root) {
             bail!("title review working directory is outside allowed root");
@@ -135,9 +148,21 @@ impl TitleReviewer {
     fn command(&self, cwd: &Path, config: &OmpConfig) -> Command {
         let mut command = Command::new(&config.executable);
         command.args([
-            "--print", "--mode", "json", "--no-session", "--no-tools",
-            "--no-extensions", "--no-skills", "--no-rules", "--no-context-files",
-            "--no-title", "--no-lsp", "--max-time", "45s", "--system-prompt", SYSTEM,
+            "--print",
+            "--mode",
+            "json",
+            "--no-session",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules",
+            "--no-context-files",
+            "--no-title",
+            "--no-lsp",
+            "--max-time",
+            "45s",
+            "--system-prompt",
+            SYSTEM,
         ]);
         if let Some(model) = config.title_model.as_deref().or(config.model.as_deref()) {
             command.args(["--model", model]);
@@ -147,7 +172,8 @@ impl TitleReviewer {
                 command.env_remove(key);
             }
         }
-        command.current_dir(cwd)
+        command
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -156,9 +182,18 @@ impl TitleReviewer {
     }
 
     async fn ask(&self, prompt: &[u8], cwd: &Path, config: &OmpConfig) -> Result<ReviewedTitle> {
-        let mut child = self.command(cwd, config).spawn().context("could not start title reviewer")?;
-        let mut stdin = child.stdin.take().context("title reviewer stdin unavailable")?;
-        let stdout = child.stdout.take().context("title reviewer stdout unavailable")?;
+        let mut child = self
+            .command(cwd, config)
+            .spawn()
+            .context("could not start title reviewer")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("title reviewer stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("title reviewer stdout unavailable")?;
         let result = timeout(REVIEW_TIMEOUT, async {
             let write = async {
                 stdin.write_all(prompt).await?;
@@ -168,7 +203,10 @@ impl TitleReviewer {
             };
             let read = async {
                 let mut bytes = Vec::new();
-                stdout.take(MAX_OUTPUT_BYTES + 1).read_to_end(&mut bytes).await?;
+                stdout
+                    .take(MAX_OUTPUT_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .await?;
                 if bytes.len() as u64 > MAX_OUTPUT_BYTES {
                     bail!("title reviewer output exceeded size limit");
                 }
@@ -179,7 +217,10 @@ impl TitleReviewer {
                 bail!("title reviewer process failed");
             }
             parse_review(&bytes, &self.secrets)
-        }).await.context("title review timed out").and_then(|result| result);
+        })
+        .await
+        .context("title review timed out")
+        .and_then(|result| result);
         if result.is_err() {
             let _ = child.kill().await;
         }
@@ -188,12 +229,18 @@ impl TitleReviewer {
 }
 
 async fn session_messages(root: &Path, path: &Path, secrets: &[String]) -> Result<Vec<Value>> {
-    let root = tokio::fs::canonicalize(root).await.context("invalid title review session directory")?;
-    let path = tokio::fs::canonicalize(path).await.context("invalid title review session path")?;
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .context("invalid title review session directory")?;
+    let path = tokio::fs::canonicalize(path)
+        .await
+        .context("invalid title review session path")?;
     if !path.starts_with(&root) || path == root {
         bail!("title review session path is outside configured session directory");
     }
-    let mut file = tokio::fs::File::open(path).await.context("could not read title review session")?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .context("could not read title review session")?;
     let metadata = file.metadata().await?;
     if !metadata.is_file() {
         bail!("title review session is not a regular file");
@@ -236,17 +283,24 @@ fn project_snapshot(bytes: &[u8], discard_first: bool, secrets: &[String]) -> Re
         let content = &message["content"];
         let text = match content {
             Value::String(text) => Cow::Borrowed(text.as_str()),
-            Value::Array(parts) => Cow::Owned(parts.iter()
-                .filter(|part| part["type"] == "text")
-                .filter_map(|part| part["text"].as_str())
-                .collect::<Vec<_>>().join("\n")),
+            Value::Array(parts) => Cow::Owned(
+                parts
+                    .iter()
+                    .filter(|part| part["type"] == "text")
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             _ => continue,
         };
         if text.trim().is_empty() {
             continue;
         }
         let text = redact(&text, secrets);
-        let text: String = text.chars().take(remaining.min(MAX_MESSAGE_CHARS)).collect();
+        let text: String = text
+            .chars()
+            .take(remaining.min(MAX_MESSAGE_CHARS))
+            .collect();
         remaining -= text.chars().count();
         messages.push(json!({"role": role, "text": text}));
     }
@@ -271,9 +325,16 @@ fn parse_review(bytes: &[u8], secrets: &[String]) -> Result<ReviewedTitle> {
             if message["stopReason"] != "stop" {
                 bail!("title reviewer did not finish normally");
             }
-            let parts = message["content"].as_array().context("invalid title reviewer content")?;
-            answer = Some(parts.iter().filter(|part| part["type"] == "text")
-                .filter_map(|part| part["text"].as_str()).collect::<String>());
+            let parts = message["content"]
+                .as_array()
+                .context("invalid title reviewer content")?;
+            answer = Some(
+                parts
+                    .iter()
+                    .filter(|part| part["type"] == "text")
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<String>(),
+            );
         }
     }
     if !finished {
@@ -283,7 +344,8 @@ fn parse_review(bytes: &[u8], secrets: &[String]) -> Result<ReviewedTitle> {
     let mut title: ReviewedTitle = serde_json::from_str(&answer)
         .map_err(|_| anyhow::anyhow!("title reviewer returned invalid topic/status JSON"))?;
     title.topic = title.topic.trim().to_owned();
-    if title.topic.is_empty() || title.topic.chars().count() > 80
+    if title.topic.is_empty()
+        || title.topic.chars().count() > 80
         || title.topic.chars().any(char::is_control)
     {
         bail!("title reviewer returned an invalid topic");
@@ -294,18 +356,23 @@ fn parse_review(bytes: &[u8], secrets: &[String]) -> Result<ReviewedTitle> {
     Ok(title)
 }
 
-static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
     r#"(?i)\b[\w-]*(?:api[_-]?key|password|passwd|secret|token|authorization|credential)s?[\"']?\s*[=:]\s*(?:\"(?:\\.|[^\"\\])*\"?|\x27(?:\\.|[^\x27\\])*\x27?|[^\s,;}]+)"#,
-).expect("secret assignment pattern"));
-static SECRET_TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+).expect("secret assignment pattern")
+});
+static SECRET_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
     r"(?i)\b(?:sk-[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9_]{16,}|github_pat_[a-z0-9_]{16,}|Bearer\s+[a-z0-9._~+/-]+=*|(?:AKIA|ASIA)[A-Z0-9]{16}|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|[a-z0-9_-]{23,28}\.[a-z0-9_-]{6}\.[a-z0-9_-]{27,})",
-).expect("secret token pattern"));
-static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
-).expect("private key pattern"));
-static URL_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(
-    r"(?i)[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@",
-).expect("URL credential pattern"));
+).expect("secret token pattern")
+});
+static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)")
+        .expect("private key pattern")
+});
+static URL_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@").expect("URL credential pattern")
+});
 
 fn redact(text: &str, secrets: &[String]) -> String {
     let text = PRIVATE_KEY.replace_all(text, "[REDACTED]");
@@ -326,16 +393,29 @@ mod tests {
     use super::*;
 
     fn output(answer: &str) -> Vec<u8> {
-        format!("{}\n{}\n", json!({"type":"message_end","message":{
-            "role":"assistant","stopReason":"stop","content":[{"type":"text","text":answer}]
-        }}), json!({"type":"agent_end"})).into_bytes()
+        format!(
+            "{}\n{}\n",
+            json!({"type":"message_end","message":{
+                "role":"assistant","stopReason":"stop","content":[{"type":"text","text":answer}]
+            }}),
+            json!({"type":"agent_end"})
+        )
+        .into_bytes()
     }
 
     #[test]
     fn parses_strict_topic_and_noncompleted_phase() {
-        for (status, phase) in [("working", TitlePhase::Working), ("thinking", TitlePhase::Thinking),
-            ("waiting", TitlePhase::Waiting), ("blocked", TitlePhase::Blocked)] {
-            let result = parse_review(&output(&json!({"topic":"Fix thread titles","status":status}).to_string()), &[]).unwrap();
+        for (status, phase) in [
+            ("working", TitlePhase::Working),
+            ("thinking", TitlePhase::Thinking),
+            ("waiting", TitlePhase::Waiting),
+            ("blocked", TitlePhase::Blocked),
+        ] {
+            let result = parse_review(
+                &output(&json!({"topic":"Fix thread titles","status":status}).to_string()),
+                &[],
+            )
+            .unwrap();
             assert_eq!(result.topic, "Fix thread titles");
             assert_eq!(result.status, phase);
         }
@@ -348,8 +428,20 @@ mod tests {
         ] {
             assert!(parse_review(&output(invalid), &[]).is_err(), "{invalid}");
         }
-        assert!(parse_review(&output(&json!({"topic":"x".repeat(81),"status":"working"}).to_string()), &[]).is_err());
-        assert!(parse_review(&output(r#"{"topic":"private-value","status":"working"}"#), &["private-value".to_owned()]).is_err());
+        assert!(
+            parse_review(
+                &output(&json!({"topic":"x".repeat(81),"status":"working"}).to_string()),
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            parse_review(
+                &output(r#"{"topic":"private-value","status":"working"}"#),
+                &["private-value".to_owned()]
+            )
+            .is_err()
+        );
         assert!(parse_review(b"{\"type\":\"agent_end\"}\n", &[]).is_err());
     }
 
@@ -365,24 +457,37 @@ mod tests {
             ],"provider":"private provider metadata"}}),
             json!({"type":"message","message":{"role":"user","content":"Fix titles"}}),
         ];
-        let mut bytes = records.iter().map(|record| format!("{record}\n")).collect::<String>();
+        let mut bytes = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
         bytes.push_str(r#"{"type":"message","message":{"role":"user","content":"unfinished"}}"#);
         let projected = project_snapshot(bytes.as_bytes(), false, &[]).unwrap();
-        assert_eq!(projected, vec![
-            json!({"role":"assistant","text":"Repair queue [REDACTED]"}),
-            json!({"role":"user","text":"Fix titles"}),
-        ]);
+        assert_eq!(
+            projected,
+            vec![
+                json!({"role":"assistant","text":"Repair queue [REDACTED]"}),
+                json!({"role":"user","text":"Fix titles"}),
+            ]
+        );
         let cut = format!("partial record\n{bytes}");
-        assert_eq!(project_snapshot(cut.as_bytes(), true, &[]).unwrap(), projected);
+        assert_eq!(
+            project_snapshot(cut.as_bytes(), true, &[]).unwrap(),
+            projected
+        );
         assert!(project_snapshot(b"partial", true, &[]).unwrap().is_empty());
     }
 
     #[test]
     fn redacts_credentials_and_known_environment_secrets() {
         for secret in [
-            "api_key=topsecret", "DISCORD_TOKEN='private-token'", "\"password\": \"secret value\"",
-            "authorization: Bearer abc.def.ghi", "sk-12345678901234567890",
-            "ghp_123456789012345678901234", "https://user:password@example.org",
+            "api_key=topsecret",
+            "DISCORD_TOKEN='private-token'",
+            "\"password\": \"secret value\"",
+            "authorization: Bearer abc.def.ghi",
+            "sk-12345678901234567890",
+            "ghp_123456789012345678901234",
+            "https://user:password@example.org",
             "-----BEGIN RSA PRIVATE KEY-----\nprivate\n-----END RSA PRIVATE KEY-----",
         ] {
             let redacted = redact(secret, &[]);
@@ -391,7 +496,10 @@ mod tests {
             assert!(!redacted.contains("private-token"));
             assert!(!redacted.contains("abc.def.ghi"));
         }
-        assert_eq!(redact("use opaque-value here", &["opaque-value".to_owned()]), "use [REDACTED] here");
+        assert_eq!(
+            redact("use opaque-value here", &["opaque-value".to_owned()]),
+            "use [REDACTED] here"
+        );
         assert_eq!(redact("Fix queue scheduling", &[]), "Fix queue scheduling");
     }
 
@@ -401,40 +509,79 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
         let record = json!({"type":"message","message":{"role":"user","content":"x".repeat(4096)}});
-        tokio::fs::write(&path, format!("{record}\n").repeat(100)).await.unwrap();
-        let messages = session_messages(directory.path(), &path, &[]).await.unwrap();
-        let chars: usize = messages.iter().map(|message| message["text"].as_str().unwrap().chars().count()).sum();
+        tokio::fs::write(&path, format!("{record}\n").repeat(100))
+            .await
+            .unwrap();
+        let messages = session_messages(directory.path(), &path, &[])
+            .await
+            .unwrap();
+        let chars: usize = messages
+            .iter()
+            .map(|message| message["text"].as_str().unwrap().chars().count())
+            .sum();
         assert_eq!(chars, MAX_VISIBLE_CHARS);
         let escaped = outside.path().join("session.jsonl");
-        tokio::fs::write(&escaped, format!("{record}\n")).await.unwrap();
-        assert!(session_messages(directory.path(), &escaped, &[]).await.is_err());
+        tokio::fs::write(&escaped, format!("{record}\n"))
+            .await
+            .unwrap();
+        assert!(
+            session_messages(directory.path(), &escaped, &[])
+                .await
+                .is_err()
+        );
         #[cfg(unix)]
         {
             let link = directory.path().join("link.jsonl");
             std::os::unix::fs::symlink(&escaped, &link).unwrap();
-            assert!(session_messages(directory.path(), &link, &[]).await.is_err());
+            assert!(
+                session_messages(directory.path(), &link, &[])
+                    .await
+                    .is_err()
+            );
         }
     }
 
     #[tokio::test]
     async fn reviewer_is_isolated_and_title_model_falls_back() {
         let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(&directory.path().join("store.sqlite")).await.unwrap();
+        let store = Store::open(&directory.path().join("store.sqlite"))
+            .await
+            .unwrap();
         let config = OmpConfig {
-            executable: "omp".into(), session_dir: directory.path().into(),
-            allowed_root: directory.path().into(), model: Some("primary".into()),
-            title_model: None, thinking_level: None,
+            executable: "omp".into(),
+            session_dir: directory.path().into(),
+            allowed_root: directory.path().into(),
+            model: Some("primary".into()),
+            title_model: None,
+            thinking_level: None,
         };
         let mut reviewer = TitleReviewer::new(config, store);
         let command = reviewer.command(directory.path(), &reviewer.config);
-        let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_string_lossy()).collect();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
         assert!(args.windows(2).any(|pair| pair == ["--model", "primary"]));
-        for flag in ["--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-rules", "--no-context-files", "--no-title", "--no-lsp"] {
+        for flag in [
+            "--no-session",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules",
+            "--no-context-files",
+            "--no-title",
+            "--no-lsp",
+        ] {
             assert!(args.iter().any(|arg| arg == flag));
         }
         reviewer.config.title_model = Some("reviewer".into());
         let command = reviewer.command(directory.path(), &reviewer.config);
-        let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_string_lossy()).collect();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
         assert!(args.windows(2).any(|pair| pair == ["--model", "reviewer"]));
         let cloned = reviewer.clone();
         let _permit = reviewer.gate.acquire().await.unwrap();

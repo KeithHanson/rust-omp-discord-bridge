@@ -77,7 +77,10 @@ impl OmpUi for Ui {
     async fn thread_participants(&self) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
-    async fn upload_file(&self, _: omp_client_bridge::omp::UploadRequest) -> Result<String, String> {
+    async fn upload_file(
+        &self,
+        _: omp_client_bridge::omp::UploadRequest,
+    ) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
 }

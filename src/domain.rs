@@ -48,7 +48,10 @@ macro_rules! client_scoped_id {
         }
 
         impl $name {
-            pub fn scoped(client: ClientKind, native: impl Into<Arc<str>>) -> Result<Self, InvalidClientId> {
+            pub fn scoped(
+                client: ClientKind,
+                native: impl Into<Arc<str>>,
+            ) -> Result<Self, InvalidClientId> {
                 let native = native.into();
                 if native.is_empty() {
                     return Err(InvalidClientId);
@@ -107,7 +110,6 @@ impl ConversationId {
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("conversation database IDs must be positive, got {0}")]
 pub struct InvalidConversationId(i64);
-
 
 macro_rules! snowflake {
     ($name:ident) => {

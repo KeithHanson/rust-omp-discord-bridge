@@ -1,6 +1,6 @@
 mod activity;
-pub mod config;
 pub mod clients;
+pub mod config;
 pub mod domain;
 pub mod live_config;
 pub mod omp;
@@ -9,7 +9,7 @@ pub mod render;
 pub mod runner;
 pub mod store;
 mod table_images;
-pub mod titles;
-mod usage;
 pub mod threadwatch;
+pub mod titles;
 mod update;
+mod usage;

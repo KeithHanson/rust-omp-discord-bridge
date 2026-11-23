@@ -1,4 +1,8 @@
-use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
@@ -13,7 +17,9 @@ pub struct LiveConfig {
 
 impl LiveConfig {
     pub fn new(config: AppConfig) -> Self {
-        Self { current: Arc::new(ArcSwap::from_pointee(config)) }
+        Self {
+            current: Arc::new(ArcSwap::from_pointee(config)),
+        }
     }
 
     pub fn load(&self) -> Arc<AppConfig> {
@@ -51,30 +57,34 @@ fn ensure_restart_fields_unchanged(current: &AppConfig, candidate: &AppConfig) -
         || current.runtime.discord_message_limit != candidate.runtime.discord_message_limit
         || current.runtime.max_attachment_bytes != candidate.runtime.max_attachment_bytes
         || current.runtime.max_attachments != candidate.runtime.max_attachments
-        || current.runtime.discord_history_max_messages != candidate.runtime.discord_history_max_messages
+        || current.runtime.discord_history_max_messages
+            != candidate.runtime.discord_history_max_messages
         || current.runtime.discord_history_max_bytes != candidate.runtime.discord_history_max_bytes
-        || current.runtime.discord_history_timeout_seconds != candidate.runtime.discord_history_timeout_seconds
+        || current.runtime.discord_history_timeout_seconds
+            != candidate.runtime.discord_history_timeout_seconds
     {
         changed.push("runtime fields other than max_response_bytes, discord_history_max_days, and turn_timeout_seconds");
     }
     if current.threadwatch.is_some() != candidate.threadwatch.is_some() {
         changed.push("threadwatch");
-    } else if let (Some(old), Some(new)) = (&current.threadwatch, &candidate.threadwatch) {
-        if old.server_url != new.server_url
+    } else if let (Some(old), Some(new)) = (&current.threadwatch, &candidate.threadwatch)
+        && (old.server_url != new.server_url
             || old.ingest_token_file != new.ingest_token_file
             || old.bot_id != new.bot_id
             || old.bot_name != new.bot_name
             || old.data_dir != new.data_dir
             || old.collect_interval_ms != new.collect_interval_ms
-            || old.heartbeat_interval_ms != new.heartbeat_interval_ms
-        {
-            changed.push("threadwatch");
-        }
+            || old.heartbeat_interval_ms != new.heartbeat_interval_ms)
+    {
+        changed.push("threadwatch");
     }
     if changed.is_empty() {
         Ok(())
     } else {
-        bail!("restart-required configuration changed: {}", changed.join(", "))
+        bail!(
+            "restart-required configuration changed: {}",
+            changed.join(", ")
+        )
     }
 }
 
@@ -88,10 +98,17 @@ pub fn spawn_watcher(path: PathBuf, config: LiveConfig) -> Result<tokio::task::J
         notify::Config::default(),
     )
     .context("failed to create configuration watcher")?;
-    let parent = path.parent().context("configuration path has no parent directory")?;
+    let parent = path
+        .parent()
+        .context("configuration path has no parent directory")?;
     watcher
         .watch(parent, RecursiveMode::NonRecursive)
-        .with_context(|| format!("failed to watch configuration directory {}", parent.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to watch configuration directory {}",
+                parent.display()
+            )
+        })?;
 
     Ok(tokio::spawn(async move {
         let _watcher = watcher;
@@ -109,8 +126,12 @@ pub fn spawn_watcher(path: PathBuf, config: LiveConfig) -> Result<tokio::task::J
             tokio::time::sleep(Duration::from_millis(100)).await;
             while receiver.try_recv().is_ok() {}
             match config.reload(&watched_path) {
-                Ok(()) => tracing::info!(path = %watched_path.display(), "reloaded live configuration"),
-                Err(error) => tracing::warn!(error = %format!("{error:#}"), path = %watched_path.display(), "kept last-known-good configuration"),
+                Ok(()) => {
+                    tracing::info!(path = %watched_path.display(), "reloaded live configuration")
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), path = %watched_path.display(), "kept last-known-good configuration")
+                }
             }
         }
     }))
@@ -127,7 +148,10 @@ mod tests {
         let source = std::fs::read_to_string("config.example.toml")
             .unwrap()
             .replace("~/src/project", &root.to_string())
-            .replace("allowed_root = \"~/src\"", &format!("allowed_root = \"{root}\""));
+            .replace(
+                "allowed_root = \"~/src\"",
+                &format!("allowed_root = \"{root}\""),
+            );
         std::fs::write(&path, source).unwrap();
         (directory, path)
     }
@@ -156,7 +180,11 @@ mod tests {
         let (_directory, path) = copied_config();
         let live = LiveConfig::new(AppConfig::load(&path).unwrap());
         let source = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, source.replace("executable = \"omp\"", "executable = \"other-omp\"")).unwrap();
+        std::fs::write(
+            &path,
+            source.replace("executable = \"omp\"", "executable = \"other-omp\""),
+        )
+        .unwrap();
         let error = live.reload(&path).unwrap_err();
         assert!(error.to_string().contains("omp.executable"), "{error:#}");
         assert_eq!(live.load().omp.executable, PathBuf::from("omp"));

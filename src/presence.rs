@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use tokio::sync::watch;
 
@@ -44,10 +47,7 @@ impl PresenceTracker {
         self.snapshot.subscribe()
     }
 
-    pub(crate) fn engage(
-        self: &Arc<Self>,
-        conversation_id: ConversationId,
-    ) -> WorkingPresence {
+    pub(crate) fn engage(self: &Arc<Self>, conversation_id: ConversationId) -> WorkingPresence {
         self.update(conversation_id, |conversation| conversation.engaged += 1);
         WorkingPresence {
             tracker: Arc::clone(self),
@@ -55,11 +55,7 @@ impl PresenceTracker {
         }
     }
 
-    fn update(
-        &self,
-        conversation_id: ConversationId,
-        update: impl FnOnce(&mut ThreadPresence),
-    ) {
+    fn update(&self, conversation_id: ConversationId, update: impl FnOnce(&mut ThreadPresence)) {
         // Serialize the counters and publication together; no await or network I/O.
         let mut conversations = self.conversations.lock().unwrap();
         let conversation = conversations.entry(conversation_id).or_default();
@@ -72,8 +68,8 @@ impl PresenceTracker {
         if before != after {
             self.snapshot.send_modify(|snapshot| {
                 snapshot.working = snapshot.working - before.working + after.working;
-                snapshot.awaiting_approval = snapshot.awaiting_approval
-                    - before.awaiting_approval + after.awaiting_approval;
+                snapshot.awaiting_approval =
+                    snapshot.awaiting_approval - before.awaiting_approval + after.awaiting_approval;
             });
         }
     }
@@ -86,14 +82,18 @@ pub(crate) struct WorkingPresence {
 
 impl WorkingPresence {
     pub(crate) fn awaiting_approval(&self) -> ApprovalPresence<'_> {
-        self.tracker.update(self.conversation_id, |conversation| conversation.approvals += 1);
+        self.tracker.update(self.conversation_id, |conversation| {
+            conversation.approvals += 1
+        });
         ApprovalPresence(self)
     }
 }
 
 impl Drop for WorkingPresence {
     fn drop(&mut self) {
-        self.tracker.update(self.conversation_id, |conversation| conversation.engaged -= 1);
+        self.tracker.update(self.conversation_id, |conversation| {
+            conversation.engaged -= 1
+        });
     }
 }
 
@@ -101,7 +101,11 @@ pub(crate) struct ApprovalPresence<'a>(&'a WorkingPresence);
 
 impl Drop for ApprovalPresence<'_> {
     fn drop(&mut self) {
-        self.0.tracker.update(self.0.conversation_id, |conversation| conversation.approvals -= 1);
+        self.0
+            .tracker
+            .update(self.0.conversation_id, |conversation| {
+                conversation.approvals -= 1
+            });
     }
 }
 
@@ -116,17 +120,35 @@ mod tests {
         let first = tracker.engage(ConversationId::new(1).unwrap());
         let replacement = tracker.engage(ConversationId::new(1).unwrap());
         let second = tracker.engage(ConversationId::new(2).unwrap());
-        assert_eq!(*snapshots.borrow_and_update(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow_and_update(),
+            PresenceSnapshot {
+                working: 2,
+                awaiting_approval: 0
+            }
+        );
         drop(replacement);
         assert!(!snapshots.has_changed().unwrap());
         let approval = first.awaiting_approval();
-        assert_eq!(*snapshots.borrow_and_update(), PresenceSnapshot { working: 1, awaiting_approval: 1 });
+        assert_eq!(
+            *snapshots.borrow_and_update(),
+            PresenceSnapshot {
+                working: 1,
+                awaiting_approval: 1
+            }
+        );
         let nested = first.awaiting_approval();
         assert!(!snapshots.has_changed().unwrap());
         drop(approval);
         assert!(!snapshots.has_changed().unwrap());
         drop(nested);
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 2,
+                awaiting_approval: 0
+            }
+        );
         drop(first);
         drop(second);
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
@@ -147,7 +169,13 @@ mod tests {
             _ = &mut pending => panic!("approval unexpectedly completed"),
             _ = std::future::ready(()) => {}
         }
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 0, awaiting_approval: 1 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 0,
+                awaiting_approval: 1
+            }
+        );
         drop(pending);
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
         assert!(tracker.conversations.lock().unwrap().is_empty());

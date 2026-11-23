@@ -212,7 +212,10 @@ impl OmpTransport {
         // OMP's chat catalog uses ModelRegistry.getAvailable(), including
         // configured credentials and extension-provided models.
         let live = self.live();
-        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let config = live
+            .as_ref()
+            .map(|config| &config.omp)
+            .unwrap_or(&self.config);
         let mut process = Command::new(&config.executable)
             .args(["models", "--json"])
             .current_dir(&config.allowed_root)
@@ -253,7 +256,10 @@ impl OmpTransport {
 
     pub async fn probe(&self) -> Result<(), OmpTurnError> {
         let live = self.live();
-        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let config = live
+            .as_ref()
+            .map(|config| &config.omp)
+            .unwrap_or(&self.config);
         let mut process = bounded(
             STARTUP_TIMEOUT,
             "spawning OMP",
@@ -288,7 +294,10 @@ impl OmpTransport {
         ui: &dyn OmpUi,
     ) -> Result<OmpTurnResult, OmpTurnError> {
         let live = self.live();
-        let omp_config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let omp_config = live
+            .as_ref()
+            .map(|config| &config.omp)
+            .unwrap_or(&self.config);
         let discord_history_max_days = live
             .as_ref()
             .map(|config| config.runtime.discord_history_max_days)
@@ -836,7 +845,10 @@ impl OmpTransport {
         model: Option<&str>,
     ) -> Result<Child, OmpTurnError> {
         let live = self.live();
-        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let config = live
+            .as_ref()
+            .map(|config| &config.omp)
+            .unwrap_or(&self.config);
         tokio::fs::create_dir_all(&config.session_dir)
             .await
             .map_err(|error| {
@@ -937,7 +949,10 @@ impl OmpTransport {
 
     async fn canonical_session_root(&self) -> Result<PathBuf, OmpTurnError> {
         let live = self.live();
-        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let config = live
+            .as_ref()
+            .map(|config| &config.omp)
+            .unwrap_or(&self.config);
         tokio::fs::canonicalize(&config.session_dir)
             .await
             .map_err(|error| {
@@ -950,7 +965,10 @@ impl OmpTransport {
 impl AgentTransport for OmpTransport {
     async fn usage(&self) -> anyhow::Result<String> {
         let live = self.live();
-        let config = live.as_ref().map(|config| &config.omp).unwrap_or(&self.config);
+        let config = live
+            .as_ref()
+            .map(|config| &config.omp)
+            .unwrap_or(&self.config);
         crate::usage::fetch(&config.executable, &config.allowed_root).await
     }
 
@@ -1188,7 +1206,9 @@ impl<'a> ServiceRequest<'a> {
             })?
             .to_owned();
         let cancel = if frame.get("type").and_then(Value::as_str) == Some("host_tool_call") {
-            let reason = if frame.get("toolName").and_then(Value::as_str) == Some(DISCORD_UPLOAD_TOOL) {
+            let reason = if frame.get("toolName").and_then(Value::as_str)
+                == Some(DISCORD_UPLOAD_TOOL)
+            {
                 "Upload cancelled or timed out; delivery may already have occurred. Inspect the thread before retrying."
             } else {
                 "Bridge request cancelled"
@@ -1510,9 +1530,14 @@ where
                 .pointer("/data/toolNames")
                 .and_then(Value::as_array)
                 .is_some_and(|names| {
-                    [DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL, DISCORD_UPLOAD_TOOL, DISCORD_THREAD_HISTORY_TOOL]
-                        .iter()
-                        .all(|required| names.iter().any(|name| name.as_str() == Some(*required)))
+                    [
+                        DISCORD_HISTORY_TOOL,
+                        DISCORD_PARTICIPANTS_TOOL,
+                        DISCORD_UPLOAD_TOOL,
+                        DISCORD_THREAD_HISTORY_TOOL,
+                    ]
+                    .iter()
+                    .all(|required| names.iter().any(|name| name.as_str() == Some(*required)))
                 });
             if !registered {
                 return Err(OmpTurnError::Protocol(
@@ -1592,10 +1617,12 @@ async fn service_response(frame: &Value, ui: &dyn OmpUi, max_history_days: u16) 
             Ok(days) => ui.channel_history(days).await,
             Err(error) => Err(error),
         },
-        Some(DISCORD_THREAD_HISTORY_TOOL) => match thread_history_arguments(frame, max_history_days) {
-            Ok((thread_id, days)) => ui.thread_history(thread_id, days).await,
-            Err(error) => Err(error),
-        },
+        Some(DISCORD_THREAD_HISTORY_TOOL) => {
+            match thread_history_arguments(frame, max_history_days) {
+                Ok((thread_id, days)) => ui.thread_history(thread_id, days).await,
+                Err(error) => Err(error),
+            }
+        }
         Some(DISCORD_PARTICIPANTS_TOOL) => match frame.get("arguments") {
             None => ui.thread_participants().await,
             Some(Value::Object(arguments)) if arguments.is_empty() => {
@@ -1607,7 +1634,9 @@ async fn service_response(frame: &Value, ui: &dyn OmpUi, max_history_days: u16) 
             match serde_json::from_value::<UploadRequest>(
                 frame.get("arguments").cloned().unwrap_or(Value::Null),
             ) {
-                Ok(request) if !request.path.as_os_str().is_empty() => ui.upload_file(request).await,
+                Ok(request) if !request.path.as_os_str().is_empty() => {
+                    ui.upload_file(request).await
+                }
                 Ok(_) => Err("`path` must not be empty".to_owned()),
                 Err(error) => Err(format!("Invalid upload arguments: {error}")),
             }
@@ -1644,16 +1673,25 @@ fn history_days(frame: &Value, max_history_days: u16) -> Result<u16, String> {
     u16::try_from(days).map_err(|_| format!("`days` must be between 1 and {max_history_days}"))
 }
 
-fn thread_history_arguments(frame: &Value, max_history_days: u16) -> Result<(ThreadId, u16), String> {
+fn thread_history_arguments(
+    frame: &Value,
+    max_history_days: u16,
+) -> Result<(ThreadId, u16), String> {
     let arguments = frame
         .get("arguments")
         .and_then(Value::as_object)
         .ok_or_else(|| "Thread history arguments must be an object".to_owned())?;
-    if arguments.keys().any(|key| key != "thread_id" && key != "days") {
+    if arguments
+        .keys()
+        .any(|key| key != "thread_id" && key != "days")
+    {
         return Err("`discord_thread_history` accepts only `thread_id` and `days`".to_owned());
     }
     let invalid_id = || "`thread_id` must be a nonzero decimal u64 string".to_owned();
-    let id = arguments.get("thread_id").and_then(Value::as_str).ok_or_else(invalid_id)?;
+    let id = arguments
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_id)?;
     if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid_id());
     }
@@ -2006,14 +2044,18 @@ mod tests {
             let (client_read, client_write) = tokio::io::split(client);
             let (server_read, server_write) = tokio::io::split(server);
             let mut input = BufWriter::new(client_write);
-            let mut frames =
-                FramedRead::new(client_read, LinesCodec::new_with_max_length(MAX_RPC_LINE_BYTES));
+            let mut frames = FramedRead::new(
+                client_read,
+                LinesCodec::new_with_max_length(MAX_RPC_LINE_BYTES),
+            );
             let ui = TestUi::default();
             let selection =
                 set_session_model(&mut input, &mut frames, "provider/namespace/model", &ui, 7);
             let protocol = async {
-                let mut commands =
-                    FramedRead::new(server_read, LinesCodec::new_with_max_length(MAX_RPC_LINE_BYTES));
+                let mut commands = FramedRead::new(
+                    server_read,
+                    LinesCodec::new_with_max_length(MAX_RPC_LINE_BYTES),
+                );
                 let mut events = BufWriter::new(server_write);
                 let command = next_frame(commands.next().await, false).unwrap();
                 assert_eq!(
@@ -3169,7 +3211,10 @@ mod tests {
             ("select", json!({"value": "Exact option"})),
             ("input", json!({"value": ""})),
             ("editor", json!({"value": "line one\nline two"})),
-            ("ask", json!({"answers": [{"id": "q1", "selectedOptions": ["Yes"]}]})),
+            (
+                "ask",
+                json!({"answers": [{"id": "q1", "selectedOptions": ["Yes"]}]}),
+            ),
             ("input", json!({"cancelled": true})),
             ("ask", json!({"cancelled": true, "timedOut": true})),
         ] {
@@ -3330,7 +3375,10 @@ mod tests {
             .unwrap()
         };
         let mut requests = vec![request("first"), request("second")];
-        cancel_service_request(&json!({"id": "first", "targetId": "missing"}), &mut requests);
+        cancel_service_request(
+            &json!({"id": "first", "targetId": "missing"}),
+            &mut requests,
+        );
         assert_eq!(requests.len(), 2);
         cancel_service_request(&json!({"id": "first", "targetId": "second"}), &mut requests);
         assert_eq!(requests.len(), 1);
@@ -3554,7 +3602,8 @@ mod tests {
                 }),
                 &HistoryUi(false),
                 30,
-            ).await;
+            )
+            .await;
             assert_eq!(response["isError"], true, "{arguments}");
             assert_eq!(response["id"], "invalid-upload");
         }
@@ -3587,15 +3636,34 @@ mod tests {
             assert_eq!(thread_history_rpc(arguments, false).await["isError"], true);
         }
         for id in [
-            json!(42), json!(null), json!(true), json!(""), json!("0"),
-            json!("-1"), json!("+1"), json!(" 42"), json!("42 "),
-            json!("1.0"), json!("1e2"), json!("１２"), json!("18446744073709551616"),
+            json!(42),
+            json!(null),
+            json!(true),
+            json!(""),
+            json!("0"),
+            json!("-1"),
+            json!("+1"),
+            json!(" 42"),
+            json!("42 "),
+            json!("1.0"),
+            json!("1e2"),
+            json!("１２"),
+            json!("18446744073709551616"),
         ] {
             let response = thread_history_rpc(json!({"thread_id": id, "days": 1}), false).await;
             assert_eq!(response["isError"], true, "{id}");
         }
-        for days in [json!(0), json!(31), json!(-1), json!(1.5), json!("1"), json!(null), json!(true)] {
-            let response = thread_history_rpc(json!({"thread_id": "42", "days": days}), false).await;
+        for days in [
+            json!(0),
+            json!(31),
+            json!(-1),
+            json!(1.5),
+            json!("1"),
+            json!(null),
+            json!(true),
+        ] {
+            let response =
+                thread_history_rpc(json!({"thread_id": "42", "days": days}), false).await;
             assert_eq!(response["isError"], true, "{days}");
         }
     }
@@ -3607,14 +3675,22 @@ mod tests {
             assert_eq!(response["type"], "host_tool_result");
             assert_eq!(response["id"], "thread-history-1");
             assert!(response.get("isError").is_none());
-            assert_eq!(response["result"]["content"][0]["text"], format!("history for thread {id} for {days} days"));
+            assert_eq!(
+                response["result"]["content"][0]["text"],
+                format!("history for thread {id} for {days} days")
+            );
         }
         let response = thread_history_rpc(json!({"thread_id": "42", "days": 7}), true).await;
         assert_eq!(response["id"], "thread-history-1");
         assert_eq!(response["isError"], true);
-        assert_eq!(response["result"]["content"][0]["text"], "Discord thread history unavailable");
         assert_eq!(
-            activity_status(&json!({"type": "tool_execution_start", "toolName": DISCORD_THREAD_HISTORY_TOOL})),
+            response["result"]["content"][0]["text"],
+            "Discord thread history unavailable"
+        );
+        assert_eq!(
+            activity_status(
+                &json!({"type": "tool_execution_start", "toolName": DISCORD_THREAD_HISTORY_TOOL})
+            ),
             Some("Reading thread history")
         );
     }
@@ -3625,8 +3701,17 @@ mod tests {
             json!([DISCORD_HISTORY_TOOL]),
             json!([DISCORD_PARTICIPANTS_TOOL]),
             json!([DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL]),
-            json!([DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL, DISCORD_UPLOAD_TOOL]),
-            json!([DISCORD_HISTORY_TOOL, DISCORD_PARTICIPANTS_TOOL, DISCORD_UPLOAD_TOOL, DISCORD_THREAD_HISTORY_TOOL]),
+            json!([
+                DISCORD_HISTORY_TOOL,
+                DISCORD_PARTICIPANTS_TOOL,
+                DISCORD_UPLOAD_TOOL
+            ]),
+            json!([
+                DISCORD_HISTORY_TOOL,
+                DISCORD_PARTICIPANTS_TOOL,
+                DISCORD_UPLOAD_TOOL,
+                DISCORD_THREAD_HISTORY_TOOL
+            ]),
         ] {
             let (writer, reader) = tokio::io::duplex(8_192);
             let (response_writer, response_reader) = tokio::io::duplex(1_024);
@@ -3656,10 +3741,22 @@ mod tests {
             );
             assert_eq!(command["tools"][2]["name"], DISCORD_UPLOAD_TOOL);
             assert_eq!(command["tools"][3]["name"], DISCORD_THREAD_HISTORY_TOOL);
-            assert_eq!(command["tools"][3]["parameters"]["required"], json!(["thread_id", "days"]));
-            assert_eq!(command["tools"][3]["parameters"]["properties"]["thread_id"]["type"], "string");
-            assert_eq!(command["tools"][3]["parameters"]["properties"]["days"]["maximum"], 30);
-            assert_eq!(command["tools"][3]["parameters"]["additionalProperties"], false);
+            assert_eq!(
+                command["tools"][3]["parameters"]["required"],
+                json!(["thread_id", "days"])
+            );
+            assert_eq!(
+                command["tools"][3]["parameters"]["properties"]["thread_id"]["type"],
+                "string"
+            );
+            assert_eq!(
+                command["tools"][3]["parameters"]["properties"]["days"]["maximum"],
+                30
+            );
+            assert_eq!(
+                command["tools"][3]["parameters"]["additionalProperties"],
+                false
+            );
             assert_eq!(command["tools"].as_array().unwrap().len(), 4);
         }
     }
@@ -3674,7 +3771,10 @@ mod tests {
         let arguments = directory.path().join("arguments");
         std::fs::write(
             &executable,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", arguments.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                arguments.display()
+            ),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
@@ -3707,16 +3807,16 @@ model = "openai/old"
         .unwrap();
         let live_config = LiveConfig::new(crate::config::AppConfig::load(&config_path).unwrap());
         let transport = OmpTransport::from_live(live_config.clone());
-        crate::config::AppConfig::write_default_model(
-            &config_path,
-            "rtx-inkling/inkling-2-mini",
-        )
-        .unwrap();
+        crate::config::AppConfig::write_default_model(&config_path, "rtx-inkling/inkling-2-mini")
+            .unwrap();
         live_config.reload(&config_path).unwrap();
 
         let mut child = transport.spawn(None, directory.path(), None).await.unwrap();
         child.wait().await.unwrap();
         let arguments = std::fs::read_to_string(arguments).unwrap();
-        assert!(arguments.contains("--model\nrtx-inkling/inkling-2-mini\n"), "{arguments}");
+        assert!(
+            arguments.contains("--model\nrtx-inkling/inkling-2-mini\n"),
+            "{arguments}"
+        );
     }
 }

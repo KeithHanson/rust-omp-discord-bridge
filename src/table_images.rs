@@ -84,11 +84,25 @@ pub(crate) async fn prepare(content: &str, limit: usize) -> Result<Vec<Assistant
     command.process_group(0);
     let child = command.spawn().context("starting table renderer with uv")?;
     let mut process = RendererProcess::new(child)?;
-    let stdout = process.child.stdout.take().context("missing renderer stdout")?;
-    let stderr = process.child.stderr.take().context("missing renderer stderr")?;
+    let stdout = process
+        .child
+        .stdout
+        .take()
+        .context("missing renderer stdout")?;
+    let stderr = process
+        .child
+        .stderr
+        .take()
+        .context("missing renderer stderr")?;
     let (status, manifest, diagnostics) = tokio::time::timeout(RENDER_TIMEOUT, async {
         tokio::try_join!(
-            async { process.child.wait().await.context("waiting for table renderer") },
+            async {
+                process
+                    .child
+                    .wait()
+                    .await
+                    .context("waiting for table renderer")
+            },
             read_bounded(stdout, MAX_MANIFEST_BYTES, "table renderer manifest"),
             read_bounded(stderr, 64 * 1024, "table renderer diagnostics"),
         )
@@ -130,15 +144,28 @@ async fn read_bounded(
         .read_to_end(&mut bytes)
         .await
         .with_context(|| format!("reading {description}"))?;
-    ensure!(bytes.len() <= maximum, "{description} exceeds {maximum} bytes");
+    ensure!(
+        bytes.len() <= maximum,
+        "{description} exceeds {maximum} bytes"
+    );
     Ok(bytes)
 }
 
-async fn load_manifest(manifest: &[u8], directory: &Path, limit: usize) -> Result<Vec<AssistantPart>> {
+async fn load_manifest(
+    manifest: &[u8],
+    directory: &Path,
+    limit: usize,
+) -> Result<Vec<AssistantPart>> {
     let entries: Vec<ManifestPart> =
         serde_json::from_slice(manifest).context("invalid table renderer manifest")?;
-    ensure!(!entries.is_empty(), "table renderer returned an empty manifest");
-    ensure!(entries.len() <= MAX_PARTS, "table renderer exceeds {MAX_PARTS} parts");
+    ensure!(
+        !entries.is_empty(),
+        "table renderer returned an empty manifest"
+    );
+    ensure!(
+        entries.len() <= MAX_PARTS,
+        "table renderer exceeds {MAX_PARTS} parts"
+    );
     let mut parts = Vec::with_capacity(entries.len());
     for entry in entries {
         match entry {
@@ -154,7 +181,10 @@ async fn load_manifest(manifest: &[u8], directory: &Path, limit: usize) -> Resul
                 let metadata = tokio::fs::symlink_metadata(path)
                     .await
                     .context("reading table image metadata")?;
-                ensure!(metadata.file_type().is_file(), "table image must be a regular file");
+                ensure!(
+                    metadata.file_type().is_file(),
+                    "table image must be a regular file"
+                );
                 ensure!(
                     metadata.len() <= MAX_ATTACHMENT_BYTES as u64,
                     "table image exceeds the 10 MiB attachment limit"
@@ -162,20 +192,32 @@ async fn load_manifest(manifest: &[u8], directory: &Path, limit: usize) -> Resul
                 let canonical = tokio::fs::canonicalize(path)
                     .await
                     .context("resolving table image path")?;
-                ensure!(canonical.starts_with(directory), "table image escapes renderer directory");
-                ensure!(canonical.extension().is_some_and(|ext| ext == "png"), "table image must be a PNG");
+                ensure!(
+                    canonical.starts_with(directory),
+                    "table image escapes renderer directory"
+                );
+                ensure!(
+                    canonical.extension().is_some_and(|ext| ext == "png"),
+                    "table image must be a PNG"
+                );
                 let file = tokio::fs::File::open(&canonical)
                     .await
                     .context("opening table image")?;
                 let data = read_bounded(file, MAX_ATTACHMENT_BYTES, "table image").await?;
-                ensure!(data.starts_with(PNG_SIGNATURE), "table image has an invalid PNG signature");
+                ensure!(
+                    data.starts_with(PNG_SIGNATURE),
+                    "table image has an invalid PNG signature"
+                );
                 parts.push(AssistantPart::Image {
                     data,
                     filename: format!("table-{}.png", parts.len() + 1),
                 });
             }
         }
-        ensure!(parts.len() <= MAX_PARTS, "assistant output exceeds {MAX_PARTS} parts");
+        ensure!(
+            parts.len() <= MAX_PARTS,
+            "assistant output exceeds {MAX_PARTS} parts"
+        );
     }
     if parts.is_empty() {
         bail!("table renderer returned no deliverable parts");
@@ -191,7 +233,10 @@ struct RendererProcess {
 impl RendererProcess {
     fn new(child: Child) -> Result<Self> {
         let group = child.id().context("table renderer has no process ID")?;
-        Ok(Self { child, group: Some(group) })
+        Ok(Self {
+            child,
+            group: Some(group),
+        })
     }
 }
 
@@ -256,7 +301,9 @@ mod tests {
         ]))
         .unwrap();
         let parts = load_manifest(&manifest, &root, 100).await.unwrap();
-        assert!(matches!(&parts[..], [AssistantPart::Text(before), AssistantPart::Image { .. }, AssistantPart::Text(after)] if before == "before" && after == "after"));
+        assert!(
+            matches!(&parts[..], [AssistantPart::Text(before), AssistantPart::Image { .. }, AssistantPart::Text(after)] if before == "before" && after == "after")
+        );
     }
 
     #[tokio::test]
@@ -272,7 +319,9 @@ mod tests {
             assert!(load_manifest(manifest, &root, 100).await.is_err());
         }
         let outside = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
-        tokio::fs::write(outside.path(), PNG_SIGNATURE).await.unwrap();
+        tokio::fs::write(outside.path(), PNG_SIGNATURE)
+            .await
+            .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!([{"image": outside.path()}])).unwrap();
         assert!(load_manifest(&manifest, &root, 100).await.is_err());
     }
@@ -285,9 +334,12 @@ mod tests {
         tokio::fs::write(&image, "not a PNG").await.unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!([{"image": image}])).unwrap();
         assert!(load_manifest(&manifest, &root, 100).await.is_err());
-        let manifest = serde_json::to_vec(&vec![serde_json::json!({"text": "a"}); MAX_PARTS + 1]).unwrap();
+        let manifest =
+            serde_json::to_vec(&vec![serde_json::json!({"text": "a"}); MAX_PARTS + 1]).unwrap();
         assert!(load_manifest(&manifest, &root, 100).await.is_err());
-        let manifest = serde_json::to_vec(&serde_json::json!([{"text": "x".repeat(100 * (MAX_PARTS + 1))}])).unwrap();
+        let manifest =
+            serde_json::to_vec(&serde_json::json!([{"text": "x".repeat(100 * (MAX_PARTS + 1))}]))
+                .unwrap();
         assert!(load_manifest(&manifest, &root, 100).await.is_err());
     }
 
@@ -296,7 +348,9 @@ mod tests {
     async fn local_renderer_smoke() {
         let content = "Before\n\n| Name | Value |\n| --- | --- |\n| Example | 42 |\n\nAfter";
         let parts = prepare(content, 1900).await.unwrap();
-        assert!(matches!(&parts[..], [AssistantPart::Text(before), AssistantPart::Image { data, .. }, AssistantPart::Text(after)] if before.contains("Before") && data.starts_with(PNG_SIGNATURE) && data.len() > PNG_SIGNATURE.len() && after.contains("After")));
+        assert!(
+            matches!(&parts[..], [AssistantPart::Text(before), AssistantPart::Image { data, .. }, AssistantPart::Text(after)] if before.contains("Before") && data.starts_with(PNG_SIGNATURE) && data.len() > PNG_SIGNATURE.len() && after.contains("After"))
+        );
         let fenced = "```markdown\n| A | B |\n| --- | --- |\n| 1 | 2 |\n```";
         let parts = prepare(fenced, 1900).await.unwrap();
         assert!(matches!(&parts[..], [AssistantPart::Text(text)] if text == fenced));

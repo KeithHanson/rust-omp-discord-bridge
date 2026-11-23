@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex, OnceLock, Weak, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, Mutex as StdMutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,7 +21,9 @@ use crate::{
     activity::ActivityReporter,
     domain::{ConversationId, MessageId, SessionStatus, ThreadId, Turn, TurnStatus},
     live_config::LiveConfig,
-    omp::{AgentTransport, ApprovalRequest, OmpTurnError, OmpUi, TurnControl, TurnInput, UploadRequest},
+    omp::{
+        AgentTransport, ApprovalRequest, OmpTurnError, OmpUi, TurnControl, TurnInput, UploadRequest,
+    },
     presence::{PresenceSnapshot, PresenceTracker, WorkingPresence},
     render::chunk_message,
     store::Store,
@@ -44,7 +49,13 @@ struct MessageDelivery {
 impl MessageDelivery {
     fn new() -> (Self, mpsc::Receiver<QueuedMessage>) {
         let (sender, receiver) = mpsc::channel(MAX_PENDING_MESSAGES);
-        (Self { sender, assistant_enqueued: AtomicBool::new(false) }, receiver)
+        (
+            Self {
+                sender,
+                assistant_enqueued: AtomicBool::new(false),
+            },
+            receiver,
+        )
     }
 
     fn message(&self, text: impl Into<String>) -> Result<(), OmpTurnError> {
@@ -78,8 +89,6 @@ impl MessageDelivery {
         self.assistant_enqueued.load(Ordering::Acquire)
     }
 }
-
-
 
 async fn deliver_messages(
     messenger: &dyn ThreadMessenger,
@@ -201,13 +210,11 @@ struct ThreadStatusReconciler {
 }
 
 impl ThreadStatusReconciler {
-    fn set(
-        &self,
-        conversation_id: ConversationId,
-        thread_id: ThreadId,
-        status: ThreadStatus,
-    ) {
-        let mut senders = self.senders.lock().expect("thread status registry poisoned");
+    fn set(&self, conversation_id: ConversationId, thread_id: ThreadId, status: ThreadStatus) {
+        let mut senders = self
+            .senders
+            .lock()
+            .expect("thread status registry poisoned");
         if let Some(sender) = senders.get(&conversation_id) {
             sender.send_if_modified(|desired| {
                 if *desired == status {
@@ -322,7 +329,9 @@ fn validate_model_selection(selection: &str) -> Result<(&str, &str)> {
                 .chars()
                 .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '"' || ch == '\\')
         })
-        .context("use `model provider/model` with an exact entry from `models`, or `model default`")?;
+        .context(
+            "use `model provider/model` with an exact entry from `models`, or `model default`",
+        )?;
     Ok((provider, id))
 }
 
@@ -354,7 +363,13 @@ struct ActiveRunGuard<'a> {
 
 impl Drop for ActiveRunGuard<'_> {
     fn drop(&mut self) {
-        if let Some(active) = self.runner.active.lock().unwrap().remove(&self.conversation_id) {
+        if let Some(active) = self
+            .runner
+            .active
+            .lock()
+            .unwrap()
+            .remove(&self.conversation_id)
+        {
             active.cancellation.cancel();
         }
     }
@@ -411,8 +426,7 @@ impl ThreadQueueRunner {
     /// Drains include delivery and activity finalization; title workers are
     /// separate OMP processes and must also finish before replacing the daemon.
     pub(crate) async fn rollover_idle(&self) -> bool {
-        self.draining.lock().await.is_empty()
-            && self.statuses.senders.lock().unwrap().is_empty()
+        self.draining.lock().await.is_empty() && self.statuses.senders.lock().unwrap().is_empty()
     }
 
     pub async fn poke(self: &Arc<Self>, thread_id: ThreadId) {
@@ -455,7 +469,10 @@ impl ThreadQueueRunner {
             let mut presence = None;
             let mut cancellation = cancellation;
             'drain: loop {
-                if let Err(error) = runner.drain(conversation_id, thread_id, &cancellation, &mut presence).await {
+                if let Err(error) = runner
+                    .drain(conversation_id, thread_id, &cancellation, &mut presence)
+                    .await
+                {
                     tracing::error!(thread_id = %thread_id, error = %error, "thread queue drain failed");
                     let _ = timeout(
                         DELIVERY_TIMEOUT,
@@ -548,7 +565,12 @@ impl ThreadQueueRunner {
             .session(thread_id)
             .await?
             .context("no OMP session is mapped to this thread")?;
-        if self.active.lock().unwrap().contains_key(&session.conversation_id) {
+        if self
+            .active
+            .lock()
+            .unwrap()
+            .contains_key(&session.conversation_id)
+        {
             bail!(
                 "stop the active OMP turn and wait for it to finish before starting a new session"
             );
@@ -676,9 +698,13 @@ impl ThreadQueueRunner {
         if draining.contains_key(&session.conversation_id) {
             bail!("wait for this session to become idle before changing its model");
         }
-        self.store.set_session_model(thread_id, Some(selection)).await?;
+        self.store
+            .set_session_model(thread_id, Some(selection))
+            .await?;
         drop(draining);
-        Ok(format!("Session model set to `{selection}`. Conversation retained."))
+        Ok(format!(
+            "Session model set to `{selection}`. Conversation retained."
+        ))
     }
 
     async fn clear_session_model(&self, thread_id: ThreadId) -> Result<String> {
@@ -775,8 +801,7 @@ impl ThreadQueueRunner {
             }
             self.statuses
                 .set(conversation_id, thread_id, ThreadStatus::Working);
-            let presence =
-                presence.get_or_insert_with(|| self.presence.engage(conversation_id));
+            let presence = presence.get_or_insert_with(|| self.presence.engage(conversation_id));
 
             let _permit = tokio::select! {
                 biased;
@@ -868,7 +893,9 @@ impl ThreadQueueRunner {
             };
             let fallback = match &result {
                 Ok(outcome)
-                    if !outcome.aborted && !outcome.text.is_empty() && !delivery.has_assistant() =>
+                    if !outcome.aborted
+                        && !outcome.text.is_empty()
+                        && !delivery.has_assistant() =>
                 {
                     Some(outcome.text.clone())
                 }
@@ -1098,7 +1125,14 @@ mod tests {
         );
         delivery.message(text).unwrap();
         drop(delivery);
-        deliver_messages(&messenger, ThreadId::new(3), receiver, 100, DELIVERY_TIMEOUT).await;
+        deliver_messages(
+            &messenger,
+            ThreadId::new(3),
+            receiver,
+            100,
+            DELIVERY_TIMEOUT,
+        )
+        .await;
         let sent = messenger.sent.lock().await;
         assert_eq!(sent.len(), 3);
         assert_eq!(sent[0].trim(), "Before table.");
@@ -1353,7 +1387,12 @@ mod tests {
             self.send(thread_id, content).await
         }
 
-        async fn send_image(&self, thread_id: ThreadId, _data: Vec<u8>, filename: String) -> Result<()> {
+        async fn send_image(
+            &self,
+            thread_id: ThreadId,
+            _data: Vec<u8>,
+            filename: String,
+        ) -> Result<()> {
             self.send(thread_id, &format!("[image: {filename}]")).await
         }
 
@@ -1415,7 +1454,9 @@ mod tests {
                 started.send(()).unwrap();
                 gate.acquire().await.unwrap().forget();
             }
-            self.prompt_response.clone().expect("unexpected test prompt")
+            self.prompt_response
+                .clone()
+                .expect("unexpected test prompt")
         }
 
         async fn notify(&self, _thread_id: ThreadId, _message: &str) {}
@@ -1437,7 +1478,11 @@ mod tests {
             Ok("[]".to_owned())
         }
 
-        async fn upload_file(&self, _thread_id: ThreadId, _request: UploadRequest) -> Result<String> {
+        async fn upload_file(
+            &self,
+            _thread_id: ThreadId,
+            _request: UploadRequest,
+        ) -> Result<String> {
             panic!("unexpected file upload")
         }
 
@@ -1530,7 +1575,10 @@ mod tests {
             delivery: &delivery,
             presence: &working,
         };
-        let request = ApprovalRequest { title: "Allow?".into(), details: "test".into() };
+        let request = ApprovalRequest {
+            title: "Allow?".into(),
+            details: "test".into(),
+        };
         let mut first = Box::pin(ui.confirm(request.clone()));
         let mut second = Box::pin(ui.confirm(request));
         tokio::select! {
@@ -1541,12 +1589,30 @@ mod tests {
         }
         received(&mut requests).await;
         received(&mut requests).await;
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 1 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 1,
+                awaiting_approval: 1
+            }
+        );
         drop(first);
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 1 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 1,
+                awaiting_approval: 1
+            }
+        );
         gate.add_permits(1);
         assert!(!second.await);
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 2,
+                awaiting_approval: 0
+            }
+        );
         let mut cancelled = Box::pin(ui.confirm(ApprovalRequest {
             title: "Cancel?".into(),
             details: String::new(),
@@ -1558,7 +1624,13 @@ mod tests {
         }
         assert_eq!(snapshots.borrow().awaiting_approval, 1);
         drop(cancelled);
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 2,
+                awaiting_approval: 0
+            }
+        );
         drop(working);
         drop(other);
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
@@ -1600,11 +1672,26 @@ mod tests {
             _ = std::future::ready(()) => {}
         }
         received(&mut requests).await;
-        assert_eq!(*messenger.prompts.lock().await, vec![(THREAD, request.clone())]);
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 0, awaiting_approval: 1 });
+        assert_eq!(
+            *messenger.prompts.lock().await,
+            vec![(THREAD, request.clone())]
+        );
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 0,
+                awaiting_approval: 1
+            }
+        );
         gate.add_permits(1);
         assert_eq!(prompt.await, response);
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 1,
+                awaiting_approval: 0
+            }
+        );
         let mut cancelled = Box::pin(ui.prompt(request));
         tokio::select! {
             biased;
@@ -1613,7 +1700,13 @@ mod tests {
         }
         assert_eq!(snapshots.borrow().awaiting_approval, 1);
         drop(cancelled);
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 1,
+                awaiting_approval: 0
+            }
+        );
         activity.finish("Finished").await;
     }
 
@@ -1633,11 +1726,25 @@ mod tests {
         let task_runner = runner.clone();
         let task = tokio::spawn(async move {
             let mut presence = None;
-            task_runner.drain(CONVERSATION, THREAD, &CancellationToken::new(), &mut presence).await
+            task_runner
+                .drain(
+                    CONVERSATION,
+                    THREAD,
+                    &CancellationToken::new(),
+                    &mut presence,
+                )
+                .await
         });
         assert_eq!(received(&mut incoming).await, turn);
         assert_eq!(snapshots.borrow().working, 1);
-        let cancellation = runner.active.lock().unwrap().get(&CONVERSATION).unwrap().cancellation.clone();
+        let cancellation = runner
+            .active
+            .lock()
+            .unwrap()
+            .get(&CONVERSATION)
+            .unwrap()
+            .cancellation
+            .clone();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
@@ -1663,15 +1770,28 @@ mod tests {
         let task_runner = runner.clone();
         let task = tokio::spawn(async move {
             let mut presence = None;
-            task_runner.drain(CONVERSATION, THREAD, &task_cancellation, &mut presence).await
+            task_runner
+                .drain(CONVERSATION, THREAD, &task_cancellation, &mut presence)
+                .await
         });
         assert_eq!(received(&mut incoming).await, turn);
-        let active = runner.active.lock().unwrap().get(&CONVERSATION).unwrap().cancellation.clone();
+        let active = runner
+            .active
+            .lock()
+            .unwrap()
+            .get(&CONVERSATION)
+            .unwrap()
+            .cancellation
+            .clone();
 
         cancellation.cancel();
 
         assert!(active.is_cancelled());
-        timeout(Duration::from_secs(3), task).await.unwrap().unwrap().unwrap();
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(runner.active.lock().unwrap().is_empty());
         assert_eq!(runner.permits.available_permits(), 1);
         assert_eq!(
@@ -1684,17 +1804,28 @@ mod tests {
     async fn concurrent_threads_settle_independently() {
         let (directory, store) = fixture().await;
         let other = ThreadId::new(11);
-        store.create_session(&NewSession {
-            thread_id: other,
-            guild_id: GuildId::new(1),
-            parent_channel_id: ChannelId::new(2),
-            trigger_message_id: MessageId::new(30),
-            cwd: directory.path().to_owned(),
-            created_by_user_id: UserId::new(4),
-        }).await.unwrap();
+        store
+            .create_session(&NewSession {
+                thread_id: other,
+                guild_id: GuildId::new(1),
+                parent_channel_id: ChannelId::new(2),
+                trigger_message_id: MessageId::new(30),
+                cwd: directory.path().to_owned(),
+                created_by_user_id: UserId::new(4),
+            })
+            .await
+            .unwrap();
         enqueue(&store, 20).await;
-        store.enqueue_turn(other, MessageId::new(21), UserId::new(4), "other", TurnSource::Human)
-            .await.unwrap();
+        store
+            .enqueue_turn(
+                other,
+                MessageId::new(21),
+                UserId::new(4),
+                "other",
+                TurnSource::Human,
+            )
+            .await
+            .unwrap();
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let runner = ThreadQueueRunner::new(
             store,
@@ -1708,12 +1839,26 @@ mod tests {
         runner.poke(other).await;
         received(&mut incoming).await;
         received(&mut incoming).await;
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 2, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 2,
+                awaiting_approval: 0
+            }
+        );
         assert!(runner.stop(THREAD).await.unwrap());
         idle(&runner).await;
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 1,
+                awaiting_approval: 0
+            }
+        );
         assert!(runner.stop(other).await.unwrap());
-        timeout(Duration::from_secs(3), runner.wait_idle(other)).await.unwrap();
+        timeout(Duration::from_secs(3), runner.wait_idle(other))
+            .await
+            .unwrap();
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
     }
 
@@ -1747,7 +1892,13 @@ mod tests {
             runner.poke(THREAD).await;
             assert_eq!(received(&mut incoming).await, turn);
             messenger.wait_status("working").await;
-            assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+            assert_eq!(
+                *snapshots.borrow(),
+                PresenceSnapshot {
+                    working: 1,
+                    awaiting_approval: 0
+                }
+            );
             transport.finish.add_permits(1);
             received(&mut sends).await;
             assert_eq!(received(&mut outcomes).await, turn);
@@ -1755,7 +1906,13 @@ mod tests {
             assert_eq!((counts.running, counts.queued), (0, 0));
             assert!(runner.set_model(THREAD, "default").await.is_err());
             assert_eq!(messenger.statuses.lock().await.last().unwrap(), "working");
-            assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+            assert_eq!(
+                *snapshots.borrow(),
+                PresenceSnapshot {
+                    working: 1,
+                    awaiting_approval: 0
+                }
+            );
             send_gate.add_permits(1);
             received(&mut edits).await;
             let counts = store.counts(THREAD).await.unwrap();
@@ -1763,7 +1920,13 @@ mod tests {
             assert!(runner.set_model(THREAD, "default").await.is_err());
             assert!(runner.active.lock().unwrap().contains_key(&CONVERSATION));
             assert_eq!(messenger.statuses.lock().await.last().unwrap(), "working");
-            assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+            assert_eq!(
+                *snapshots.borrow(),
+                PresenceSnapshot {
+                    working: 1,
+                    awaiting_approval: 0
+                }
+            );
             edit_gate.add_permits(1);
             idle(&runner).await;
             assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
@@ -1781,13 +1944,7 @@ mod tests {
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let transport = Arc::new(ControlledTransport::new(observed, false));
         let messenger = Arc::new(FakeMessenger::default());
-        let runner = ThreadQueueRunner::new(
-            store.clone(),
-            transport,
-            messenger.clone(),
-            1_900,
-            1,
-        );
+        let runner = ThreadQueueRunner::new(store.clone(), transport, messenger.clone(), 1_900, 1);
         let turn = enqueue(&store, 20).await;
         assert_eq!(store.claim_next(THREAD).await.unwrap().unwrap().id, turn);
         runner.poke(THREAD).await;
@@ -1832,13 +1989,26 @@ mod tests {
         messenger.wait_status("working").await;
         // Making the obsolete request ready cannot let completed win again.
         gate.add_permits(1);
-        assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
+        assert!(
+            messenger
+                .statuses
+                .lock()
+                .await
+                .iter()
+                .all(|status| status == "working")
+        );
         transport.finish.add_permits(1);
         received(&mut updates).await;
         idle(&runner).await;
         messenger.wait_status("completed").await;
         assert_eq!(
-            messenger.statuses.lock().await.iter().filter(|status| *status == "completed").count(),
+            messenger
+                .statuses
+                .lock()
+                .await
+                .iter()
+                .filter(|status| *status == "completed")
+                .count(),
             1
         );
         let counts = store.counts(THREAD).await.unwrap();
@@ -1875,7 +2045,14 @@ mod tests {
         idle(&runner).await;
         messenger.wait_status_attempts(3).await;
         messenger.wait_status("working").await;
-        assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
+        assert!(
+            messenger
+                .statuses
+                .lock()
+                .await
+                .iter()
+                .all(|status| status == "working")
+        );
         assert_eq!(store.counts(THREAD).await.unwrap().queued, 1);
         assert!(incoming.try_recv().is_err());
 
@@ -1927,7 +2104,12 @@ mod tests {
         messenger.wait_status("completed").await;
         for turn in [first, second] {
             assert_eq!(
-                store.next_outcome(THREAD, turn - 1).await.unwrap().unwrap().status,
+                store
+                    .next_outcome(THREAD, turn - 1)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
                 TurnStatus::Done
             );
         }
@@ -2020,9 +2202,12 @@ mod tests {
                 .expect("thread status worker stopped");
             tokio::time::advance(STATUS_REQUEST_TIMEOUT).await;
         }
-        timeout(STATUS_WORKER_IDLE_TIMEOUT + Duration::from_secs(1), sender.closed())
-            .await
-            .expect("exhausted title worker did not retire");
+        timeout(
+            STATUS_WORKER_IDLE_TIMEOUT + Duration::from_secs(1),
+            sender.closed(),
+        )
+        .await
+        .expect("exhausted title worker did not retire");
         assert!(statuses.senders.lock().unwrap().is_empty());
         assert_eq!(
             messenger.status_attempts.lock().await.len(),
@@ -2079,10 +2264,15 @@ mod tests {
             messenger.wait_status_attempts(attempt as usize).await;
             tokio::time::advance(Duration::from_secs(1 << attempt)).await;
         }
-        messenger.fail_status.store(false, std::sync::atomic::Ordering::Relaxed);
+        messenger
+            .fail_status
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         tokio::time::advance(STATUS_REVIEW_INTERVAL).await;
         messenger.wait_status("working").await;
-        assert_eq!(messenger.status_attempts.lock().await.len(), MAX_STATUS_ATTEMPTS as usize + 1);
+        assert_eq!(
+            messenger.status_attempts.lock().await.len(),
+            MAX_STATUS_ATTEMPTS as usize + 1
+        );
     }
 
     #[tokio::test]
@@ -2124,7 +2314,13 @@ mod tests {
             status_gate: Some(("completed", updating, title_gate.clone())),
             ..FakeMessenger::default()
         });
-        let runner = ThreadQueueRunner::new(store.clone(), transport.clone(), messenger.clone(), 1_900, 1);
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            transport.clone(),
+            messenger.clone(),
+            1_900,
+            1,
+        );
         assert!(runner.rollover_idle().await);
         let turn = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
@@ -2133,11 +2329,17 @@ mod tests {
         transport.finish.add_permits(1);
         received(&mut updates).await;
         idle(&runner).await;
-        assert!(!runner.rollover_idle().await, "title subprocess still running");
+        assert!(
+            !runner.rollover_idle().await,
+            "title subprocess still running"
+        );
         let sender = runner.statuses.senders.lock().unwrap()[&CONVERSATION].clone();
         title_gate.add_permits(1);
         messenger.wait_status("completed").await;
-        assert_eq!(store.next_outcome(THREAD, 0).await.unwrap().unwrap().status, TurnStatus::Done);
+        assert_eq!(
+            store.next_outcome(THREAD, 0).await.unwrap().unwrap().status,
+            TurnStatus::Done
+        );
         // SQLite uses real blocking workers; pause only after database work settles.
         tokio::time::pause();
         sender.closed().await;
@@ -2486,14 +2688,24 @@ mod tests {
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, second);
         assert_eq!(received(&mut incoming).await, third);
-        assert!(!snapshots.has_changed().unwrap(), "interrupt replacements must not change presence");
+        assert!(
+            !snapshots.has_changed().unwrap(),
+            "interrupt replacements must not change presence"
+        );
         assert_eq!(
             store.next_outcome(THREAD, 0).await.unwrap().unwrap().status,
             TurnStatus::Aborted
         );
         assert_eq!(store.counts(THREAD).await.unwrap().running, 1);
         messenger.wait_status("working").await;
-        assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
+        assert!(
+            messenger
+                .statuses
+                .lock()
+                .await
+                .iter()
+                .all(|status| status == "working")
+        );
         transport.finish.add_permits(1);
         idle(&runner).await;
         messenger.wait_status("completed").await;
@@ -2537,7 +2749,10 @@ mod tests {
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, second);
         idle(&runner).await;
-        assert_eq!(*runner.subscribe_presence().borrow(), PresenceSnapshot::default());
+        assert_eq!(
+            *runner.subscribe_presence().borrow(),
+            PresenceSnapshot::default()
+        );
         let counts = store.counts(THREAD).await.unwrap();
         assert_eq!((counts.running, counts.queued, counts.uncertain), (0, 0, 2));
         messenger.wait_status("completed").await;
@@ -2584,8 +2799,18 @@ mod tests {
         messenger.wait_status("working").await;
         gate.add_permits(1);
         assert_eq!(received(&mut incoming).await, second);
-        assert!(!snapshots.has_changed().unwrap(), "continuing the drain must not publish idle presence");
-        assert!(messenger.statuses.lock().await.iter().all(|status| status == "working"));
+        assert!(
+            !snapshots.has_changed().unwrap(),
+            "continuing the drain must not publish idle presence"
+        );
+        assert!(
+            messenger
+                .statuses
+                .lock()
+                .await
+                .iter()
+                .all(|status| status == "working")
+        );
         transport.finish.add_permits(1);
         received(&mut edits).await;
         gate.add_permits(1);
@@ -2605,13 +2830,7 @@ mod tests {
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let transport = Arc::new(ControlledTransport::new(observed, false));
         let messenger = Arc::new(FakeMessenger::default());
-        let runner = ThreadQueueRunner::new(
-            store.clone(),
-            transport,
-            messenger.clone(),
-            1_900,
-            1,
-        );
+        let runner = ThreadQueueRunner::new(store.clone(), transport, messenger.clone(), 1_900, 1);
         let first = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, first);
@@ -2640,22 +2859,29 @@ mod tests {
     async fn exclusion_cancels_active_work_discards_queue_and_leaves_other_threads_running() {
         let (directory, store) = fixture().await;
         let other = ThreadId::new(11);
-        store.create_session(&NewSession {
-            thread_id: other,
-            guild_id: GuildId::new(1),
-            parent_channel_id: ChannelId::new(2),
-            trigger_message_id: MessageId::new(30),
-            cwd: directory.path().to_owned(),
-            created_by_user_id: UserId::new(4),
-        }).await.unwrap();
+        store
+            .create_session(&NewSession {
+                thread_id: other,
+                guild_id: GuildId::new(1),
+                parent_channel_id: ChannelId::new(2),
+                trigger_message_id: MessageId::new(30),
+                cwd: directory.path().to_owned(),
+                created_by_user_id: UserId::new(4),
+            })
+            .await
+            .unwrap();
         let first = enqueue(&store, 20).await;
-        let other_turn = match store.enqueue_turn(
-            other,
-            MessageId::new(30),
-            UserId::new(4),
-            "other",
-            TurnSource::Human,
-        ).await.unwrap() {
+        let other_turn = match store
+            .enqueue_turn(
+                other,
+                MessageId::new(30),
+                UserId::new(4),
+                "other",
+                TurnSource::Human,
+            )
+            .await
+            .unwrap()
+        {
             EnqueueResult::Enqueued(id) => id,
             EnqueueResult::Duplicate => panic!("unexpected duplicate"),
         };
@@ -2686,22 +2912,39 @@ mod tests {
         idle(&runner).await;
 
         let first_outcome = store.next_outcome(THREAD, 0).await.unwrap().unwrap();
-        assert_eq!((first_outcome.id, first_outcome.status), (first, TurnStatus::Aborted));
+        assert_eq!(
+            (first_outcome.id, first_outcome.status),
+            (first, TurnStatus::Aborted)
+        );
         let queued_outcome = store.next_outcome(THREAD, first).await.unwrap().unwrap();
-        assert_eq!((queued_outcome.id, queued_outcome.status), (queued, TurnStatus::Aborted));
+        assert_eq!(
+            (queued_outcome.id, queued_outcome.status),
+            (queued, TurnStatus::Aborted)
+        );
         let counts = store.counts(THREAD).await.unwrap();
         assert_eq!((counts.queued, counts.running, counts.uncertain), (0, 0, 0));
         assert!(runner.new_session(THREAD).await.is_err());
-        assert_eq!(store.session(THREAD).await.unwrap().unwrap().status, SessionStatus::Stopped);
+        assert_eq!(
+            store.session(THREAD).await.unwrap().unwrap().status,
+            SessionStatus::Stopped
+        );
         runner.poke(THREAD).await;
         assert!(!runner.draining.lock().await.contains_key(&CONVERSATION));
         assert!(incoming.try_recv().is_err());
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 1,
+                awaiting_approval: 0
+            }
+        );
         assert!(!store.is_thread_excluded(other).await.unwrap());
         assert_eq!(store.counts(other).await.unwrap().running, 1);
 
         transport.finish.add_permits(1);
-        timeout(Duration::from_secs(3), runner.wait_idle(other)).await.unwrap();
+        timeout(Duration::from_secs(3), runner.wait_idle(other))
+            .await
+            .unwrap();
         assert_eq!(
             store.next_outcome(other, 0).await.unwrap().unwrap().status,
             TurnStatus::Done
@@ -2761,8 +3004,13 @@ mod tests {
         transport.emit_answer_message = false;
         let transport = Arc::new(transport);
         let messenger = Arc::new(FakeMessenger::default());
-        let runner =
-            ThreadQueueRunner::new(store.clone(), transport.clone(), messenger.clone(), 1_900, 1);
+        let runner = ThreadQueueRunner::new(
+            store.clone(),
+            transport.clone(),
+            messenger.clone(),
+            1_900,
+            1,
+        );
         let turn = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, turn);
@@ -2836,19 +3084,22 @@ mod tests {
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let transport = Arc::new(ControlledTransport::new(observed, false));
         let messenger = Arc::new(FakeMessenger::default());
-        let runner = ThreadQueueRunner::new(
-            store.clone(),
-            transport,
-            messenger.clone(),
-            1_900,
-            1,
-        );
+        let runner = ThreadQueueRunner::new(store.clone(), transport, messenger.clone(), 1_900, 1);
         let mut snapshots = runner.subscribe_presence();
         let permit = runner.permits.acquire().await.unwrap();
         enqueue(&store, 20).await;
         runner.poke(THREAD).await;
-        timeout(Duration::from_secs(3), snapshots.changed()).await.unwrap().unwrap();
-        assert_eq!(*snapshots.borrow(), PresenceSnapshot { working: 1, awaiting_approval: 0 });
+        timeout(Duration::from_secs(3), snapshots.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *snapshots.borrow(),
+            PresenceSnapshot {
+                working: 1,
+                awaiting_approval: 0
+            }
+        );
         assert!(!runner.stop(THREAD).await.unwrap());
         idle(&runner).await;
         assert_eq!(*snapshots.borrow(), PresenceSnapshot::default());
@@ -2877,7 +3128,10 @@ mod tests {
         let permit = runner.permits.acquire().await.unwrap();
         let turn = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
-        timeout(Duration::from_secs(3), snapshots.changed()).await.unwrap().unwrap();
+        timeout(Duration::from_secs(3), snapshots.changed())
+            .await
+            .unwrap()
+            .unwrap();
 
         store.exclude_thread(THREAD).await.unwrap();
         assert!(!runner.stop(THREAD).await.unwrap());
@@ -2959,7 +3213,10 @@ mod tests {
         let listing = runner.models(THREAD).await.unwrap();
         assert!(listing.starts_with("Current session model: `default`\n"));
         assert_eq!(
-            listing.lines().filter(|line| line.starts_with("- ")).collect::<Vec<_>>(),
+            listing
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .collect::<Vec<_>>(),
             vec![
                 "- `anthropic/shared`",
                 "- `openai/shared`",
@@ -2968,29 +3225,63 @@ mod tests {
         );
         assert!(listing.contains("`model provider/model`"));
         assert!(listing.contains("`model default`"));
-        for selection in ["openai/shared", "anthropic/shared", "openrouter/vendor/nested"] {
+        for selection in [
+            "openai/shared",
+            "anthropic/shared",
+            "openrouter/vendor/nested",
+        ] {
             runner.set_model(THREAD, selection).await.unwrap();
             assert_eq!(
-                store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+                store
+                    .session(THREAD)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .model
+                    .as_deref(),
                 Some(selection)
             );
             assert!(
-                runner.models(THREAD).await.unwrap()
+                runner
+                    .models(THREAD)
+                    .await
+                    .unwrap()
                     .starts_with(&format!("Current session model: `{selection}`\n"))
             );
         }
         for selection in [
-            "", "shared", "/shared", "openai/", "openai/shared extra",
-            "openai/shared\n", "OpenAI/shared", "unknown/shared", "openai/unknown",
+            "",
+            "shared",
+            "/shared",
+            "openai/",
+            "openai/shared extra",
+            "openai/shared\n",
+            "OpenAI/shared",
+            "unknown/shared",
+            "openai/unknown",
         ] {
-            assert!(runner.set_model(THREAD, selection).await.is_err(), "{selection:?}");
+            assert!(
+                runner.set_model(THREAD, selection).await.is_err(),
+                "{selection:?}"
+            );
         }
         assert_eq!(
-            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            store
+                .session(THREAD)
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
             Some("openrouter/vendor/nested")
         );
         assert!(runner.models(ThreadId::new(99)).await.is_err());
-        assert!(runner.set_model(ThreadId::new(99), "default").await.is_err());
+        assert!(
+            runner
+                .set_model(ThreadId::new(99), "default")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2998,8 +3289,14 @@ mod tests {
         let (directory, store) = fixture().await;
         let path = directory.path().join("saved.jsonl");
         store.set_session_path(THREAD, &path).await.unwrap();
-        store.set_session_model(THREAD, Some("openai/shared")).await.unwrap();
-        store.set_session_status(THREAD, SessionStatus::Stopped).await.unwrap();
+        store
+            .set_session_model(THREAD, Some("openai/shared"))
+            .await
+            .unwrap();
+        store
+            .set_session_status(THREAD, SessionStatus::Stopped)
+            .await
+            .unwrap();
         let (observed, _incoming) = mpsc::unbounded_channel();
         let (started, requests) = mpsc::unbounded_channel();
         drop(requests); // A catalog lookup would fail.
@@ -3038,15 +3335,30 @@ mod tests {
         assert!(runner.set_model(THREAD, "anthropic/shared").await.is_err());
         assert!(runner.set_model(THREAD, "default").await.is_err());
         assert_eq!(
-            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            store
+                .session(THREAD)
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
             Some("openai/shared")
         );
-        store.finish_turn(turn, TurnStatus::Done, None, None).await.unwrap();
+        store
+            .finish_turn(turn, TurnStatus::Done, None, None)
+            .await
+            .unwrap();
         runner.set_model(THREAD, "anthropic/shared").await.unwrap();
         runner.new_session(THREAD).await.unwrap();
         idle(&runner).await;
         assert_eq!(
-            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            store
+                .session(THREAD)
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
             Some("anthropic/shared")
         );
     }
@@ -3054,7 +3366,10 @@ mod tests {
     #[tokio::test]
     async fn work_started_during_catalog_lookup_prevents_model_change() {
         let (_directory, store) = fixture().await;
-        store.set_session_model(THREAD, Some("anthropic/shared")).await.unwrap();
+        store
+            .set_session_model(THREAD, Some("anthropic/shared"))
+            .await
+            .unwrap();
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let (started, mut requests) = mpsc::unbounded_channel();
         let gate = Arc::new(Semaphore::new(0));
@@ -3069,20 +3384,30 @@ mod tests {
             1,
         );
         let changing_runner = runner.clone();
-        let change = tokio::spawn(async move {
-            changing_runner.set_model(THREAD, "openai/shared").await
-        });
+        let change =
+            tokio::spawn(async move { changing_runner.set_model(THREAD, "openai/shared").await });
         received(&mut requests).await;
         let turn = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
         assert_eq!(received(&mut incoming).await, turn);
         gate.add_permits(1);
         assert!(
-            timeout(Duration::from_secs(3), change).await.unwrap().unwrap()
-                .unwrap_err().to_string().contains("idle")
+            timeout(Duration::from_secs(3), change)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("idle")
         );
         assert_eq!(
-            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            store
+                .session(THREAD)
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
             Some("anthropic/shared")
         );
         transport.finish.add_permits(1);
@@ -3092,8 +3417,14 @@ mod tests {
     #[tokio::test]
     async fn waiting_drain_reloads_reset_session_and_model_before_dispatch() {
         let (directory, store) = fixture().await;
-        store.set_session_model(THREAD, Some("openai/shared")).await.unwrap();
-        store.set_session_path(THREAD, &directory.path().join("old.jsonl")).await.unwrap();
+        store
+            .set_session_model(THREAD, Some("openai/shared"))
+            .await
+            .unwrap();
+        store
+            .set_session_path(THREAD, &directory.path().join("old.jsonl"))
+            .await
+            .unwrap();
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let (sessions, mut launched) = mpsc::unbounded_channel();
         let mut transport = ControlledTransport::new(observed, false);
@@ -3110,15 +3441,27 @@ mod tests {
         let permit = runner.permits.acquire().await.unwrap();
         let discarded = enqueue(&store, 20).await;
         runner.poke(THREAD).await;
-        timeout(Duration::from_secs(3), snapshots.changed()).await.unwrap().unwrap();
+        timeout(Duration::from_secs(3), snapshots.changed())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(runner.set_model(THREAD, "default").await.is_err());
         assert_eq!(runner.new_session(THREAD).await.unwrap(), 1);
         assert_eq!(
-            store.session(THREAD).await.unwrap().unwrap().model.as_deref(),
+            store
+                .session(THREAD)
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
             Some("openai/shared")
         );
         // Exercise a persisted change after the drain's pre-permit snapshot.
-        store.set_session_model(THREAD, Some("anthropic/shared")).await.unwrap();
+        store
+            .set_session_model(THREAD, Some("anthropic/shared"))
+            .await
+            .unwrap();
         let next = enqueue(&store, 21).await;
         drop(permit);
         assert_eq!(received(&mut incoming).await, next);
@@ -3164,7 +3507,10 @@ allowed_root = "{root}"
     async fn set_default_model_writes_config_and_keeps_session_override() {
         let (directory, store) = fixture().await;
         let config_path = write_test_config(&directory);
-        store.set_session_model(THREAD, Some("openai/shared")).await.unwrap();
+        store
+            .set_session_model(THREAD, Some("openai/shared"))
+            .await
+            .unwrap();
         let (observed, _incoming) = mpsc::unbounded_channel();
         let runner = ThreadQueueRunner::new(
             store.clone(),
@@ -3176,10 +3522,22 @@ allowed_root = "{root}"
         runner.set_config_path(config_path.clone());
         let live_config = LiveConfig::new(crate::config::AppConfig::load(&config_path).unwrap());
         runner.set_live_config(live_config.clone());
-        let response = runner.set_model(THREAD, "default anthropic/shared").await.unwrap();
-        assert!(response.contains("Default model set to `anthropic/shared`"), "{response}");
-        assert!(response.contains("live bridge configuration was reloaded"), "{response}");
-        assert_eq!(live_config.load().omp.model.as_deref(), Some("anthropic/shared"));
+        let response = runner
+            .set_model(THREAD, "default anthropic/shared")
+            .await
+            .unwrap();
+        assert!(
+            response.contains("Default model set to `anthropic/shared`"),
+            "{response}"
+        );
+        assert!(
+            response.contains("live bridge configuration was reloaded"),
+            "{response}"
+        );
+        assert_eq!(
+            live_config.load().omp.model.as_deref(),
+            Some("anthropic/shared")
+        );
         let source = std::fs::read_to_string(&config_path).unwrap();
         assert!(source.contains("model = \"anthropic/shared\""), "{source}");
         assert!(source.contains("# model = \"openai/old\""), "{source}");
@@ -3206,10 +3564,18 @@ allowed_root = "{root}"
             "default openai/unknown",
             "default openai/shared extra",
         ] {
-            assert!(runner.set_model(THREAD, selection).await.is_err(), "{selection:?}");
+            assert!(
+                runner.set_model(THREAD, selection).await.is_err(),
+                "{selection:?}"
+            );
         }
         let source = std::fs::read_to_string(&config_path).unwrap();
-        assert!(source.lines().all(|line| !line.trim().starts_with("model = \"openai/")), "{source}");
+        assert!(
+            source
+                .lines()
+                .all(|line| !line.trim().starts_with("model = \"openai/")),
+            "{source}"
+        );
     }
 
     #[tokio::test]
@@ -3223,7 +3589,13 @@ allowed_root = "{root}"
             1_900,
             1,
         );
-        let error = runner.set_model(THREAD, "default openai/shared").await.unwrap_err();
-        assert!(error.to_string().contains("configuration file path"), "{error}");
+        let error = runner
+            .set_model(THREAD, "default openai/shared")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("configuration file path"),
+            "{error}"
+        );
     }
 }

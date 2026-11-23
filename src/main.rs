@@ -3,8 +3,12 @@ use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use omp_client_bridge::{
-    clients, config::AppConfig, live_config::{LiveConfig, spawn_watcher}, omp::OmpTransport,
-    store::Store, threadwatch,
+    clients,
+    config::AppConfig,
+    live_config::{LiveConfig, spawn_watcher},
+    omp::OmpTransport,
+    store::Store,
+    threadwatch,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -80,7 +84,6 @@ fn collector_config(
     }))
 }
 async fn execute(cli: Cli) -> Result<()> {
-
     let config_path = expand_cli_home(cli.config)?;
     let config = AppConfig::load(&config_path)?;
     if config.discord.is_none() && config.matrix.is_none() {

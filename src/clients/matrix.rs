@@ -1,15 +1,24 @@
-use std::{collections::HashMap, io::Write, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::{Certificate, Client, Method, Url};
-use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 use serde_json::{Value, json};
+use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 use uuid::Uuid;
 
 use crate::{
     config::{AppConfig, MatrixConfig},
-    domain::{ActorId, ChannelId, ClientConversationId, ClientKind, EventId, GuildId, MessageId, NewSession, ThreadId},
+    domain::{
+        ActorId, ChannelId, ClientConversationId, ClientKind, EventId, GuildId, MessageId,
+        NewSession, ThreadId,
+    },
     omp::{ApprovalRequest, OmpTransport, UploadRequest},
     runner::{ThreadMessenger, ThreadQueueRunner},
     store::{CreateSessionResult, EnqueueResult, Store, TurnSource},
@@ -31,10 +40,17 @@ impl MatrixHttp {
         if let Some(ca_file) = &config.ca_file {
             let pem = std::fs::read(ca_file)
                 .with_context(|| format!("failed to read matrix.ca_file {}", ca_file.display()))?;
-            let certs = Certificate::from_pem_bundle(&pem)
-                .with_context(|| format!("matrix.ca_file {} is not a valid PEM certificate bundle", ca_file.display()))?;
+            let certs = Certificate::from_pem_bundle(&pem).with_context(|| {
+                format!(
+                    "matrix.ca_file {} is not a valid PEM certificate bundle",
+                    ca_file.display()
+                )
+            })?;
             if certs.is_empty() {
-                bail!("matrix.ca_file {} contains no certificates", ca_file.display());
+                bail!(
+                    "matrix.ca_file {} contains no certificates",
+                    ca_file.display()
+                );
             }
             for cert in certs {
                 builder = builder.add_root_certificate(cert);
@@ -51,7 +67,9 @@ impl MatrixHttp {
         let mut url = self.homeserver.clone();
         url.set_query(None);
         url.set_fragment(None);
-        let mut path = url.path_segments_mut().map_err(|_| anyhow::anyhow!("Matrix homeserver URL cannot be a base URL"))?;
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Matrix homeserver URL cannot be a base URL"))?;
         path.clear();
         path.extend(segments);
         drop(path);
@@ -65,43 +83,77 @@ impl MatrixHttp {
         }
         let response = request.send().await.context("Matrix request failed")?;
         let status = response.status();
-        let bytes = response.bytes().await.context("failed to read Matrix response")?;
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read Matrix response")?;
         if !status.is_success() {
-            let detail = serde_json::from_slice::<Value>(&bytes).ok()
-                .and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned))
+            let detail = serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
                 .unwrap_or_else(|| "Matrix server returned no error detail".to_owned());
             bail!("Matrix request returned {status}: {detail}");
         }
-        if bytes.is_empty() { return Ok(Value::Null); }
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
         serde_json::from_slice(&bytes).context("Matrix response was not valid JSON")
     }
 
     async fn send_event(&self, room_id: &str, event_type: &str, content: &Value) -> Result<String> {
         let transaction = Uuid::new_v4().to_string();
-        let url = self.endpoint(&["_matrix", "client", "v3", "rooms", room_id, "send", event_type, &transaction])?;
+        let url = self.endpoint(&[
+            "_matrix",
+            "client",
+            "v3",
+            "rooms",
+            room_id,
+            "send",
+            event_type,
+            &transaction,
+        ])?;
         let response = self.request(Method::PUT, url, Some(content)).await?;
-        response.get("event_id").and_then(Value::as_str).map(str::to_owned)
+        response
+            .get("event_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
             .context("Matrix send response omitted event_id")
     }
-
 
     async fn download_media(&self, uri: &str, limit: u64) -> Result<Vec<u8>> {
         let uri = Url::parse(uri).context("Matrix attachment URL is invalid")?;
         if uri.scheme() != "mxc" {
             bail!("Matrix attachment URL must use mxc");
         }
-        let server = uri.host_str().context("Matrix attachment URL omitted server")?;
+        let server = uri
+            .host_str()
+            .context("Matrix attachment URL omitted server")?;
         let media_id = uri.path().trim_start_matches('/');
         if media_id.is_empty() || media_id.contains('/') {
             bail!("Matrix attachment URL has an invalid media ID");
         }
-        let url = self.endpoint(&["_matrix", "client", "v1", "media", "download", server, media_id])?;
-        let response = self.client.get(url).bearer_auth(&*self.token).send().await?;
+        let url = self.endpoint(&[
+            "_matrix", "client", "v1", "media", "download", server, media_id,
+        ])?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&*self.token)
+            .send()
+            .await?;
         let status = response.status();
         if !status.is_success() {
             bail!("Matrix media download returned {status}");
         }
-        if response.content_length().is_some_and(|length| length > limit) {
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit)
+        {
             bail!("Matrix attachment exceeds {limit} bytes");
         }
         let bytes = response.bytes().await?;
@@ -121,7 +173,10 @@ impl ReplyBroker {
     async fn wait(&self, event_id: String) -> Option<String> {
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(event_id.clone(), sender);
-        let result = tokio::time::timeout(PROMPT_TIMEOUT, receiver).await.ok().and_then(Result::ok);
+        let result = tokio::time::timeout(PROMPT_TIMEOUT, receiver)
+            .await
+            .ok()
+            .and_then(Result::ok);
         self.pending.lock().await.remove(&event_id);
         result
     }
@@ -149,7 +204,10 @@ fn thread_relation(root_event_id: &str) -> Value {
 
 // A kick takes the corresponding write lock before persisting the exclusion.
 // Holding this guard through delivery lets already-started sends finish first.
-async fn thread_access(store: &Store, thread_id: ThreadId) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+async fn thread_access(
+    store: &Store,
+    thread_id: ThreadId,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
     let guard = store.thread_access(thread_id).read_owned().await;
     if store.is_thread_excluded(thread_id).await? {
         bail!("bot was kicked from this thread");
@@ -176,11 +234,19 @@ async fn upload_media(
         .await
         .context("Matrix media upload request failed")?;
     let status = response.status();
-    let bytes = response.bytes().await.context("failed to read Matrix media upload response")?;
+    let bytes = response
+        .bytes()
+        .await
+        .context("failed to read Matrix media upload response")?;
     if !status.is_success() {
         let detail = serde_json::from_slice::<Value>(&bytes)
             .ok()
-            .and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned))
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| {
                 let text = String::from_utf8_lossy(&bytes);
                 let trimmed = text.trim();
@@ -223,11 +289,14 @@ impl MatrixMessenger {
         if let Some(root) = target.root_event_id {
             content["m.relates_to"] = thread_relation(&root);
         }
-        self.http.send_event(&target.room_id, "m.room.message", &content).await
+        self.http
+            .send_event(&target.room_id, "m.room.message", &content)
+            .await
     }
 
     async fn send_text(&self, thread_id: ThreadId, content: &str) -> Result<String> {
-        self.send_content(thread_id, json!({"msgtype": "m.text", "body": content})).await
+        self.send_content(thread_id, json!({"msgtype": "m.text", "body": content}))
+            .await
     }
 }
 
@@ -238,7 +307,9 @@ impl ThreadMessenger for MatrixMessenger {
         self.send_text(thread_id, content).await?;
         Ok(())
     }
-    async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()> { self.send(thread_id, content).await }
+    async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()> {
+        self.send(thread_id, content).await
+    }
     async fn send_image(&self, thread_id: ThreadId, data: Vec<u8>, filename: String) -> Result<()> {
         let _access = thread_access(&self.store, thread_id).await?;
         let uri = upload_media(&self.http, &data, "image/png", &filename).await?;
@@ -259,12 +330,25 @@ impl ThreadMessenger for MatrixMessenger {
         .await?;
         Ok(())
     }
-    async fn create_activity(&self, thread_id: ThreadId, content: &str, _finished: bool) -> Result<MessageId> {
+    async fn create_activity(
+        &self,
+        thread_id: ThreadId,
+        content: &str,
+        _finished: bool,
+    ) -> Result<MessageId> {
         let _access = thread_access(&self.store, thread_id).await?;
         let event = self.send_text(thread_id, content).await?;
-        self.store.ensure_event(&EventId::scoped(ClientKind::Matrix, event)?).await
+        self.store
+            .ensure_event(&EventId::scoped(ClientKind::Matrix, event)?)
+            .await
     }
-    async fn edit_activity(&self, thread_id: ThreadId, message_id: MessageId, content: &str, _finished: bool) -> Result<MessageId> {
+    async fn edit_activity(
+        &self,
+        thread_id: ThreadId,
+        message_id: MessageId,
+        content: &str,
+        _finished: bool,
+    ) -> Result<MessageId> {
         let _access = thread_access(&self.store, thread_id).await?;
         let activity_event = self
             .store
@@ -287,60 +371,135 @@ impl ThreadMessenger for MatrixMessenger {
         Ok(message_id)
     }
     async fn confirm(&self, thread_id: ThreadId, request: ApprovalRequest) -> bool {
-        let Ok(access) = thread_access(&self.store, thread_id).await else { return false; };
-        let text = format!("Approval required: {request:?}\nReply to this message with approve or deny.");
-        let Ok(event) = self.send_text(thread_id, &text).await else { return false; };
+        let Ok(access) = thread_access(&self.store, thread_id).await else {
+            return false;
+        };
+        let text =
+            format!("Approval required: {request:?}\nReply to this message with approve or deny.");
+        let Ok(event) = self.send_text(thread_id, &text).await else {
+            return false;
+        };
         drop(access);
-        self.replies.wait(event).await.is_some_and(|reply| matches!(reply.trim().to_ascii_lowercase().as_str(), "approve" | "approved" | "yes"))
+        self.replies.wait(event).await.is_some_and(|reply| {
+            matches!(
+                reply.trim().to_ascii_lowercase().as_str(),
+                "approve" | "approved" | "yes"
+            )
+        })
     }
     async fn prompt(&self, thread_id: ThreadId, request: Value) -> Value {
-        let Ok(access) = thread_access(&self.store, thread_id).await else { return Value::Null; };
+        let Ok(access) = thread_access(&self.store, thread_id).await else {
+            return Value::Null;
+        };
         let text = format!("Input required:\n{request}\nReply to this message.");
-        let Ok(event) = self.send_text(thread_id, &text).await else { return Value::Null; };
+        let Ok(event) = self.send_text(thread_id, &text).await else {
+            return Value::Null;
+        };
         drop(access);
-        self.replies.wait(event).await.map(Value::String).unwrap_or(Value::Null)
+        self.replies
+            .wait(event)
+            .await
+            .map(Value::String)
+            .unwrap_or(Value::Null)
     }
-    async fn notify(&self, thread_id: ThreadId, message: &str) { let _ = self.send(thread_id, message).await; }
-    async fn channel_history(&self, thread_id: ThreadId, days: u16) -> Result<String> { self.thread_history(thread_id, thread_id, days).await }
-    async fn thread_history(&self, _session_thread_id: ThreadId, target_thread_id: ThreadId, _days: u16) -> Result<String> {
+    async fn notify(&self, thread_id: ThreadId, message: &str) {
+        let _ = self.send(thread_id, message).await;
+    }
+    async fn channel_history(&self, thread_id: ThreadId, days: u16) -> Result<String> {
+        self.thread_history(thread_id, thread_id, days).await
+    }
+    async fn thread_history(
+        &self,
+        _session_thread_id: ThreadId,
+        target_thread_id: ThreadId,
+        _days: u16,
+    ) -> Result<String> {
         let target = self.target(target_thread_id).await?;
-        let mut url = self.http.endpoint(&["_matrix", "client", "v3", "rooms", &target.room_id, "messages"])?;
-        url.query_pairs_mut().append_pair("dir", "b").append_pair("limit", "100");
+        let mut url = self.http.endpoint(&[
+            "_matrix",
+            "client",
+            "v3",
+            "rooms",
+            &target.room_id,
+            "messages",
+        ])?;
+        url.query_pairs_mut()
+            .append_pair("dir", "b")
+            .append_pair("limit", "100");
         let value = self.http.request(Method::GET, url, None).await?;
-        let lines = value.get("chunk").and_then(Value::as_array).into_iter().flatten().filter_map(|event| {
-            if let Some(root) = &target.root_event_id {
-                let event_root = event.pointer("/content/m.relates_to/event_id").and_then(Value::as_str);
-                let event_id = event.get("event_id").and_then(Value::as_str);
-                if event_root != Some(root.as_str()) && event_id != Some(root.as_str()) {
-                    return None;
+        let lines = value
+            .get("chunk")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|event| {
+                if let Some(root) = &target.root_event_id {
+                    let event_root = event
+                        .pointer("/content/m.relates_to/event_id")
+                        .and_then(Value::as_str);
+                    let event_id = event.get("event_id").and_then(Value::as_str);
+                    if event_root != Some(root.as_str()) && event_id != Some(root.as_str()) {
+                        return None;
+                    }
                 }
-            }
-            let sender = event.get("sender")?.as_str()?;
-            let body = event.pointer("/content/body")?.as_str()?;
-            Some(format!("{sender}: {body}"))
-        }).collect::<Vec<_>>();
+                let sender = event.get("sender")?.as_str()?;
+                let body = event.pointer("/content/body")?.as_str()?;
+                Some(format!("{sender}: {body}"))
+            })
+            .collect::<Vec<_>>();
         Ok(lines.into_iter().rev().collect::<Vec<_>>().join("\n"))
     }
     async fn thread_participants(&self, thread_id: ThreadId) -> Result<String> {
         let target = self.target(thread_id).await?;
-        let url = self.http.endpoint(&["_matrix", "client", "v3", "rooms", &target.room_id, "joined_members"])?;
+        let url = self.http.endpoint(&[
+            "_matrix",
+            "client",
+            "v3",
+            "rooms",
+            &target.room_id,
+            "joined_members",
+        ])?;
         let value = self.http.request(Method::GET, url, None).await?;
-        Ok(value.get("joined").and_then(Value::as_object).map(|joined| joined.keys().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default())
+        Ok(value
+            .get("joined")
+            .and_then(Value::as_object)
+            .map(|joined| joined.keys().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default())
     }
     async fn upload_file(&self, thread_id: ThreadId, request: UploadRequest) -> Result<String> {
         let _access = thread_access(&self.store, thread_id).await?;
         let data = tokio::fs::read(&request.path).await?;
-        let filename = request.path.file_name().and_then(|name| name.to_str()).unwrap_or("upload").to_owned();
+        let filename = request
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("upload")
+            .to_owned();
         let uri = upload_media(&self.http, &data, "application/octet-stream", &filename).await?;
-        self.send_content(thread_id, json!({"msgtype":"m.file","body":filename,"url":uri})).await?;
+        self.send_content(
+            thread_id,
+            json!({"msgtype":"m.file","body":filename,"url":uri}),
+        )
+        .await?;
         Ok(uri)
     }
     async fn thread_status(&self, thread_id: ThreadId, status: &str) -> Result<()> {
         let _access = thread_access(&self.store, thread_id).await?;
         let target = self.target(thread_id).await?;
         let state_key = target.root_event_id.as_deref().unwrap_or("");
-        let url = self.http.endpoint(&["_matrix", "client", "v3", "rooms", &target.room_id, "state", "io.omp.bridge.status", state_key])?;
-        self.http.request(Method::PUT, url, Some(&json!({"status":status}))).await?;
+        let url = self.http.endpoint(&[
+            "_matrix",
+            "client",
+            "v3",
+            "rooms",
+            &target.room_id,
+            "state",
+            "io.omp.bridge.status",
+            state_key,
+        ])?;
+        self.http
+            .request(Method::PUT, url, Some(&json!({"status":status})))
+            .await?;
         Ok(())
     }
 }
@@ -352,8 +511,13 @@ fn conversation_native_id(room_id: &str, root_event_id: Option<&str>) -> String 
 fn target_from_native_id(native_id: &str) -> MatrixTarget {
     let (room_id, root_event_id) = native_id
         .split_once('\n')
-        .map_or((native_id, None), |(room, root)| (room, Some(root.to_owned())));
-    MatrixTarget { room_id: room_id.to_owned(), root_event_id }
+        .map_or((native_id, None), |(room, root)| {
+            (room, Some(root.to_owned()))
+        });
+    MatrixTarget {
+        room_id: room_id.to_owned(),
+        root_event_id,
+    }
 }
 
 fn mentions_user(event: &Value, user_id: &str) -> bool {
@@ -366,8 +530,18 @@ fn mentions_user(event: &Value, user_id: &str) -> bool {
 pub async fn run(config: Arc<AppConfig>, store: Store, permits: Arc<Semaphore>) -> Result<()> {
     let matrix = config.matrix.as_ref().context("Matrix is not configured")?;
     let http = MatrixHttp::new(matrix)?;
-    let whoami = http.request(Method::GET, http.endpoint(&["_matrix", "client", "v3", "account", "whoami"])?, None).await?;
-    let own_user = whoami.get("user_id").and_then(Value::as_str).context("Matrix whoami omitted user_id")?.to_owned();
+    let whoami = http
+        .request(
+            Method::GET,
+            http.endpoint(&["_matrix", "client", "v3", "account", "whoami"])?,
+            None,
+        )
+        .await?;
+    let own_user = whoami
+        .get("user_id")
+        .and_then(Value::as_str)
+        .context("Matrix whoami omitted user_id")?
+        .to_owned();
     let replies = Arc::new(ReplyBroker::default());
     let mut loaded_targets = HashMap::new();
     for (conversation, native_id) in store.client_conversations(ClientKind::Matrix).await? {
@@ -379,112 +553,280 @@ pub async fn run(config: Arc<AppConfig>, store: Store, permits: Arc<Semaphore>) 
     for policy in matrix.rooms.iter().filter(|policy| !policy.require_mention) {
         let key = ClientConversationId::scoped(ClientKind::Matrix, policy.id.clone())?;
         let conversation = store.ensure_conversation(&key).await?;
-        loaded_targets.entry(ThreadId::new(u64::try_from(conversation.get())?)).or_insert_with(|| MatrixTarget {
-            room_id: policy.id.clone(),
-            root_event_id: None,
-        });
+        loaded_targets
+            .entry(ThreadId::new(u64::try_from(conversation.get())?))
+            .or_insert_with(|| MatrixTarget {
+                room_id: policy.id.clone(),
+                root_event_id: None,
+            });
     }
     let targets = Arc::new(RwLock::new(loaded_targets));
-    let messenger = Arc::new(MatrixMessenger { http: http.clone(), store: store.clone(), targets: Arc::clone(&targets), replies: Arc::clone(&replies) });
-    let transport = Arc::new(OmpTransport::new(config.omp.clone(), Duration::from_secs(config.runtime.turn_timeout_seconds), config.runtime.max_response_bytes, config.runtime.discord_history_max_days));
-    let runner = ThreadQueueRunner::new_with_permits(store.clone(), transport, messenger, config.runtime.discord_message_limit, permits);
+    let messenger = Arc::new(MatrixMessenger {
+        http: http.clone(),
+        store: store.clone(),
+        targets: Arc::clone(&targets),
+        replies: Arc::clone(&replies),
+    });
+    let transport = Arc::new(OmpTransport::new(
+        config.omp.clone(),
+        Duration::from_secs(config.runtime.turn_timeout_seconds),
+        config.runtime.max_response_bytes,
+        config.runtime.discord_history_max_days,
+    ));
+    let runner = ThreadQueueRunner::new_with_permits(
+        store.clone(),
+        transport,
+        messenger,
+        config.runtime.discord_message_limit,
+        permits,
+    );
     for thread_id in targets.read().await.keys().copied().collect::<Vec<_>>() {
         if store.session(thread_id).await?.is_some() {
             runner.poke(thread_id).await;
         }
     }
-    sync_loop(&config, matrix, &http, &store, &runner, &replies, &targets, &own_user).await
+    let sync = MatrixSync {
+        config: config.as_ref(),
+        matrix,
+        http: &http,
+        store: &store,
+        runner: &runner,
+        replies: replies.as_ref(),
+        targets: &targets,
+        own_user: own_user.as_str(),
+    };
+    sync.sync_loop().await
 }
 
-async fn sync_loop(config: &AppConfig, matrix: &MatrixConfig, http: &MatrixHttp, store: &Store, runner: &Arc<ThreadQueueRunner>, replies: &ReplyBroker, targets: &Arc<RwLock<HashMap<ThreadId, MatrixTarget>>>, own_user: &str) -> Result<()> {
-    let mut since = load_since(&matrix.session_store_path).await?;
-    loop {
-        let mut url = http.endpoint(&["_matrix", "client", "v3", "sync"])?;
-        { let mut query = url.query_pairs_mut(); query.append_pair("timeout", &SYNC_TIMEOUT_MS.to_string()); if let Some(token) = &since { query.append_pair("since", token); } }
-        let response = http.request(Method::GET, url, None).await?;
-        let next = response.get("next_batch").and_then(Value::as_str).context("Matrix sync omitted next_batch")?.to_owned();
-        if since.is_some() { process_sync(config, http, store, runner, replies, targets, own_user, &response).await; }
-        save_since(&matrix.session_store_path, &next).await?;
-        since = Some(next);
+/// Shared state threaded through the sync loop and its event handlers.
+struct MatrixSync<'a> {
+    config: &'a AppConfig,
+    matrix: &'a MatrixConfig,
+    http: &'a MatrixHttp,
+    store: &'a Store,
+    runner: &'a Arc<ThreadQueueRunner>,
+    replies: &'a ReplyBroker,
+    targets: &'a Arc<RwLock<HashMap<ThreadId, MatrixTarget>>>,
+    own_user: &'a str,
+}
+
+impl<'a> MatrixSync<'a> {
+    async fn sync_loop(&self) -> Result<()> {
+        let mut since = load_since(&self.matrix.session_store_path).await?;
+        loop {
+            let mut url = self.http.endpoint(&["_matrix", "client", "v3", "sync"])?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("timeout", &SYNC_TIMEOUT_MS.to_string());
+                if let Some(token) = &since {
+                    query.append_pair("since", token);
+                }
+            }
+            let response = self.http.request(Method::GET, url, None).await?;
+            let next = response
+                .get("next_batch")
+                .and_then(Value::as_str)
+                .context("Matrix sync omitted next_batch")?
+                .to_owned();
+            if since.is_some() {
+                self.process_sync(&response).await;
+            }
+            save_since(&self.matrix.session_store_path, &next).await?;
+            since = Some(next);
+        }
     }
-}
 
-async fn process_sync(config: &AppConfig, http: &MatrixHttp, store: &Store, runner: &Arc<ThreadQueueRunner>, replies: &ReplyBroker, targets: &Arc<RwLock<HashMap<ThreadId, MatrixTarget>>>, own_user: &str, response: &Value) {
-    let Some(joined) = response.pointer("/rooms/join").and_then(Value::as_object) else { return; };
-    for (room_id, room) in joined {
-        let Some(policy) = config.matrix_room_policy(room_id) else { continue; };
-        let Some(events) = room.pointer("/timeline/events").and_then(Value::as_array) else { continue; };
-        for event in events {
-            if let Err(error) = process_event(config, http, store, runner, replies, targets, policy, room_id, own_user, event).await {
-                tracing::warn!(%room_id, %error, "Matrix event rejected");
+    async fn process_sync(&self, response: &Value) {
+        let Some(joined) = response.pointer("/rooms/join").and_then(Value::as_object) else {
+            return;
+        };
+        for (room_id, room) in joined {
+            let Some(policy) = self.config.matrix_room_policy(room_id) else {
+                continue;
+            };
+            let Some(events) = room.pointer("/timeline/events").and_then(Value::as_array) else {
+                continue;
+            };
+            for event in events {
+                if let Err(error) = self.process_event(policy, room_id, event).await {
+                    tracing::warn!(%room_id, %error, "Matrix event rejected");
+                }
             }
         }
     }
-}
 
-async fn process_event(config: &AppConfig, http: &MatrixHttp, store: &Store, runner: &Arc<ThreadQueueRunner>, replies: &ReplyBroker, targets: &Arc<RwLock<HashMap<ThreadId, MatrixTarget>>>, policy: &crate::config::MatrixRoomPolicy, room_id: &str, own_user: &str, event: &Value) -> Result<()> {
-    if event.get("type").and_then(Value::as_str) != Some("m.room.message") { return Ok(()); }
-    let sender = event.get("sender").and_then(Value::as_str).context("Matrix event omitted sender")?;
-    if sender == own_user || !policy.permits(sender) { return Ok(()); }
-    let event_id = event.get("event_id").and_then(Value::as_str).context("Matrix event omitted event_id")?;
-    let mut body = event.pointer("/content/body").and_then(Value::as_str).context("Matrix message omitted body")?.trim().to_owned();
-    if let Some(reply_to) = event.pointer("/content/m.relates_to/m.in_reply_to/event_id").and_then(Value::as_str) {
-        if replies.resolve(reply_to, body.clone()).await { return Ok(()); }
-    }
-    let thread_root = event
-        .pointer("/content/m.relates_to")
-        .filter(|relation| relation.get("rel_type").and_then(Value::as_str) == Some("m.thread"))
-        .and_then(|relation| relation.get("event_id"))
-        .and_then(Value::as_str);
-    if thread_root.is_none() && policy.require_mention && !mentions_user(event, own_user) {
-        return Ok(());
-    }
-    if event.pointer("/content/url").and_then(Value::as_str).is_some()
-        && event.pointer("/content/msgtype").and_then(Value::as_str) != Some("m.text")
-    {
-        let uri = event.pointer("/content/url").and_then(Value::as_str).unwrap();
-        let data = http.download_media(uri, config.runtime.max_attachment_bytes).await?;
-        let directory = config.omp.session_dir.join("matrix-media");
-        tokio::fs::create_dir_all(&directory).await?;
-        let safe_event = event_id.chars().filter(|character| character.is_ascii_alphanumeric()).take(80).collect::<String>();
-        let supplied_name = Path::new(&body).file_name().and_then(|name| name.to_str()).unwrap_or("attachment");
-        let safe_name = supplied_name.chars().map(|character| if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') { character } else { '_' }).take(120).collect::<String>();
-        let path = directory.join(format!("{safe_event}-{safe_name}"));
-        let writer_path = path.clone();
-        tokio::task::spawn_blocking(move || write_private_file(&writer_path, &data)).await.context("Matrix attachment writer panicked")??;
-        body.push_str("\n\nMatrix attachment saved at: ");
-        body.push_str(&path.to_string_lossy());
-    }
-    let root_event_id = thread_root.map(str::to_owned).or_else(|| policy.require_mention.then(|| event_id.to_owned()));
-    let conversation_key = ClientConversationId::scoped(ClientKind::Matrix, conversation_native_id(room_id, root_event_id.as_deref()))?;
-    let conversation = store.ensure_conversation(&conversation_key).await?;
-    let thread_id = ThreadId::new(u64::try_from(conversation.get())?);
-    targets.write().await.insert(thread_id, MatrixTarget { room_id: room_id.to_owned(), root_event_id });
-    let message_id = store.ensure_event(&EventId::scoped(ClientKind::Matrix, event_id.to_owned())?).await?;
-    let actor_id = store.ensure_actor(&ActorId::scoped(ClientKind::Matrix, sender.to_owned())?).await?;
-    if store.session(thread_id).await?.is_none() {
-        let input = NewSession { thread_id, guild_id: GuildId::new(thread_id.get()), parent_channel_id: ChannelId::new(thread_id.get()), trigger_message_id: message_id, cwd: policy.cwd.clone(), created_by_user_id: actor_id };
-        match store.create_session_for_conversation(conversation, &input).await? { CreateSessionResult::Created(_) | CreateSessionResult::Existing(_) => {} }
-    }
-    match body.as_str() {
-        "!stop" => { runner.stop(thread_id).await?; }
-        "!new" => { runner.new_session(thread_id).await?; }
-        "!status" => { let status = runner.status(thread_id).await?; runner.notify(thread_id, &status).await; }
-        "!models" => { let models = runner.models(thread_id).await?; runner.notify(thread_id, &models).await; }
-        _ if body.starts_with("!model ") => { let result = runner.set_model(thread_id, body[7..].trim()).await?; runner.notify(thread_id, &result).await; }
-        _ => {
-            if matches!(store.enqueue_turn(thread_id, message_id, actor_id, &body, TurnSource::Human).await?, EnqueueResult::Enqueued(_)) { runner.poke(thread_id).await; }
+    async fn process_event(
+        &self,
+        policy: &crate::config::MatrixRoomPolicy,
+        room_id: &str,
+        event: &Value,
+    ) -> Result<()> {
+        if event.get("type").and_then(Value::as_str) != Some("m.room.message") {
+            return Ok(());
         }
+        let sender = event
+            .get("sender")
+            .and_then(Value::as_str)
+            .context("Matrix event omitted sender")?;
+        if sender == self.own_user || !policy.permits(sender) {
+            return Ok(());
+        }
+        let event_id = event
+            .get("event_id")
+            .and_then(Value::as_str)
+            .context("Matrix event omitted event_id")?;
+        let mut body = event
+            .pointer("/content/body")
+            .and_then(Value::as_str)
+            .context("Matrix message omitted body")?
+            .trim()
+            .to_owned();
+        if let Some(reply_to) = event
+            .pointer("/content/m.relates_to/m.in_reply_to/event_id")
+            .and_then(Value::as_str)
+            && self.replies.resolve(reply_to, body.clone()).await
+        {
+            return Ok(());
+        }
+        let thread_root = event
+            .pointer("/content/m.relates_to")
+            .filter(|relation| relation.get("rel_type").and_then(Value::as_str) == Some("m.thread"))
+            .and_then(|relation| relation.get("event_id"))
+            .and_then(Value::as_str);
+        if thread_root.is_none() && policy.require_mention && !mentions_user(event, self.own_user) {
+            return Ok(());
+        }
+        if event
+            .pointer("/content/url")
+            .and_then(Value::as_str)
+            .is_some()
+            && event.pointer("/content/msgtype").and_then(Value::as_str) != Some("m.text")
+        {
+            let uri = event
+                .pointer("/content/url")
+                .and_then(Value::as_str)
+                .unwrap();
+            let data = self
+                .http
+                .download_media(uri, self.config.runtime.max_attachment_bytes)
+                .await?;
+            let directory = self.config.omp.session_dir.join("matrix-media");
+            tokio::fs::create_dir_all(&directory).await?;
+            let safe_event = event_id
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .take(80)
+                .collect::<String>();
+            let supplied_name = Path::new(&body)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment");
+            let safe_name = supplied_name
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .take(120)
+                .collect::<String>();
+            let path = directory.join(format!("{safe_event}-{safe_name}"));
+            let writer_path = path.clone();
+            tokio::task::spawn_blocking(move || write_private_file(&writer_path, &data))
+                .await
+                .context("Matrix attachment writer panicked")??;
+            body.push_str("\n\nMatrix attachment saved at: ");
+            body.push_str(&path.to_string_lossy());
+        }
+        let root_event_id = thread_root
+            .map(str::to_owned)
+            .or_else(|| policy.require_mention.then(|| event_id.to_owned()));
+        let conversation_key = ClientConversationId::scoped(
+            ClientKind::Matrix,
+            conversation_native_id(room_id, root_event_id.as_deref()),
+        )?;
+        let conversation = self.store.ensure_conversation(&conversation_key).await?;
+        let thread_id = ThreadId::new(u64::try_from(conversation.get())?);
+        self.targets.write().await.insert(
+            thread_id,
+            MatrixTarget {
+                room_id: room_id.to_owned(),
+                root_event_id,
+            },
+        );
+        let message_id = self
+            .store
+            .ensure_event(&EventId::scoped(ClientKind::Matrix, event_id.to_owned())?)
+            .await?;
+        let actor_id = self
+            .store
+            .ensure_actor(&ActorId::scoped(ClientKind::Matrix, sender.to_owned())?)
+            .await?;
+        if self.store.session(thread_id).await?.is_none() {
+            let input = NewSession {
+                thread_id,
+                guild_id: GuildId::new(thread_id.get()),
+                parent_channel_id: ChannelId::new(thread_id.get()),
+                trigger_message_id: message_id,
+                cwd: policy.cwd.clone(),
+                created_by_user_id: actor_id,
+            };
+            match self
+                .store
+                .create_session_for_conversation(conversation, &input)
+                .await?
+            {
+                CreateSessionResult::Created(_) | CreateSessionResult::Existing(_) => {}
+            }
+        }
+        match body.as_str() {
+            "!stop" => {
+                self.runner.stop(thread_id).await?;
+            }
+            "!new" => {
+                self.runner.new_session(thread_id).await?;
+            }
+            "!status" => {
+                let status = self.runner.status(thread_id).await?;
+                self.runner.notify(thread_id, &status).await;
+            }
+            "!models" => {
+                let models = self.runner.models(thread_id).await?;
+                self.runner.notify(thread_id, &models).await;
+            }
+            _ if body.starts_with("!model ") => {
+                let result = self.runner.set_model(thread_id, body[7..].trim()).await?;
+                self.runner.notify(thread_id, &result).await;
+            }
+            _ => {
+                if matches!(
+                    self.store
+                        .enqueue_turn(thread_id, message_id, actor_id, &body, TurnSource::Human)
+                        .await?,
+                    EnqueueResult::Enqueued(_)
+                ) {
+                    self.runner.poke(thread_id).await;
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 async fn load_since(path: &Path) -> Result<Option<String>> {
-    match tokio::fs::read_to_string(path).await { Ok(value) => Ok(Some(value.trim().to_owned())), Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None), Err(error) => Err(error.into()) }
+    match tokio::fs::read_to_string(path).await {
+        Ok(value) => Ok(Some(value.trim().to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn save_since(path: &Path, token: &str) -> Result<()> {
-    if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let temporary = path.with_extension("tmp");
     let temporary_writer = temporary.clone();
     let token = token.to_owned();
@@ -534,12 +876,18 @@ mod tests {
 
         assert_eq!(load_since(&path).await.unwrap(), None);
         save_since(&path, "next-token").await.unwrap();
-        assert_eq!(load_since(&path).await.unwrap().as_deref(), Some("next-token"));
+        assert_eq!(
+            load_since(&path).await.unwrap().as_deref(),
+            Some("next-token")
+        );
         assert!(!path.with_extension("tmp").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0
+            );
         }
     }
 
@@ -575,14 +923,15 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut request = Vec::new();
             let mut chunk = [0_u8; 4096];
             loop {
                 let read = stream.read(&mut chunk).unwrap();
                 request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n")
-                    && request.ends_with(b"}")
+                if request.windows(4).any(|window| window == b"\r\n\r\n") && request.ends_with(b"}")
                 {
                     break;
                 }
@@ -590,7 +939,11 @@ mod tests {
             let request = String::from_utf8(request).unwrap();
             assert!(request.starts_with("PUT /_matrix/client/v3/rooms/"));
             assert!(request.contains("/send/m.room.message/"));
-            assert!(request.to_ascii_lowercase().contains("authorization: bearer test-token"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
             assert!(request.contains("\"body\":\"hello\""));
             stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"event_id\":\"$response\"}").unwrap();
         });
@@ -621,7 +974,9 @@ mod tests {
         let mut chunk = [0_u8; 4096];
         let head_end = loop {
             let read = stream.read(&mut chunk).unwrap();
-            if read == 0 { panic!("request ended before headers completed") }
+            if read == 0 {
+                panic!("request ended before headers completed")
+            }
             request.extend_from_slice(&chunk[..read]);
             if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
                 break position + 4;
@@ -632,13 +987,17 @@ mod tests {
             .lines()
             .find_map(|line| {
                 let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok()).flatten()
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
             })
             .unwrap_or(0);
         let mut body = request.split_off(head_end);
         while body.len() < content_length {
             let read = stream.read(&mut chunk).unwrap();
-            if read == 0 { break; }
+            if read == 0 {
+                break;
+            }
             body.extend_from_slice(&chunk[..read]);
         }
         body.truncate(content_length);
@@ -654,16 +1013,24 @@ mod tests {
         let server = thread::spawn(move || {
             // Upload request
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let (upload_head, _upload_body) = read_request(&mut stream);
             assert!(upload_head.starts_with("POST /_matrix/media/v3/upload"));
             assert!(upload_head.contains("filename=test.png"));
-            assert!(upload_head.to_ascii_lowercase().contains("content-type: image/png"));
+            assert!(
+                upload_head
+                    .to_ascii_lowercase()
+                    .contains("content-type: image/png")
+            );
             stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"content_uri\":\"mxc://test/test.png\"}").unwrap();
             drop(stream);
             // Message request
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let (message_head, message_body) = read_request(&mut stream);
             assert!(message_head.starts_with("PUT /_matrix/client/v3/rooms/"));
             let event: Value = serde_json::from_slice(&message_body).unwrap();
@@ -675,20 +1042,33 @@ mod tests {
             stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"event_id\":\"$response\"}").unwrap();
         });
         let root = tempfile::tempdir().unwrap();
-        let store = Store::open(&root.path().join("store.sqlite")).await.unwrap();
+        let store = Store::open(&root.path().join("store.sqlite"))
+            .await
+            .unwrap();
         let thread_id = ThreadId::new(1);
         let http = MatrixHttp {
             client: Client::builder().no_proxy().build().unwrap(),
             homeserver: Url::parse(&format!("http://{address}")).unwrap(),
             token: Arc::from("test-token"),
         };
-        let targets = Arc::new(RwLock::new(HashMap::from([(thread_id, MatrixTarget {
-            room_id: "!room:example.org".to_owned(),
-            root_event_id: None,
-        })])));
+        let targets = Arc::new(RwLock::new(HashMap::from([(
+            thread_id,
+            MatrixTarget {
+                room_id: "!room:example.org".to_owned(),
+                root_event_id: None,
+            },
+        )])));
         let replies = Arc::new(ReplyBroker::default());
-        let messenger = MatrixMessenger { http, store, targets, replies };
-        messenger.send_image(thread_id, vec![1, 2, 3, 4], "test.png".to_owned()).await.unwrap();
+        let messenger = MatrixMessenger {
+            http,
+            store,
+            targets,
+            replies,
+        };
+        messenger
+            .send_image(thread_id, vec![1, 2, 3, 4], "test.png".to_owned())
+            .await
+            .unwrap();
         server.join().unwrap();
     }
 
@@ -700,28 +1080,49 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let (upload_head, _upload_body) = read_request(&mut stream);
             assert!(upload_head.starts_with("POST /_matrix/media/v3/upload"));
             stream.write_all(b"HTTP/1.1 413 Request Entity Too Large\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":\"too large\"}").unwrap();
         });
         let root = tempfile::tempdir().unwrap();
-        let store = Store::open(&root.path().join("store.sqlite")).await.unwrap();
+        let store = Store::open(&root.path().join("store.sqlite"))
+            .await
+            .unwrap();
         let thread_id = ThreadId::new(1);
         let http = MatrixHttp {
             client: Client::builder().no_proxy().build().unwrap(),
             homeserver: Url::parse(&format!("http://{address}")).unwrap(),
             token: Arc::from("test-token"),
         };
-        let targets = Arc::new(RwLock::new(HashMap::from([(thread_id, MatrixTarget {
-            room_id: "!room:example.org".to_owned(),
-            root_event_id: None,
-        })])));
+        let targets = Arc::new(RwLock::new(HashMap::from([(
+            thread_id,
+            MatrixTarget {
+                room_id: "!room:example.org".to_owned(),
+                root_event_id: None,
+            },
+        )])));
         let replies = Arc::new(ReplyBroker::default());
-        let messenger = MatrixMessenger { http, store, targets, replies };
-        let error = messenger.send_image(thread_id, vec![1], "test.png".to_owned()).await.unwrap_err();
-        assert!(error.to_string().contains("413"), "error must include the status: {error}");
-        assert!(error.to_string().contains("too large"), "error must include the server detail: {error}");
+        let messenger = MatrixMessenger {
+            http,
+            store,
+            targets,
+            replies,
+        };
+        let error = messenger
+            .send_image(thread_id, vec![1], "test.png".to_owned())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("413"),
+            "error must include the status: {error}"
+        );
+        assert!(
+            error.to_string().contains("too large"),
+            "error must include the server detail: {error}"
+        );
         server.join().unwrap();
     }
 
@@ -754,6 +1155,9 @@ mod tests {
             ca_file: Some(garbage),
             ..config.clone()
         };
-        assert!(MatrixHttp::new(&bad).is_err(), "garbage PEM must fail client construction");
+        assert!(
+            MatrixHttp::new(&bad).is_err(),
+            "garbage PEM must fail client construction"
+        );
     }
 }

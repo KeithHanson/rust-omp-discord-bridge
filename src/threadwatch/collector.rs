@@ -671,8 +671,10 @@ impl Transport {
         cancellation: &Cancellation,
     ) -> Result<Value> {
         ensure!(
-            matches!(path, "/api/ingest" | "/api/heartbeat" | "/api/commands/poll")
-                || (path.starts_with("/api/commands/") && path.ends_with("/ack")),
+            matches!(
+                path,
+                "/api/ingest" | "/api/heartbeat" | "/api/commands/poll"
+            ) || (path.starts_with("/api/commands/") && path.ends_with("/ack")),
             "Invalid collector API path"
         );
         tokio::select! {
@@ -799,10 +801,7 @@ async fn delivery_loop(
     }
 }
 
-async fn command_loop(
-    config: Arc<Config>,
-    cancellation: Arc<Cancellation>,
-) -> Result<()> {
+async fn command_loop(config: Arc<Config>, cancellation: Arc<Cancellation>) -> Result<()> {
     let transport = Transport::new(&config)?;
     let mut timer = tokio::time::interval(config.collect_interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1039,9 +1038,9 @@ pub async fn run(config: Config, once: bool) -> Result<()> {
         matches!(joined, Ok(Ok(()))),
         "Collector worker failed during shutdown"
     );
-    result
-        .and(signal_result)
-        .context("Collector did not complete successfully; saved deliveries remain available for retry")
+    result.and(signal_result).context(
+        "Collector did not complete successfully; saved deliveries remain available for retry",
+    )
 }
 
 #[cfg(test)]

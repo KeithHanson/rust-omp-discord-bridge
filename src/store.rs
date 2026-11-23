@@ -271,11 +271,7 @@ impl Store {
             .collect()
     }
 
-
-    pub async fn ensure_conversation(
-        &self,
-        key: &ClientConversationId,
-    ) -> Result<ConversationId> {
+    pub async fn ensure_conversation(&self, key: &ClientConversationId) -> Result<ConversationId> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let id = Self::ensure_conversation_in(&mut transaction, key).await?;
         transaction.commit().await?;
@@ -305,12 +301,12 @@ impl Store {
     }
 
     pub async fn is_thread_excluded(&self, thread_id: ThreadId) -> Result<bool> {
-        Ok(sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM excluded_threads WHERE thread_id = ?)",
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM excluded_threads WHERE thread_id = ?)")
+                .bind(thread_id.to_string())
+                .fetch_one(&self.pool)
+                .await?,
         )
-        .bind(thread_id.to_string())
-        .fetch_one(&self.pool)
-        .await?)
     }
 
     pub async fn ensure_event(&self, key: &EventId) -> Result<MessageId> {
@@ -399,7 +395,8 @@ impl Store {
         let key =
             ClientConversationId::discord(input.thread_id.get()).expect("valid Discord thread id");
         let conversation_id = self.ensure_conversation(&key).await?;
-        self.create_session_for_conversation(conversation_id, input).await
+        self.create_session_for_conversation(conversation_id, input)
+            .await
     }
 
     pub async fn create_session_for_conversation(
@@ -877,12 +874,11 @@ async fn require_thread_admitted(
     connection: &mut sqlx::SqliteConnection,
     thread_id: ThreadId,
 ) -> Result<()> {
-    let excluded: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM excluded_threads WHERE thread_id = ?)",
-    )
-    .bind(thread_id.to_string())
-    .fetch_one(connection)
-    .await?;
+    let excluded: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM excluded_threads WHERE thread_id = ?)")
+            .bind(thread_id.to_string())
+            .fetch_one(connection)
+            .await?;
     if excluded {
         bail!("bot was kicked from this thread");
     }
@@ -1023,7 +1019,10 @@ mod tests {
                 .thread_id,
             ThreadId::new(10)
         );
-        assert_eq!(store.queued_conversation_ids().await.unwrap(), vec![discord_id]);
+        assert_eq!(
+            store.queued_conversation_ids().await.unwrap(),
+            vec![discord_id]
+        );
         assert!(store.conversation_id(&matrix).await.unwrap().is_none());
 
         let matrix_id = store.ensure_conversation(&matrix).await.unwrap();
@@ -1034,7 +1033,10 @@ mod tests {
             Some(matrix_id)
         );
         assert_eq!(
-            store.client_conversations(ClientKind::Matrix).await.unwrap(),
+            store
+                .client_conversations(ClientKind::Matrix)
+                .await
+                .unwrap(),
             vec![(matrix_id, "10".to_owned())]
         );
         let matrix_thread = ThreadId::new(u64::try_from(matrix_id.get()).unwrap());
@@ -1055,11 +1057,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.queued_thread_ids_for(ClientKind::Discord).await.unwrap(),
+            store
+                .queued_thread_ids_for(ClientKind::Discord)
+                .await
+                .unwrap(),
             vec![ThreadId::new(10)]
         );
         assert_eq!(
-            store.queued_thread_ids_for(ClientKind::Matrix).await.unwrap(),
+            store
+                .queued_thread_ids_for(ClientKind::Matrix)
+                .await
+                .unwrap(),
             vec![matrix_thread]
         );
     }
@@ -1075,21 +1083,37 @@ mod tests {
         assert_eq!(store.ensure_event(&matrix_event).await.unwrap(), matrix_id);
         assert_ne!(store.ensure_event(&discord_event).await.unwrap(), matrix_id);
         assert_eq!(
-            store.event_native_id(ClientKind::Matrix, matrix_id).await.unwrap().as_deref(),
+            store
+                .event_native_id(ClientKind::Matrix, matrix_id)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("same")
         );
         assert_eq!(
-            store.event_native_id(ClientKind::Discord, matrix_id).await.unwrap(),
+            store
+                .event_native_id(ClientKind::Discord, matrix_id)
+                .await
+                .unwrap(),
             None
         );
         let actor_id = store.ensure_actor(&actor).await.unwrap();
         assert_eq!(store.ensure_actor(&actor).await.unwrap(), actor_id);
         store.pool.close().await;
 
-        let reopened = Store::open(&directory.path().join("bridge.sqlite")).await.unwrap();
-        assert_eq!(reopened.ensure_event(&matrix_event).await.unwrap(), matrix_id);
+        let reopened = Store::open(&directory.path().join("bridge.sqlite"))
+            .await
+            .unwrap();
         assert_eq!(
-            reopened.event_native_id(ClientKind::Matrix, matrix_id).await.unwrap().as_deref(),
+            reopened.ensure_event(&matrix_event).await.unwrap(),
+            matrix_id
+        );
+        assert_eq!(
+            reopened
+                .event_native_id(ClientKind::Matrix, matrix_id)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("same")
         );
         assert_eq!(reopened.ensure_actor(&actor).await.unwrap(), actor_id);
@@ -1132,7 +1156,12 @@ mod tests {
         assert!(reopened.is_thread_excluded(thread).await.unwrap());
         assert!(reopened.create_session(&new_session(10, 20)).await.is_err());
         assert!(reopened.session(thread).await.unwrap().is_none());
-        assert!(!reopened.is_thread_excluded(ThreadId::new(11)).await.unwrap());
+        assert!(
+            !reopened
+                .is_thread_excluded(ThreadId::new(11))
+                .await
+                .unwrap()
+        );
         reopened.create_session(&new_session(11, 21)).await.unwrap();
     }
 
@@ -1167,7 +1196,10 @@ mod tests {
         let discarded = store.next_outcome(thread, done).await.unwrap().unwrap();
         assert_eq!(discarded.id, queued);
         assert_eq!(discarded.status, TurnStatus::Aborted);
-        assert_eq!(discarded.error.as_deref(), Some("bot was kicked from this thread"));
+        assert_eq!(
+            discarded.error.as_deref(),
+            Some("bot was kicked from this thread")
+        );
         assert_eq!(store.queued_thread_ids().await.unwrap(), vec![other]);
         store.pool.close().await;
 
@@ -1177,10 +1209,22 @@ mod tests {
         assert!(reopened.is_thread_excluded(thread).await.unwrap());
         let session = reopened.session(thread).await.unwrap().unwrap();
         assert_eq!(session.status, SessionStatus::Stopped);
-        assert_eq!(session.omp_session_path.as_deref(), Some(session_path.as_path()));
-        assert_eq!(reopened.next_outcome(thread, done).await.unwrap(), Some(discarded));
+        assert_eq!(
+            session.omp_session_path.as_deref(),
+            Some(session_path.as_path())
+        );
+        assert_eq!(
+            reopened.next_outcome(thread, done).await.unwrap(),
+            Some(discarded)
+        );
         assert!(reopened.claim_next(thread).await.unwrap().is_none());
-        assert!(reopened.claim_next_interrupting(thread).await.unwrap().is_none());
+        assert!(
+            reopened
+                .claim_next_interrupting(thread)
+                .await
+                .unwrap()
+                .is_none()
+        );
         // The runner can still resolve an in-flight turn after exclusion.
         reopened
             .finish_turn(running, TurnStatus::Aborted, Some("partial"), None)
@@ -1204,32 +1248,70 @@ mod tests {
         enqueue(&store, 10, 30).await;
         store.exclude_thread(thread).await.unwrap();
         assert!(store.reset_session(thread).await.is_err());
-        assert!(store.set_session_status(thread, SessionStatus::Active).await.is_err());
-        store.set_session_status(thread, SessionStatus::Stopped).await.unwrap();
+        assert!(
+            store
+                .set_session_status(thread, SessionStatus::Active)
+                .await
+                .is_err()
+        );
+        store
+            .set_session_status(thread, SessionStatus::Stopped)
+            .await
+            .unwrap();
         assert!(store.create_session(&new_session(10, 20)).await.is_err());
         assert!(store.create_session(&new_session(10, 21)).await.is_err());
         // A duplicate trigger must not return the excluded session under another thread ID.
         assert!(store.create_session(&new_session(11, 20)).await.is_err());
         assert!(store.session(ThreadId::new(11)).await.unwrap().is_none());
-        assert!(store.note_human_message(thread, MessageId::new(40)).await.is_err());
-        for (message, source) in [(30, TurnSource::Human), (31, TurnSource::Human), (32, TurnSource::Bot)] {
+        assert!(
+            store
+                .note_human_message(thread, MessageId::new(40))
+                .await
+                .is_err()
+        );
+        for (message, source) in [
+            (30, TurnSource::Human),
+            (31, TurnSource::Human),
+            (32, TurnSource::Bot),
+        ] {
             assert!(
                 store
-                    .enqueue_turn(thread, MessageId::new(message), UserId::new(3), "blocked", source)
+                    .enqueue_turn(
+                        thread,
+                        MessageId::new(message),
+                        UserId::new(3),
+                        "blocked",
+                        source
+                    )
                     .await
                     .is_err()
             );
         }
         assert!(store.claim_next(thread).await.unwrap().is_none());
-        assert!(store.claim_next_interrupting(thread).await.unwrap().is_none());
+        assert!(
+            store
+                .claim_next_interrupting(thread)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(store.queued_thread_ids().await.unwrap().is_empty());
-        assert_eq!(store.session(thread).await.unwrap().unwrap().status, SessionStatus::Stopped);
+        assert_eq!(
+            store.session(thread).await.unwrap().unwrap().status,
+            SessionStatus::Stopped
+        );
 
         let other = ThreadId::new(11);
         store.create_session(&new_session(11, 21)).await.unwrap();
-        store.set_session_status(other, SessionStatus::Stopped).await.unwrap();
+        store
+            .set_session_status(other, SessionStatus::Stopped)
+            .await
+            .unwrap();
         store.reset_session(other).await.unwrap();
-        store.note_human_message(other, MessageId::new(41)).await.unwrap();
+        store
+            .note_human_message(other, MessageId::new(41))
+            .await
+            .unwrap();
         let admitted = enqueue(&store, 11, 42).await;
         assert_eq!(store.claim_next(other).await.unwrap().unwrap().id, admitted);
     }
@@ -1253,7 +1335,13 @@ mod tests {
             .await
             .unwrap();
         assert!(store.claim_next(thread).await.unwrap().is_none());
-        assert!(store.claim_next_interrupting(thread).await.unwrap().is_none());
+        assert!(
+            store
+                .claim_next_interrupting(thread)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(store.queued_thread_ids().await.unwrap().is_empty());
     }
 
@@ -1305,7 +1393,10 @@ mod tests {
 
         for thread_number in 20..24 {
             let thread = ThreadId::new(thread_number);
-            store.create_session(&new_session(thread_number, thread_number + 100)).await.unwrap();
+            store
+                .create_session(&new_session(thread_number, thread_number + 100))
+                .await
+                .unwrap();
             enqueue(&store, thread_number, thread_number + 200).await;
             let (_, _, _, _, excluded) = tokio::join!(
                 store.reset_session(thread),
@@ -1327,7 +1418,13 @@ mod tests {
             );
             assert_eq!(store.counts(thread).await.unwrap().queued, 0);
             assert!(store.claim_next(thread).await.unwrap().is_none());
-            assert!(store.claim_next_interrupting(thread).await.unwrap().is_none());
+            assert!(
+                store
+                    .claim_next_interrupting(thread)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert!(!store.queued_thread_ids().await.unwrap().contains(&thread));
         }
     }
@@ -1347,7 +1444,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        store.enqueue_turn(ThreadId::new(11), MessageId::new(200), UserId::new(3), "unrelated", TurnSource::Human).await.unwrap();
+        store
+            .enqueue_turn(
+                ThreadId::new(11),
+                MessageId::new(200),
+                UserId::new(3),
+                "unrelated",
+                TurnSource::Human,
+            )
+            .await
+            .unwrap();
         let context = store.title_context(ThreadId::new(10)).await.unwrap();
         assert_eq!(context.len(), 8);
         assert!(context[0].prompt.starts_with("2:"));
@@ -1960,7 +2066,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("create original schema");
-        let original = Store { pool, thread_access: Arc::new(Mutex::new(HashMap::new())) };
+        let original = Store {
+            pool,
+            thread_access: Arc::new(Mutex::new(HashMap::new())),
+        };
         sqlx::query(
             "INSERT INTO sessions (thread_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES ('10', '1', '2', '20', '/tmp', '3', 'active', 0, 0)",
         )

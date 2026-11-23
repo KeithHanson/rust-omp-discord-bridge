@@ -14,20 +14,20 @@ use serde::{
     Serialize,
     ser::{SerializeSeq, Serializer},
 };
-use sha2::{Digest, Sha256};
 use serenity::{
     all::{
         Attachment, AutoArchiveDuration, ButtonStyle, Channel, ChannelId as SerenityChannelId,
         ChannelType, Client, Context, CreateAllowedMentions, CreateButton, CreateEmbed,
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
         EditMessage, Embed, EventHandler, GatewayIntents, GetMessages, GuildChannel, Http,
-        Interaction, Member, Message, MessageFlags, OnlineStatus, Ready, ResumedEvent, ThreadMember,
-        ThreadMembersUpdateEvent, Timestamp, User,
+        Interaction, Member, Message, MessageFlags, OnlineStatus, Ready, ResumedEvent,
+        ThreadMember, ThreadMembersUpdateEvent, Timestamp, User,
     },
     builder::Builder,
     gateway::{ActivityData, ShardMessenger},
     http::{LightMethod, Request, Route},
 };
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Semaphore, mpsc, oneshot, watch},
     time::Instant,
@@ -35,7 +35,9 @@ use tokio::{
 
 use crate::{
     config::{AppConfig, GuildPolicy},
-    domain::{ChannelId, ClientKind, GuildId, MessageId, NewSession, SessionStatus, ThreadId, UserId},
+    domain::{
+        ChannelId, ClientKind, GuildId, MessageId, NewSession, SessionStatus, ThreadId, UserId,
+    },
     live_config::LiveConfig,
     omp::{ApprovalRequest, OmpTransport},
     presence::PresenceSnapshot,
@@ -72,9 +74,18 @@ impl ReviewTitle for TitleReviewer {
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run(live_config: LiveConfig, store: Store, command_receiver: mpsc::Receiver<ControlCommand>, config_path: &std::path::Path, permits: Arc<Semaphore>) -> Result<()> {
+pub async fn run(
+    live_config: LiveConfig,
+    store: Store,
+    command_receiver: mpsc::Receiver<ControlCommand>,
+    config_path: &std::path::Path,
+    permits: Arc<Semaphore>,
+) -> Result<()> {
     let config = live_config.load();
-    let discord = config.discord.as_ref().context("Discord configuration is required")?;
+    let discord = config
+        .discord
+        .as_ref()
+        .context("Discord configuration is required")?;
     let token = discord.load_token()?;
     let http = Arc::new(Http::new(&token));
     let approvals = Arc::new(ApprovalBroker::default());
@@ -227,7 +238,13 @@ async fn auto_update(
 
 fn presence_text(snapshot: PresenceSnapshot) -> String {
     match (snapshot.working, snapshot.awaiting_approval) {
-        (0, 0) => concat!("Idle · v", env!("BRIDGE_RELEASE_VERSION"), " · ", env!("BRIDGE_BUILD_REVISION")).to_owned(),
+        (0, 0) => concat!(
+            "Idle · v",
+            env!("BRIDGE_RELEASE_VERSION"),
+            " · ",
+            env!("BRIDGE_BUILD_REVISION")
+        )
+        .to_owned(),
         (1, 0) => "Working in 1 thread".to_owned(),
         (working, 0) => format!("Working in {working} threads"),
         (0, awaiting) => format!("{awaiting} awaiting approval"),
@@ -268,7 +285,10 @@ async fn gateway_presence<T>(
             refresh |= target.has_changed();
             let pending = target.is_some() && (refresh || last_sent != Some(snapshot));
             if pending && Instant::now() >= next_send {
-                send(target.as_ref().expect("presence target is available"), snapshot);
+                send(
+                    target.as_ref().expect("presence target is available"),
+                    snapshot,
+                );
                 last_sent = Some(snapshot);
                 next_send = Instant::now() + PRESENCE_INTERVAL;
                 refresh = false;
@@ -293,7 +313,6 @@ async fn gateway_presence<T>(
         }
     }
 }
-
 
 #[derive(Default)]
 struct ApprovalBroker {
@@ -570,7 +589,11 @@ impl ThreadMessenger for DiscordMessenger {
         })?
     }
 
-    async fn upload_file(&self, thread_id: ThreadId, request: crate::omp::UploadRequest) -> Result<String> {
+    async fn upload_file(
+        &self,
+        thread_id: ThreadId,
+        request: crate::omp::UploadRequest,
+    ) -> Result<String> {
         let _access = thread_access(&self.store, thread_id).await?;
         tokio::time::timeout(
             Duration::from_secs(self.config.runtime.discord_history_timeout_seconds),
@@ -652,8 +675,13 @@ impl ThreadMessenger for DiscordMessenger {
 
 impl DiscordMessenger {
     fn title_lock(&self, thread_id: ThreadId) -> Arc<tokio::sync::Mutex<TitleState>> {
-        Arc::clone(self.titles.lock().expect("thread title lock poisoned")
-            .entry(thread_id).or_default())
+        Arc::clone(
+            self.titles
+                .lock()
+                .expect("thread title lock poisoned")
+                .entry(thread_id)
+                .or_default(),
+        )
     }
 
     async fn title_channel(
@@ -670,7 +698,10 @@ impl DiscordMessenger {
         if channel.id != channel_id
             || channel.guild_id.get() != session.guild_id.get()
             || channel.parent_id.map(|id| id.get()) != Some(session.parent_channel_id.get())
-            || !matches!(channel.kind, ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread)
+            || !matches!(
+                channel.kind,
+                ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread
+            )
         {
             bail!("Discord returned inconsistent thread identity for thread status");
         }
@@ -681,9 +712,14 @@ impl DiscordMessenger {
         if self.store.is_thread_excluded(thread_id).await? {
             bail!("bot was kicked from this thread");
         }
-        let session = self.store.session(thread_id).await?
+        let session = self
+            .store
+            .session(thread_id)
+            .await?
             .context("title requested for an unknown Discord thread")?;
-        let policy = self.config.guild_policy(session.guild_id)
+        let policy = self
+            .config
+            .guild_policy(session.guild_id)
             .context("title requested for an unconfigured guild")?;
         if !policy.allowed_channels.contains(&session.parent_channel_id) {
             bail!("session parent channel is not authorized for title changes");
@@ -739,7 +775,11 @@ impl DiscordMessenger {
         Ok(matches!(decision, Ok(Ok(true))))
     }
 
-    async fn authorize_history(&self, thread_id: ThreadId, days: u16) -> Result<crate::domain::Session> {
+    async fn authorize_history(
+        &self,
+        thread_id: ThreadId,
+        days: u16,
+    ) -> Result<crate::domain::Session> {
         if days == 0 || days > self.config.runtime.discord_history_max_days {
             bail!(
                 "Discord history days must be between 1 and {}",
@@ -774,7 +814,10 @@ impl DiscordMessenger {
     ) -> Result<String> {
         let session = self.authorize_history(session_thread_id, days).await?;
         let target_id = SerenityChannelId::new(target_thread_id.get());
-        let Channel::Guild(channel) = self.http.get_channel(target_id).await
+        let Channel::Guild(channel) = self
+            .http
+            .get_channel(target_id)
+            .await
             .context("failed to read Discord thread metadata for history")?
         else {
             bail!("Discord history target must be a guild thread");
@@ -782,11 +825,17 @@ impl DiscordMessenger {
         if channel.id != target_id
             || channel.guild_id.get() != session.guild_id.get()
             || channel.parent_id.map(|id| id.get()) != Some(session.parent_channel_id.get())
-            || !matches!(channel.kind, ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread)
+            || !matches!(
+                channel.kind,
+                ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread
+            )
         {
-            bail!("Discord history target must be a thread in the session's guild and authorized parent channel");
+            bail!(
+                "Discord history target must be a thread in the session's guild and authorized parent channel"
+            );
         }
-        self.fetch_history(ChannelId::new(target_thread_id.get()), days).await
+        self.fetch_history(ChannelId::new(target_thread_id.get()), days)
+            .await
     }
 
     async fn fetch_history(&self, history_channel_id: ChannelId, days: u16) -> Result<String> {
@@ -1275,7 +1324,10 @@ impl DiscordHandler {
         };
         let thread_id = ThreadId::new(message.channel_id.get());
         if message_control(message, bot_id) == Some(Control::Kick) {
-            if !policy.allowed_users.contains(&UserId::new(message.author.id.get())) {
+            if !policy
+                .allowed_users
+                .contains(&UserId::new(message.author.id.get()))
+            {
                 return Ok(());
             }
             let authorized = if let Some(session) = self.store.session(thread_id).await? {
@@ -1290,7 +1342,10 @@ impl DiscordHandler {
             if authorized {
                 self.exclude_thread(thread_id).await?;
                 // No farewell message: exclusion is effective even if Discord refuses the leave.
-                message.channel_id.leave_thread(http).await
+                message
+                    .channel_id
+                    .leave_thread(http)
+                    .await
                     .context("thread excluded locally, but Discord leave failed")?;
             }
             return Ok(());
@@ -1396,7 +1451,11 @@ impl DiscordHandler {
         }
         let builder = CreateThread::new(format!("🛠️ {}", thread_name(&prompt)))
             .auto_archive_duration(AutoArchiveDuration::from(
-                self.config.discord.as_ref().expect("Discord configuration is required").thread_auto_archive_minutes,
+                self.config
+                    .discord
+                    .as_ref()
+                    .expect("Discord configuration is required")
+                    .thread_auto_archive_minutes,
             ))
             .audit_log_reason("OMP Discord bridge session");
         let thread = builder
@@ -1713,8 +1772,14 @@ fn parse_control(content: &str) -> Option<Control> {
     let content = content.trim();
     let (command, argument) = content
         .split_once(char::is_whitespace)
-        .map_or((content, ""), |(command, argument)| (command, argument.trim()));
-    match command.trim_start_matches('/').to_ascii_lowercase().as_str() {
+        .map_or((content, ""), |(command, argument)| {
+            (command, argument.trim())
+        });
+    match command
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "model" if argument.is_empty() => Some(Control::Models),
         "model" => Some(Control::Model(argument.to_owned())),
         "models" if argument.is_empty() => Some(Control::Models),
@@ -1821,17 +1886,25 @@ fn activity_embed(content: &str, finished: bool) -> CreateEmbed {
     };
     CreateEmbed::new()
         .title(if finished { "STATUS" } else { "NOW" })
-        .description(format!("**{}**\n{}", operational_content(label), operational_content(elapsed)))
+        .description(format!(
+            "**{}**\n{}",
+            operational_content(label),
+            operational_content(elapsed)
+        ))
         .color(color)
 }
 
 fn strip_activity_phase(title: &str) -> &str {
-    title.strip_prefix("[OMP: ")
+    title
+        .strip_prefix("[OMP: ")
         .and_then(|rest| rest.split_once("] ").map(|(_, base)| base))
         .unwrap_or(title)
 }
 
-async fn thread_access(store: &Store, thread_id: ThreadId) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+async fn thread_access(
+    store: &Store,
+    thread_id: ThreadId,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
     let guard = store.thread_access(thread_id).read_owned().await;
     if store.is_thread_excluded(thread_id).await? {
         bail!("bot was kicked from this thread");
@@ -1851,7 +1924,8 @@ async fn send_without_mentions(http: &Http, thread_id: ThreadId, content: &str) 
 
 fn thread_status_name(title: &str, emoji: &str) -> String {
     let mut body = strip_activity_phase(title);
-    while let Some(rest) = body.strip_prefix("✅")
+    while let Some(rest) = body
+        .strip_prefix("✅")
         .or_else(|| body.strip_prefix("🛠️"))
         .or_else(|| body.strip_prefix("🛠"))
         .or_else(|| body.strip_prefix("🧠"))
@@ -1916,10 +1990,17 @@ mod tests {
                 snapshot_rx,
                 target_rx,
                 move |target, snapshot| {
-                    updates_tx.send((Instant::now(), *target, snapshot)).unwrap();
+                    updates_tx
+                        .send((Instant::now(), *target, snapshot))
+                        .unwrap();
                 },
             ));
-            Self { snapshots, targets, updates, worker }
+            Self {
+                snapshots,
+                targets,
+                updates,
+                worker,
+            }
         }
 
         async fn quiet(&mut self) {
@@ -1944,14 +2025,32 @@ mod tests {
     #[test]
     fn presence_includes_build_identity_only_when_idle() {
         for (working, awaiting_approval, text, status) in [
-            (0, 0, concat!("Idle · v", env!("BRIDGE_RELEASE_VERSION"), " · ", env!("BRIDGE_BUILD_REVISION")), OnlineStatus::Online),
+            (
+                0,
+                0,
+                concat!(
+                    "Idle · v",
+                    env!("BRIDGE_RELEASE_VERSION"),
+                    " · ",
+                    env!("BRIDGE_BUILD_REVISION")
+                ),
+                OnlineStatus::Online,
+            ),
             (1, 0, "Working in 1 thread", OnlineStatus::Online),
             (8, 0, "Working in 8 threads", OnlineStatus::Online),
             (0, 1, "1 awaiting approval", OnlineStatus::Idle),
             (0, 4, "4 awaiting approval", OnlineStatus::Idle),
-            (2, 3, "2 working · 3 awaiting approval", OnlineStatus::Online),
+            (
+                2,
+                3,
+                "2 working · 3 awaiting approval",
+                OnlineStatus::Online,
+            ),
         ] {
-            let snapshot = PresenceSnapshot { working, awaiting_approval };
+            let snapshot = PresenceSnapshot {
+                working,
+                awaiting_approval,
+            };
             assert_eq!(presence_text(snapshot), text);
             assert_eq!(presence_status(snapshot), status);
         }
@@ -1966,7 +2065,10 @@ mod tests {
             awaiting_approval: 0,
         });
         harness.quiet().await;
-        let latest = PresenceSnapshot { working: 3, awaiting_approval: 2 };
+        let latest = PresenceSnapshot {
+            working: 3,
+            awaiting_approval: 2,
+        };
         harness.snapshots.send_replace(latest);
         harness.quiet().await;
         harness.targets.send_replace(Some(7));
@@ -1989,11 +2091,17 @@ mod tests {
         });
         harness.quiet().await;
         tokio::time::advance(Duration::from_secs(4)).await;
-        let latest = PresenceSnapshot { working: 0, awaiting_approval: 2 };
+        let latest = PresenceSnapshot {
+            working: 0,
+            awaiting_approval: 2,
+        };
         harness.snapshots.send_replace(latest);
         harness.quiet().await;
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(harness.next().await, (first_at + PRESENCE_INTERVAL, 1, latest));
+        assert_eq!(
+            harness.next().await,
+            (first_at + PRESENCE_INTERVAL, 1, latest)
+        );
 
         // A transient state that returns to the sent value needs no update.
         harness.snapshots.send_replace(PresenceSnapshot::default());
@@ -2008,7 +2116,11 @@ mod tests {
         harness.snapshots.send_replace(PresenceSnapshot::default());
         assert_eq!(
             harness.next().await,
-            (first_at + PRESENCE_INTERVAL * 2, 1, PresenceSnapshot::default())
+            (
+                first_at + PRESENCE_INTERVAL * 2,
+                1,
+                PresenceSnapshot::default()
+            )
         );
     }
 
@@ -2021,14 +2133,20 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         harness.targets.send_replace(Some(2));
         harness.quiet().await;
-        let latest = PresenceSnapshot { working: 2, awaiting_approval: 1 };
+        let latest = PresenceSnapshot {
+            working: 2,
+            awaiting_approval: 1,
+        };
         harness.snapshots.send_replace(latest);
         harness.quiet().await;
         tokio::time::advance(Duration::from_secs(3)).await;
         harness.targets.send_replace(Some(3));
         harness.quiet().await;
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(harness.next().await, (first_at + PRESENCE_INTERVAL, 3, latest));
+        assert_eq!(
+            harness.next().await,
+            (first_at + PRESENCE_INTERVAL, 3, latest)
+        );
 
         // A resumed connection can retain the same messenger and snapshot.
         harness.targets.send_replace(Some(3));
@@ -2060,33 +2178,54 @@ mod tests {
     async fn activity_refresh_edits_original_card_without_reading_or_reposting() {
         let root = tempfile::tempdir().unwrap();
         let message = serde_json::to_value(routing_message(true, "OMP:")).unwrap();
-        let (http, requests) = discord_api(vec![
-            ("PATCH", "/channels/3/messages/100", 200, message),
-        ]);
+        let (http, requests) =
+            discord_api(vec![("PATCH", "/channels/3/messages/100", 200, message)]);
         let messenger = participants_messenger(root.path(), http).await;
-        let id = messenger.edit_activity(
-            ThreadId::new(3), MessageId::new(100), "OMP: Thinking — 5s elapsed", false,
-        ).await.unwrap();
+        let id = messenger
+            .edit_activity(
+                ThreadId::new(3),
+                MessageId::new(100),
+                "OMP: Thinking — 5s elapsed",
+                false,
+            )
+            .await
+            .unwrap();
         assert_eq!(id, MessageId::new(100));
         let bodies = requests.join().unwrap();
         assert_eq!(bodies[0]["content"], "");
         assert_eq!(bodies[0]["embeds"][0]["title"], "NOW");
-        assert_eq!(bodies[0]["embeds"][0]["description"], "**Thinking**\n5s elapsed");
+        assert_eq!(
+            bodies[0]["embeds"][0]["description"],
+            "**Thinking**\n5s elapsed"
+        );
         assert_eq!(bodies[0]["embeds"][0]["color"], 0x3498db);
-        assert_eq!(bodies[0]["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert_eq!(
+            bodies[0]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
     async fn failed_activity_edit_does_not_repost_card() {
         let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api(vec![
-            ("PATCH", "/channels/3/messages/100", 403,
-                serde_json::json!({"code": 50013, "message": "Missing Permissions"})),
-        ]);
+        let (http, requests) = discord_api(vec![(
+            "PATCH",
+            "/channels/3/messages/100",
+            403,
+            serde_json::json!({"code": 50013, "message": "Missing Permissions"}),
+        )]);
         let messenger = participants_messenger(root.path(), http).await;
-        assert!(messenger.edit_activity(
-            ThreadId::new(3), MessageId::new(100), "OMP: Thinking — 5s elapsed", false,
-        ).await.is_err());
+        assert!(
+            messenger
+                .edit_activity(
+                    ThreadId::new(3),
+                    MessageId::new(100),
+                    "OMP: Thinking — 5s elapsed",
+                    false,
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(requests.join().unwrap().len(), 1);
     }
 
@@ -2099,9 +2238,9 @@ mod tests {
             ("Interrupted; check status", 0xf1c40f),
             ("Outcome uncertain; inspect before retrying", 0xf1c40f),
         ] {
-            let embed = serde_json::to_value(activity_embed(
-                &format!("OMP: {label} — 12s elapsed"), true,
-            )).unwrap();
+            let embed =
+                serde_json::to_value(activity_embed(&format!("OMP: {label} — 12s elapsed"), true))
+                    .unwrap();
             assert_eq!(embed["title"], "STATUS");
             assert_eq!(embed["color"], color);
         }
@@ -2120,7 +2259,11 @@ mod tests {
     #[async_trait]
     impl ReviewTitle for ScriptedReviewer {
         async fn review(&self, _: &crate::domain::Session) -> Result<ReviewedTitle> {
-            self.reviews.lock().unwrap().pop_front().expect("unexpected semantic review")
+            self.reviews
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected semantic review")
         }
     }
 
@@ -2131,45 +2274,121 @@ mod tests {
         let (http, requests) = discord_api(vec![
             ("GET", "/channels/3", 200, title_response("✅ Old topic")),
             ("PATCH", "/channels/3", 200, title_response("🛠️ Old topic")),
-            ("PATCH", "/channels/3", 200, title_response("🧠 Investigating timeout")),
-            ("GET", "/channels/3", 200, title_response("🧠 Investigating timeout")),
-            ("PATCH", "/channels/3", 200, title_response("⏳ Awaiting credentials")),
-            ("GET", "/channels/3", 200, title_response("⏳ Awaiting credentials")),
-            ("GET", "/channels/3", 200, title_response("⚠️ Operator edited topic")),
-            ("PATCH", "/channels/3", 200, title_response("✅ Operator edited topic")),
-            ("GET", "/channels/3", 200, title_response("✅ Operator edited topic")),
+            (
+                "PATCH",
+                "/channels/3",
+                200,
+                title_response("🧠 Investigating timeout"),
+            ),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                title_response("🧠 Investigating timeout"),
+            ),
+            (
+                "PATCH",
+                "/channels/3",
+                200,
+                title_response("⏳ Awaiting credentials"),
+            ),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                title_response("⏳ Awaiting credentials"),
+            ),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                title_response("⚠️ Operator edited topic"),
+            ),
+            (
+                "PATCH",
+                "/channels/3",
+                200,
+                title_response("✅ Operator edited topic"),
+            ),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                title_response("✅ Operator edited topic"),
+            ),
         ]);
         let mut messenger = participants_messenger(root.path(), http).await;
         let reviewer = Arc::new(ScriptedReviewer {
-            reviews: Mutex::new([
-                Ok(ReviewedTitle { topic: "Investigating timeout".into(), status: TitlePhase::Thinking }),
-                Ok(ReviewedTitle { topic: "Awaiting credentials".into(), status: TitlePhase::Waiting }),
-                Ok(ReviewedTitle { topic: "Awaiting credentials".into(), status: TitlePhase::Waiting }),
-            ].into()),
+            reviews: Mutex::new(
+                [
+                    Ok(ReviewedTitle {
+                        topic: "Investigating timeout".into(),
+                        status: TitlePhase::Thinking,
+                    }),
+                    Ok(ReviewedTitle {
+                        topic: "Awaiting credentials".into(),
+                        status: TitlePhase::Waiting,
+                    }),
+                    Ok(ReviewedTitle {
+                        topic: "Awaiting credentials".into(),
+                        status: TitlePhase::Waiting,
+                    }),
+                ]
+                .into(),
+            ),
         });
         messenger.reviewer = reviewer.clone();
         for status in ["working", "working", "working", "completed", "completed"] {
-            messenger.thread_status(ThreadId::new(3), status).await.unwrap();
+            messenger
+                .thread_status(ThreadId::new(3), status)
+                .await
+                .unwrap();
         }
         assert!(reviewer.reviews.lock().unwrap().is_empty());
         let bodies = requests.join().unwrap();
-        assert_eq!(bodies.iter().filter_map(|body| body.get("name").and_then(|v| v.as_str())).collect::<Vec<_>>(),
-            vec!["🛠️ Old topic", "🧠 Investigating timeout", "⏳ Awaiting credentials", "✅ Operator edited topic"]);
+        assert_eq!(
+            bodies
+                .iter()
+                .filter_map(|body| body.get("name").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                "🛠️ Old topic",
+                "🧠 Investigating timeout",
+                "⏳ Awaiting credentials",
+                "✅ Operator edited topic"
+            ]
+        );
     }
 
     #[tokio::test]
     async fn failed_inference_keeps_immediate_working_prefix_but_reports_failure() {
         let root = tempfile::tempdir().unwrap();
         let (http, requests) = discord_api(vec![
-            ("GET", "/channels/3", 200, title_response("✅ Existing topic")),
-            ("PATCH", "/channels/3", 200, title_response("🛠️ Existing topic")),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                title_response("✅ Existing topic"),
+            ),
+            (
+                "PATCH",
+                "/channels/3",
+                200,
+                title_response("🛠️ Existing topic"),
+            ),
         ]);
         let mut messenger = participants_messenger(root.path(), http).await;
         messenger.reviewer = Arc::new(ScriptedReviewer {
             reviews: Mutex::new([Err(anyhow::anyhow!("review model unavailable"))].into()),
         });
-        assert_eq!(messenger.thread_status(ThreadId::new(3), "working").await
-            .unwrap_err().to_string(), "review model unavailable");
+        assert_eq!(
+            messenger
+                .thread_status(ThreadId::new(3), "working")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "review model unavailable"
+        );
         assert_eq!(requests.join().unwrap()[1]["name"], "🛠️ Existing topic");
     }
 
@@ -2181,11 +2400,21 @@ mod tests {
     #[async_trait]
     impl ReviewTitle for SessionReviewer {
         async fn review(&self, session: &crate::domain::Session) -> Result<ReviewedTitle> {
-            self.observed.lock().unwrap().push((Instant::now(), session.omp_session_path.clone()));
+            self.observed
+                .lock()
+                .unwrap()
+                .push((Instant::now(), session.omp_session_path.clone()));
             // Simulate context changing immediately after the first review snapshot.
-            self.store.set_session_path(session.thread_id, std::path::Path::new("Latest topic")).await?;
+            self.store
+                .set_session_path(session.thread_id, std::path::Path::new("Latest topic"))
+                .await?;
             Ok(ReviewedTitle {
-                topic: session.omp_session_path.as_ref().unwrap().display().to_string(),
+                topic: session
+                    .omp_session_path
+                    .as_ref()
+                    .unwrap()
+                    .display()
+                    .to_string(),
                 status: crate::titles::TitlePhase::Working,
             })
         }
@@ -2195,20 +2424,56 @@ mod tests {
     async fn rate_limited_inference_is_discarded_and_session_is_reread_after_wait() {
         let root = tempfile::tempdir().unwrap();
         let (http, requests) = discord_api(vec![
-            ("GET", "/channels/3", 200, title_response("🛠️ Existing topic")),
-            ("PATCH", "/channels/3", 429, serde_json::json!({"retry_after": 0.05, "global": false})),
-            ("GET", "/channels/3", 200, title_response("🛠️ Existing topic")),
-            ("PATCH", "/channels/3", 200, title_response("🛠️ Latest topic")),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                title_response("🛠️ Existing topic"),
+            ),
+            (
+                "PATCH",
+                "/channels/3",
+                429,
+                serde_json::json!({"retry_after": 0.05, "global": false}),
+            ),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                title_response("🛠️ Existing topic"),
+            ),
+            (
+                "PATCH",
+                "/channels/3",
+                200,
+                title_response("🛠️ Latest topic"),
+            ),
         ]);
         let mut messenger = participants_messenger(root.path(), http).await;
-        messenger.store.set_session_path(ThreadId::new(3), std::path::Path::new("Stale topic")).await.unwrap();
-        let reviewer = Arc::new(SessionReviewer { store: messenger.store.clone(), observed: Mutex::new(Vec::new()) });
+        messenger
+            .store
+            .set_session_path(ThreadId::new(3), std::path::Path::new("Stale topic"))
+            .await
+            .unwrap();
+        let reviewer = Arc::new(SessionReviewer {
+            store: messenger.store.clone(),
+            observed: Mutex::new(Vec::new()),
+        });
         messenger.reviewer = reviewer.clone();
-        messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
+        messenger
+            .thread_status(ThreadId::new(3), "working")
+            .await
+            .unwrap();
         let observed = reviewer.observed.lock().unwrap();
         assert_eq!(observed.len(), 2);
-        assert_eq!(observed[0].1.as_deref(), Some(std::path::Path::new("Stale topic")));
-        assert_eq!(observed[1].1.as_deref(), Some(std::path::Path::new("Latest topic")));
+        assert_eq!(
+            observed[0].1.as_deref(),
+            Some(std::path::Path::new("Stale topic"))
+        );
+        assert_eq!(
+            observed[1].1.as_deref(),
+            Some(std::path::Path::new("Latest topic"))
+        );
         assert!(observed[1].0.duration_since(observed[0].0) >= Duration::from_millis(50));
         let bodies = requests.join().unwrap();
         assert_eq!(bodies[1]["name"], "🛠️ Stale topic");
@@ -2218,17 +2483,49 @@ mod tests {
     #[tokio::test]
     async fn successful_patch_reset_delays_next_read_and_completion_uses_latest_topic() {
         let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api_headers(vec![
-            ("GET", "/channels/3", 200, title_response("🧠 Original topic"), ""),
-            ("PATCH", "/channels/3", 200, title_response("✅ Original topic"),
-                "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-After: 0.05\r\n"),
-            ("GET", "/channels/3", 200, title_response("⚠️ Changed while waiting"), ""),
-            ("PATCH", "/channels/3", 200, title_response("✅ Changed while waiting"), ""),
-        ], false);
+        let (http, requests) = discord_api_headers(
+            vec![
+                (
+                    "GET",
+                    "/channels/3",
+                    200,
+                    title_response("🧠 Original topic"),
+                    "",
+                ),
+                (
+                    "PATCH",
+                    "/channels/3",
+                    200,
+                    title_response("✅ Original topic"),
+                    "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-After: 0.05\r\n",
+                ),
+                (
+                    "GET",
+                    "/channels/3",
+                    200,
+                    title_response("⚠️ Changed while waiting"),
+                    "",
+                ),
+                (
+                    "PATCH",
+                    "/channels/3",
+                    200,
+                    title_response("✅ Changed while waiting"),
+                    "",
+                ),
+            ],
+            false,
+        );
         let messenger = participants_messenger(root.path(), http).await;
         let start = Instant::now();
-        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
-        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
+        messenger
+            .thread_status(ThreadId::new(3), "completed")
+            .await
+            .unwrap();
+        messenger
+            .thread_status(ThreadId::new(3), "completed")
+            .await
+            .unwrap();
         assert!(start.elapsed() >= Duration::from_millis(50));
         let bodies = requests.join().unwrap();
         assert_eq!(bodies[1]["name"], "✅ Original topic");
@@ -2252,13 +2549,22 @@ mod tests {
                 // Another thread's title response establishes a global limit mid-review.
                 let messenger = self.messenger.upgrade().unwrap();
                 let mut other = TitleState::default();
-                assert!(matches!(messenger.title_http.patch(
-                    ThreadId::new(4), "Other thread", &mut other,
-                ).await?, TitleReply::Limited));
+                assert!(matches!(
+                    messenger
+                        .title_http
+                        .patch(ThreadId::new(4), "Other thread", &mut other,)
+                        .await?,
+                    TitleReply::Limited
+                ));
                 tokio::time::sleep(Duration::from_millis(60)).await;
             }
             Ok(ReviewedTitle {
-                topic: if first { "Stale inference" } else { "Fresh inference" }.into(),
+                topic: if first {
+                    "Stale inference"
+                } else {
+                    "Fresh inference"
+                }
+                .into(),
                 status: crate::titles::TitlePhase::Working,
             })
         }
@@ -2267,13 +2573,39 @@ mod tests {
     #[tokio::test]
     async fn global_limit_during_inference_discards_result_before_any_patch() {
         let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api_headers(vec![
-            ("GET", "/channels/3", 200, title_response("🛠️ Existing topic"), ""),
-            ("PATCH", "/channels/4", 429, serde_json::json!({"retry_after": 0.025, "global": true}),
-                "Retry-After: 0.05\r\nX-RateLimit-Global: true\r\n"),
-            ("GET", "/channels/3", 200, title_response("🛠️ Updated during cooldown"), ""),
-            ("PATCH", "/channels/3", 200, title_response("🛠️ Fresh inference"), ""),
-        ], false);
+        let (http, requests) = discord_api_headers(
+            vec![
+                (
+                    "GET",
+                    "/channels/3",
+                    200,
+                    title_response("🛠️ Existing topic"),
+                    "",
+                ),
+                (
+                    "PATCH",
+                    "/channels/4",
+                    429,
+                    serde_json::json!({"retry_after": 0.025, "global": true}),
+                    "Retry-After: 0.05\r\nX-RateLimit-Global: true\r\n",
+                ),
+                (
+                    "GET",
+                    "/channels/3",
+                    200,
+                    title_response("🛠️ Updated during cooldown"),
+                    "",
+                ),
+                (
+                    "PATCH",
+                    "/channels/3",
+                    200,
+                    title_response("🛠️ Fresh inference"),
+                    "",
+                ),
+            ],
+            false,
+        );
         let mut messenger = participants_messenger(root.path(), http).await;
         let observed = Arc::new(Mutex::new(Vec::new()));
         let messenger = Arc::new_cyclic(|weak| {
@@ -2283,7 +2615,10 @@ mod tests {
             });
             messenger
         });
-        messenger.thread_status(ThreadId::new(3), "working").await.unwrap();
+        messenger
+            .thread_status(ThreadId::new(3), "working")
+            .await
+            .unwrap();
         let observed = observed.lock().unwrap();
         assert_eq!(observed.len(), 2);
         assert!(observed[1].duration_since(observed[0]) >= Duration::from_millis(50));
@@ -2302,15 +2637,38 @@ mod tests {
         };
         let (http, requests) = discord_api(vec![
             ("GET", "/channels/3", 200, response("🛠️ Original topic")),
-            ("PATCH", "/channels/3", 403, serde_json::json!({
-                "code": 50013, "message": "Missing Permissions",
-            })),
-            ("GET", "/channels/3", 200, response("🛠️ Externally updated topic")),
-            ("PATCH", "/channels/3", 200, response("✅ Externally updated topic")),
+            (
+                "PATCH",
+                "/channels/3",
+                403,
+                serde_json::json!({
+                    "code": 50013, "message": "Missing Permissions",
+                }),
+            ),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                response("🛠️ Externally updated topic"),
+            ),
+            (
+                "PATCH",
+                "/channels/3",
+                200,
+                response("✅ Externally updated topic"),
+            ),
         ]);
         let messenger = participants_messenger(root.path(), http).await;
-        assert!(messenger.thread_status(ThreadId::new(3), "completed").await.is_err());
-        messenger.thread_status(ThreadId::new(3), "completed").await.unwrap();
+        assert!(
+            messenger
+                .thread_status(ThreadId::new(3), "completed")
+                .await
+                .is_err()
+        );
+        messenger
+            .thread_status(ThreadId::new(3), "completed")
+            .await
+            .unwrap();
         let bodies = requests.join().unwrap();
         assert_eq!(bodies[1]["name"], "✅ Original topic");
         assert_eq!(bodies[3]["name"], "✅ Externally updated topic");
@@ -2321,14 +2679,29 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut channel = routing_channel();
         channel.parent_id = Some(SerenityChannelId::new(9));
-        let (http, requests) = discord_api(vec![
-            ("GET", "/channels/3", 200, serde_json::to_value(channel).unwrap()),
-        ]);
+        let (http, requests) = discord_api(vec![(
+            "GET",
+            "/channels/3",
+            200,
+            serde_json::to_value(channel).unwrap(),
+        )]);
         let messenger = participants_messenger(root.path(), http).await;
-        assert!(messenger.thread_status(ThreadId::new(4), "working").await
-            .unwrap_err().to_string().contains("unknown Discord thread"));
-        assert!(messenger.thread_status(ThreadId::new(3), "working").await
-            .unwrap_err().to_string().contains("inconsistent thread identity"));
+        assert!(
+            messenger
+                .thread_status(ThreadId::new(4), "working")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown Discord thread")
+        );
+        assert!(
+            messenger
+                .thread_status(ThreadId::new(3), "working")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent thread identity")
+        );
         assert_eq!(requests.join().unwrap(), vec![serde_json::Value::Null]);
     }
 
@@ -2343,8 +2716,14 @@ mod tests {
     #[test]
     fn status_name_preserves_body_and_only_truncates_at_discord_limit() {
         let body = format!("  Detailed {} title  ", "🦀".repeat(35));
-        assert_eq!(thread_status_name(&format!("🧠 🛠️ {body}"), "✅"), format!("✅ {body}"));
-        assert_eq!(thread_status_name("  Original title  ", "✅"), "✅   Original title  ");
+        assert_eq!(
+            thread_status_name(&format!("🧠 🛠️ {body}"), "✅"),
+            format!("✅ {body}")
+        );
+        assert_eq!(
+            thread_status_name("  Original title  ", "✅"),
+            "✅   Original title  "
+        );
         let name = thread_status_name(&"🦀".repeat(50), "🛠️");
         assert_eq!(name, format!("🛠️ {}", "🦀".repeat(48)));
         assert_eq!(name.encode_utf16().count(), 100);
@@ -2353,10 +2732,21 @@ mod tests {
     #[tokio::test]
     async fn thread_status_preserves_current_title_and_skips_correct_prefix() {
         for (current, status, expected) in [
-            (format!("🧠 🛠️ {}  ", "Detailed title ".repeat(5)), "completed",
-                format!("✅ {}  ", "Detailed title ".repeat(5))),
-            ("⏳ ⚠️ Existing title".into(), "completed", "✅ Existing title".into()),
-            ("✅ Existing title  ".into(), "completed", "✅ Existing title  ".into()),
+            (
+                format!("🧠 🛠️ {}  ", "Detailed title ".repeat(5)),
+                "completed",
+                format!("✅ {}  ", "Detailed title ".repeat(5)),
+            ),
+            (
+                "⏳ ⚠️ Existing title".into(),
+                "completed",
+                "✅ Existing title".into(),
+            ),
+            (
+                "✅ Existing title  ".into(),
+                "completed",
+                "✅ Existing title  ".into(),
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             let mut channel = routing_channel();
@@ -2368,7 +2758,10 @@ mod tests {
             }
             let (http, requests) = discord_api(responses);
             let messenger = participants_messenger(root.path(), http).await;
-            messenger.thread_status(ThreadId::new(3), status).await.unwrap();
+            messenger
+                .thread_status(ThreadId::new(3), status)
+                .await
+                .unwrap();
             let mut expected_requests = vec![serde_json::Value::Null];
             if current != expected {
                 expected_requests.push(serde_json::json!({"name": expected}));
@@ -2382,14 +2775,45 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (http, requests) = discord_api(vec![]);
         let mut messenger = participants_messenger(root.path(), http).await;
-        assert!(messenger.thread_status(ThreadId::new(4), "completed").await
-            .unwrap_err().to_string().contains("unknown Discord thread"));
-        Arc::get_mut(&mut messenger.config).unwrap().discord.as_mut().expect("discord").guilds[0].allowed_channels.clear();
-        assert!(messenger.thread_status(ThreadId::new(3), "completed").await
-            .unwrap_err().to_string().contains("not authorized"));
-        Arc::get_mut(&mut messenger.config).unwrap().discord.as_mut().expect("discord").guilds.clear();
-        assert!(messenger.thread_status(ThreadId::new(3), "completed").await
-            .unwrap_err().to_string().contains("unconfigured guild"));
+        assert!(
+            messenger
+                .thread_status(ThreadId::new(4), "completed")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown Discord thread")
+        );
+        Arc::get_mut(&mut messenger.config)
+            .unwrap()
+            .discord
+            .as_mut()
+            .expect("discord")
+            .guilds[0]
+            .allowed_channels
+            .clear();
+        assert!(
+            messenger
+                .thread_status(ThreadId::new(3), "completed")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not authorized")
+        );
+        Arc::get_mut(&mut messenger.config)
+            .unwrap()
+            .discord
+            .as_mut()
+            .expect("discord")
+            .guilds
+            .clear();
+        assert!(
+            messenger
+                .thread_status(ThreadId::new(3), "completed")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unconfigured guild")
+        );
         assert!(requests.join().unwrap().is_empty());
     }
 
@@ -2406,8 +2830,14 @@ mod tests {
             response[key] = value;
             let (http, requests) = discord_api(vec![("GET", "/channels/3", 200, response)]);
             let messenger = participants_messenger(root.path(), http).await;
-            assert!(messenger.thread_status(ThreadId::new(3), "completed").await
-                .unwrap_err().to_string().contains("inconsistent thread identity"));
+            assert!(
+                messenger
+                    .thread_status(ThreadId::new(3), "completed")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inconsistent thread identity")
+            );
             assert_eq!(requests.join().unwrap(), vec![serde_json::Value::Null]);
         }
     }
@@ -2420,13 +2850,25 @@ mod tests {
             if fail_patch {
                 let mut channel = routing_channel();
                 channel.name = "🛠️ Existing title".into();
-                responses.push(("GET", "/channels/3", 200, serde_json::to_value(channel).unwrap()));
+                responses.push((
+                    "GET",
+                    "/channels/3",
+                    200,
+                    serde_json::to_value(channel).unwrap(),
+                ));
             }
-            responses.push((if fail_patch { "PATCH" } else { "GET" }, "/channels/3", 403,
-                serde_json::json!({"code": 50013, "message": "Missing Permissions"})));
+            responses.push((
+                if fail_patch { "PATCH" } else { "GET" },
+                "/channels/3",
+                403,
+                serde_json::json!({"code": 50013, "message": "Missing Permissions"}),
+            ));
             let (http, requests) = discord_api(responses);
             let messenger = participants_messenger(root.path(), http).await;
-            let error = messenger.thread_status(ThreadId::new(3), "completed").await.unwrap_err();
+            let error = messenger
+                .thread_status(ThreadId::new(3), "completed")
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("403"));
             assert!(!error.to_string().contains("test-token"));
             let bodies = requests.join().unwrap();
@@ -2440,8 +2882,14 @@ mod tests {
         let (http, requests) = discord_api(vec![]);
         let messenger = participants_messenger(root.path(), http).await;
         for status in ["thinking", "blocked", "failed"] {
-            assert!(messenger.thread_status(ThreadId::new(3), status).await
-                .unwrap_err().to_string().contains("status must be completed or working"));
+            assert!(
+                messenger
+                    .thread_status(ThreadId::new(3), status)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("status must be completed or working")
+            );
         }
         assert!(requests.join().unwrap().is_empty());
     }
@@ -2480,7 +2928,11 @@ mod tests {
                 message.kind = kind;
                 assert_eq!(
                     message_source(&message, 9),
-                    Some(if bot { TurnSource::Bot } else { TurnSource::Human })
+                    Some(if bot {
+                        TurnSource::Bot
+                    } else {
+                        TurnSource::Human
+                    })
                 );
             }
         }
@@ -2630,7 +3082,18 @@ mod tests {
     #[tokio::test]
     async fn bots_never_control_or_approve_even_when_human_allowlisted() {
         let policy = routing_policy();
-        for command in ["status", "stop", "new", "/stop", "abort", "models", "/model", "model anthropic/claude-sonnet-4-5", "model default", "model default anthropic/claude-sonnet-4-5"] {
+        for command in [
+            "status",
+            "stop",
+            "new",
+            "/stop",
+            "abort",
+            "models",
+            "/model",
+            "model anthropic/claude-sonnet-4-5",
+            "model default",
+            "model default anthropic/claude-sonnet-4-5",
+        ] {
             for content in [
                 command.to_owned(),
                 format!("<@9> {command}"),
@@ -2779,19 +3242,32 @@ mod tests {
     async fn table_image_delivery_disables_mentions_and_attaches_bytes() {
         let root = tempfile::tempdir().unwrap();
         let (http, requests) = discord_api(vec![(
-            "POST", "/channels/3/messages", 200,
+            "POST",
+            "/channels/3/messages",
+            200,
             serde_json::to_value(routing_message(true, "")).unwrap(),
         )]);
         let messenger = participants_messenger(root.path(), http).await;
         // The existing multipart test server decodes bodies as UTF-8.
         let bytes = b"table image transport payload";
-        messenger.send_image(ThreadId::new(3), bytes.to_vec(), "table-1.png".into()).await.unwrap();
+        messenger
+            .send_image(ThreadId::new(3), bytes.to_vec(), "table-1.png".into())
+            .await
+            .unwrap();
         let bodies = requests.join().unwrap();
         let multipart = bodies[0].as_str().unwrap();
         assert!(multipart.contains("filename=\"table-1.png\""));
         assert!(multipart.contains(std::str::from_utf8(bytes).unwrap()));
-        let payload = multipart.split("name=\"payload_json\"").nth(1).unwrap()
-            .split("\r\n\r\n").nth(1).unwrap().split("\r\n").next().unwrap();
+        let payload = multipart
+            .split("name=\"payload_json\"")
+            .nth(1)
+            .unwrap()
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap()
+            .split("\r\n")
+            .next()
+            .unwrap();
         let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
         assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
         assert_eq!(payload["attachments"][0]["filename"], "table-1.png");
@@ -2804,38 +3280,66 @@ mod tests {
         std::fs::write(root.path().join("report.txt"), bytes).unwrap();
         let mut response = history_message(456, 1_700_000_001, "");
         response.channel_id = SerenityChannelId::new(3);
-        response.attachments.push(serde_json::from_value(serde_json::json!({
-            "id": "789",
-            "filename": "discord-report.txt",
-            "size": bytes.len(),
-            "url": "https://cdn.discordapp.com/attachments/3/789/discord-report.txt",
-            "proxy_url": "https://media.discordapp.net/attachments/3/789/discord-report.txt"
-        })).unwrap());
-        let (http, requests) = discord_api(vec![
-            ("POST", "/channels/3/messages", 200, serde_json::to_value(response).unwrap()),
-        ]);
+        response.attachments.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "789",
+                "filename": "discord-report.txt",
+                "size": bytes.len(),
+                "url": "https://cdn.discordapp.com/attachments/3/789/discord-report.txt",
+                "proxy_url": "https://media.discordapp.net/attachments/3/789/discord-report.txt"
+            }))
+            .unwrap(),
+        );
+        let (http, requests) = discord_api(vec![(
+            "POST",
+            "/channels/3/messages",
+            200,
+            serde_json::to_value(response).unwrap(),
+        )]);
         let messenger = participants_messenger(root.path(), http).await;
-        let receipt: serde_json::Value = serde_json::from_str(&messenger.upload_file(
-            ThreadId::new(3),
-            crate::omp::UploadRequest {
-                path: "report.txt".into(),
-                caption: Some("@everyone <@7> report".into()),
-            },
-        ).await.unwrap()).unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(
+            &messenger
+                .upload_file(
+                    ThreadId::new(3),
+                    crate::omp::UploadRequest {
+                        path: "report.txt".into(),
+                        caption: Some("@everyone <@7> report".into()),
+                    },
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(receipt["message_id"], "456");
         assert_eq!(receipt["channel_id"], "3");
-        assert_eq!(receipt["message_url"], "https://discord.com/channels/1/3/456");
+        assert_eq!(
+            receipt["message_url"],
+            "https://discord.com/channels/1/3/456"
+        );
         assert_eq!(receipt["attachment"]["filename"], "discord-report.txt");
         assert_eq!(receipt["attachment"]["size"], bytes.len());
-        assert_eq!(receipt["attachment"]["url"], "https://cdn.discordapp.com/attachments/3/789/discord-report.txt");
+        assert_eq!(
+            receipt["attachment"]["url"],
+            "https://cdn.discordapp.com/attachments/3/789/discord-report.txt"
+        );
         let bodies = requests.join().unwrap();
         assert_eq!(bodies.len(), 1);
         let multipart = bodies[0].as_str().unwrap();
         assert!(multipart.contains("name=\"files[0]\"; filename=\"report.txt\""));
-        assert!(multipart.as_bytes().windows(bytes.len()).any(|part| part == bytes));
+        assert!(
+            multipart
+                .as_bytes()
+                .windows(bytes.len())
+                .any(|part| part == bytes)
+        );
         assert!(!multipart.contains(root.path().to_str().unwrap()));
-        let payload = multipart.split("name=\"payload_json\"\r\n\r\n").nth(1).unwrap()
-            .split("\r\n--").next().unwrap();
+        let payload = multipart
+            .split("name=\"payload_json\"\r\n\r\n")
+            .nth(1)
+            .unwrap()
+            .split("\r\n--")
+            .next()
+            .unwrap();
         let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
         assert_eq!(payload["content"], "@everyone <@7> report");
         assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
@@ -2851,23 +3355,44 @@ mod tests {
             let thread = match case {
                 "unknown" => ThreadId::new(4),
                 "guild" => {
-                    Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds.clear();
+                    Arc::make_mut(&mut messenger.config)
+                        .discord
+                        .as_mut()
+                        .expect("discord")
+                        .guilds
+                        .clear();
                     ThreadId::new(3)
                 }
                 _ => {
-                    Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds[0].allowed_channels.clear();
+                    Arc::make_mut(&mut messenger.config)
+                        .discord
+                        .as_mut()
+                        .expect("discord")
+                        .guilds[0]
+                        .allowed_channels
+                        .clear();
                     ThreadId::new(3)
                 }
             };
-            let error = messenger.upload_file(thread, crate::omp::UploadRequest {
-                path: "missing".into(),
-                caption: None,
-            }).await.unwrap_err().to_string();
-            assert!(error.contains(match case {
-                "unknown" => "unknown Discord thread",
-                "guild" => "unconfigured guild",
-                _ => "not authorized",
-            }), "{error}");
+            let error = messenger
+                .upload_file(
+                    thread,
+                    crate::omp::UploadRequest {
+                        path: "missing".into(),
+                        caption: None,
+                    },
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(match case {
+                    "unknown" => "unknown Discord thread",
+                    "guild" => "unconfigured guild",
+                    _ => "not authorized",
+                }),
+                "{error}"
+            );
             assert!(requests.join().unwrap().is_empty());
         }
     }
@@ -2876,14 +3401,24 @@ mod tests {
     async fn upload_http_failure_reports_ambiguous_delivery_without_application_retry() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("report.txt"), b"hello").unwrap();
-        let (http, requests) = discord_api(vec![
-            ("POST", "/channels/3/messages", 500, serde_json::json!({"code": 0, "message": "lost response"})),
-        ]);
+        let (http, requests) = discord_api(vec![(
+            "POST",
+            "/channels/3/messages",
+            500,
+            serde_json::json!({"code": 0, "message": "lost response"}),
+        )]);
         let messenger = participants_messenger(root.path(), http).await;
-        let error = messenger.upload_file(ThreadId::new(3), crate::omp::UploadRequest {
-            path: "report.txt".into(),
-            caption: None,
-        }).await.unwrap_err().to_string();
+        let error = messenger
+            .upload_file(
+                ThreadId::new(3),
+                crate::omp::UploadRequest {
+                    path: "report.txt".into(),
+                    caption: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("delivery may have succeeded"));
         assert!(error.contains("no automatic retry"));
         assert_eq!(requests.join().unwrap().len(), 1);
@@ -2965,7 +3500,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unknown Discord thread"));
-        Arc::get_mut(&mut messenger.config).unwrap().discord.as_mut().expect("discord").guilds[0]
+        Arc::get_mut(&mut messenger.config)
+            .unwrap()
+            .discord
+            .as_mut()
+            .expect("discord")
+            .guilds[0]
             .allowed_channels
             .clear();
         let error = messenger
@@ -3097,13 +3637,23 @@ mod tests {
         responses: Vec<(&'static str, &'static str, u16, serde_json::Value)>,
         allow_title_updates: bool,
     ) -> (Arc<Http>, std::thread::JoinHandle<Vec<serde_json::Value>>) {
-        discord_api_headers(responses.into_iter().map(|(method, path, status, body)| {
-            (method, path, status, body, "")
-        }).collect(), allow_title_updates)
+        discord_api_headers(
+            responses
+                .into_iter()
+                .map(|(method, path, status, body)| (method, path, status, body, ""))
+                .collect(),
+            allow_title_updates,
+        )
     }
 
     fn discord_api_headers(
-        responses: Vec<(&'static str, &'static str, u16, serde_json::Value, &'static str)>,
+        responses: Vec<(
+            &'static str,
+            &'static str,
+            u16,
+            serde_json::Value,
+            &'static str,
+        )>,
         allow_title_updates: bool,
     ) -> (Arc<Http>, std::thread::JoinHandle<Vec<serde_json::Value>>) {
         use std::io::Read as _;
@@ -3147,10 +3697,14 @@ mod tests {
                 let actual_method = parts.next().unwrap();
                 let actual_path = parts.next().unwrap();
                 let expected = actual_method == *method && actual_path.ends_with(path);
-                let lifecycle = !expected && allow_title_updates
+                let lifecycle = !expected
+                    && allow_title_updates
                     && actual_path.ends_with("/channels/3")
                     && matches!(actual_method, "GET" | "PATCH");
-                assert!(expected || lifecycle, "unexpected request: {first}; expected {method} {path}");
+                assert!(
+                    expected || lifecycle,
+                    "unexpected request: {first}; expected {method} {path}"
+                );
                 let length = headers
                     .lines()
                     .find_map(|line| {
@@ -3206,48 +3760,137 @@ mod tests {
     async fn kick_excludes_unmanaged_thread_without_joining_and_survives_restart() {
         let root = tempfile::tempdir().unwrap();
         let (http, requests) = discord_api(vec![
-            ("GET", "/channels/3", 200, serde_json::to_value(routing_channel()).unwrap()),
-            ("DELETE", "/channels/3/thread-members/@me", 204, serde_json::Value::Null),
+            (
+                "GET",
+                "/channels/3",
+                200,
+                serde_json::to_value(routing_channel()).unwrap(),
+            ),
+            (
+                "DELETE",
+                "/channels/3/thread-members/@me",
+                204,
+                serde_json::Value::Null,
+            ),
         ]);
         let handler = routing_handler(root.path(), Arc::clone(&http)).await;
-        handler.handle_message(&http, &routing_message(false, "<@9> kick")).await.unwrap();
-        assert!(handler.store.is_thread_excluded(ThreadId::new(3)).await.unwrap());
-        assert!(handler.store.session(ThreadId::new(3)).await.unwrap().is_none());
+        handler
+            .handle_message(&http, &routing_message(false, "<@9> kick"))
+            .await
+            .unwrap();
+        assert!(
+            handler
+                .store
+                .is_thread_excluded(ThreadId::new(3))
+                .await
+                .unwrap()
+        );
+        assert!(
+            handler
+                .store
+                .session(ThreadId::new(3))
+                .await
+                .unwrap()
+                .is_none()
+        );
         drop(handler);
         let restarted = routing_handler(root.path(), Arc::clone(&http)).await;
-        for (bot, content) in [(false, "<@9> new"), (false, "status"), (false, "<@9> return"), (true, "<@9> review")] {
-            restarted.handle_message(&http, &routing_message(bot, content)).await.unwrap();
+        for (bot, content) in [
+            (false, "<@9> new"),
+            (false, "status"),
+            (false, "<@9> return"),
+            (true, "<@9> review"),
+        ] {
+            restarted
+                .handle_message(&http, &routing_message(bot, content))
+                .await
+                .unwrap();
         }
-        assert!(restarted.store.session(ThreadId::new(3)).await.unwrap().is_none());
+        assert!(
+            restarted
+                .store
+                .session(ThreadId::new(3))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(requests.join().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn kick_failure_to_leave_still_blocks_outbound_surfaces() {
         let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api(vec![
-            ("DELETE", "/channels/3/thread-members/@me", 403,
-                serde_json::json!({"code":50001,"message":"Missing Access"})),
-        ]);
+        let (http, requests) = discord_api(vec![(
+            "DELETE",
+            "/channels/3/thread-members/@me",
+            403,
+            serde_json::json!({"code":50001,"message":"Missing Access"}),
+        )]);
         let messenger = participants_messenger(root.path(), Arc::clone(&http)).await;
         let handler = routing_handler(root.path(), Arc::clone(&http)).await;
-        assert!(handler.handle_message(&http, &routing_message(false, "<@9> kick")).await.is_err());
+        assert!(
+            handler
+                .handle_message(&http, &routing_message(false, "<@9> kick"))
+                .await
+                .is_err()
+        );
         let thread = ThreadId::new(3);
         assert!(messenger.send(thread, "late error").await.is_err());
-        assert!(messenger.send_assistant(thread, "<@8> late response").await.is_err());
-        assert!(messenger.send_image(thread, vec![1], "table.png".into()).await.is_err());
-        assert!(messenger.create_activity(thread, "Working", false).await.is_err());
-        assert!(messenger.edit_activity(thread, MessageId::new(100), "Done", true).await.is_err());
+        assert!(
+            messenger
+                .send_assistant(thread, "<@8> late response")
+                .await
+                .is_err()
+        );
+        assert!(
+            messenger
+                .send_image(thread, vec![1], "table.png".into())
+                .await
+                .is_err()
+        );
+        assert!(
+            messenger
+                .create_activity(thread, "Working", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            messenger
+                .edit_activity(thread, MessageId::new(100), "Done", true)
+                .await
+                .is_err()
+        );
         assert!(messenger.thread_status(thread, "completed").await.is_err());
         messenger.notify(thread, "late notification").await;
-        let response = messenger.prompt(thread, serde_json::json!({"id":"late","method":"input"})).await;
+        let response = messenger
+            .prompt(thread, serde_json::json!({"id":"late","method":"input"}))
+            .await;
         assert_eq!(response["cancelled"], true);
-        assert!(!messenger.confirm(thread, ApprovalRequest {
-            title: "late approval".into(), details: "must not send".into(),
-        }).await);
-        assert!(messenger.upload_file(thread, crate::omp::UploadRequest {
-            path: "must-not-open".into(), caption: None,
-        }).await.unwrap_err().to_string().contains("kicked"));
+        assert!(
+            !messenger
+                .confirm(
+                    thread,
+                    ApprovalRequest {
+                        title: "late approval".into(),
+                        details: "must not send".into(),
+                    }
+                )
+                .await
+        );
+        assert!(
+            messenger
+                .upload_file(
+                    thread,
+                    crate::omp::UploadRequest {
+                        path: "must-not-open".into(),
+                        caption: None,
+                    }
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kicked")
+        );
         assert_eq!(requests.join().unwrap().len(), 1);
     }
 
@@ -3259,14 +3902,28 @@ mod tests {
         let mut unauthorized = routing_message(false, "<@9> kick");
         unauthorized.author.id = serenity::all::UserId::new(8);
         handler.handle_message(&http, &unauthorized).await.unwrap();
-        handler.handle_message(&http, &routing_message(true, "<@9> kick")).await.unwrap();
-        assert!(!handler.store.is_thread_excluded(ThreadId::new(3)).await.unwrap());
+        handler
+            .handle_message(&http, &routing_message(true, "<@9> kick"))
+            .await
+            .unwrap();
+        assert!(
+            !handler
+                .store
+                .is_thread_excluded(ThreadId::new(3))
+                .await
+                .unwrap()
+        );
         assert_eq!(message_control(&routing_message(false, "kick"), 9), None);
-        assert_eq!(message_control(&routing_message(false, "<@8> kick"), 9), None);
-        assert_eq!(message_control(&routing_message(false, "<@!9> /kick"), 9), Some(Control::Kick));
+        assert_eq!(
+            message_control(&routing_message(false, "<@8> kick"), 9),
+            None
+        );
+        assert_eq!(
+            message_control(&routing_message(false, "<@!9> /kick"), 9),
+            Some(Control::Kick)
+        );
         assert!(requests.join().unwrap().is_empty());
     }
-
 
     async fn routing_handler(root: &std::path::Path, http: Arc<Http>) -> DiscordHandler {
         let config = Arc::new(routing_config(root));
@@ -3360,55 +4017,102 @@ mod tests {
     async fn model_default_control_clears_override_without_enqueuing_a_turn() {
         let root = tempfile::tempdir().unwrap();
         let response = serde_json::to_value(routing_message(true, "Model reset.")).unwrap();
-        let (http, requests) = discord_api(vec![
-            ("POST", "/channels/3/messages", 200, response),
-        ]);
+        let (http, requests) = discord_api(vec![("POST", "/channels/3/messages", 200, response)]);
         let handler = routing_handler(root.path(), http.clone()).await;
-        handler.store.create_session(&NewSession {
-            thread_id: ThreadId::new(3),
-            guild_id: GuildId::new(1),
-            parent_channel_id: ChannelId::new(2),
-            trigger_message_id: MessageId::new(99),
-            cwd: root.path().to_path_buf(),
-            created_by_user_id: UserId::new(7),
-        }).await.unwrap();
-        handler.store.set_session_model(ThreadId::new(3), Some("provider/model"))
-            .await.unwrap();
+        handler
+            .store
+            .create_session(&NewSession {
+                thread_id: ThreadId::new(3),
+                guild_id: GuildId::new(1),
+                parent_channel_id: ChannelId::new(2),
+                trigger_message_id: MessageId::new(99),
+                cwd: root.path().to_path_buf(),
+                created_by_user_id: UserId::new(7),
+            })
+            .await
+            .unwrap();
+        handler
+            .store
+            .set_session_model(ThreadId::new(3), Some("provider/model"))
+            .await
+            .unwrap();
         let message = routing_message(false, "model default");
         handler.handle_message(&http, &message).await.unwrap();
-        let session = handler.store.session(ThreadId::new(3)).await.unwrap().unwrap();
+        let session = handler
+            .store
+            .session(ThreadId::new(3))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(session.model, None);
-        assert!(handler.store.claim_next(ThreadId::new(3)).await.unwrap().is_none());
+        assert!(
+            handler
+                .store
+                .claim_next(ThreadId::new(3))
+                .await
+                .unwrap()
+                .is_none()
+        );
         let bodies = requests.join().unwrap();
-        assert!(!bodies[0]["content"].as_str().unwrap().contains("Model unchanged"));
-        assert_eq!(bodies[0]["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert!(
+            !bodies[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Model unchanged")
+        );
+        assert_eq!(
+            bodies[0]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
     async fn replies_to_closed_question_cards_do_not_interrupt_or_stop_work() {
         let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api_with_title_updates(vec![(
-            "POST", "/channels/3/messages", 200,
-            serde_json::to_value(routing_message(true, "Use the latest question controls.")).unwrap(),
-        )], true);
+        let (http, requests) = discord_api_with_title_updates(
+            vec![(
+                "POST",
+                "/channels/3/messages",
+                200,
+                serde_json::to_value(routing_message(true, "Use the latest question controls."))
+                    .unwrap(),
+            )],
+            true,
+        );
         let handler = routing_handler(root.path(), http.clone()).await;
-        handler.store.create_session(&NewSession {
-            thread_id: ThreadId::new(3),
-            guild_id: GuildId::new(1),
-            parent_channel_id: ChannelId::new(2),
-            trigger_message_id: MessageId::new(99),
-            cwd: root.path().to_path_buf(),
-            created_by_user_id: UserId::new(7),
-        }).await.unwrap();
+        handler
+            .store
+            .create_session(&NewSession {
+                thread_id: ThreadId::new(3),
+                guild_id: GuildId::new(1),
+                parent_channel_id: ChannelId::new(2),
+                trigger_message_id: MessageId::new(99),
+                cwd: root.path().to_path_buf(),
+                created_by_user_id: UserId::new(7),
+            })
+            .await
+            .unwrap();
         let mut card = routing_message(true, "**OMP question**\nCancelled.");
         card.author.id = serenity::all::UserId::new(9);
         card.id = serenity::all::MessageId::new(98);
         let mut reply = routing_message(false, "stop");
         reply.referenced_message = Some(Box::new(card));
         handler.handle_message(&http, &reply).await.unwrap();
-        let session = handler.store.session(ThreadId::new(3)).await.unwrap().unwrap();
+        let session = handler
+            .store
+            .session(ThreadId::new(3))
+            .await
+            .unwrap()
+            .unwrap();
         assert_ne!(session.status, SessionStatus::Stopped);
-        assert!(handler.store.claim_next(ThreadId::new(3)).await.unwrap().is_none());
+        assert!(
+            handler
+                .store
+                .claim_next(ThreadId::new(3))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(requests.join().unwrap().len(), 1);
     }
 
@@ -3417,15 +4121,18 @@ mod tests {
         for bot in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let channel = serde_json::to_value(routing_channel()).unwrap();
-            let (http, requests) = discord_api_with_title_updates(vec![
-                ("GET", "/channels/3", 200, channel),
-                (
-                    "PUT",
-                    "/channels/3/thread-members/@me",
-                    204,
-                    serde_json::Value::Null,
-                ),
-            ], true);
+            let (http, requests) = discord_api_with_title_updates(
+                vec![
+                    ("GET", "/channels/3", 200, channel),
+                    (
+                        "PUT",
+                        "/channels/3/thread-members/@me",
+                        204,
+                        serde_json::Value::Null,
+                    ),
+                ],
+                true,
+            );
             let handler = routing_handler(root.path(), http.clone()).await;
             let mut message = routing_message(bot, "<@9>");
             if bot {
@@ -3456,26 +4163,29 @@ mod tests {
     #[tokio::test]
     async fn handler_adoption_feeds_peer_message_once() {
         let root = tempfile::tempdir().unwrap();
-        let (http, requests) = discord_api_with_title_updates(vec![
-            (
-                "GET",
-                "/channels/3",
-                200,
-                serde_json::to_value(routing_channel()).unwrap(),
-            ),
-            (
-                "PUT",
-                "/channels/3/thread-members/@me",
-                204,
-                serde_json::Value::Null,
-            ),
-            (
-                "POST",
-                "/channels/3/messages",
-                200,
-                serde_json::to_value(routing_message(true, "accepted")).unwrap(),
-            ),
-        ], true);
+        let (http, requests) = discord_api_with_title_updates(
+            vec![
+                (
+                    "GET",
+                    "/channels/3",
+                    200,
+                    serde_json::to_value(routing_channel()).unwrap(),
+                ),
+                (
+                    "PUT",
+                    "/channels/3/thread-members/@me",
+                    204,
+                    serde_json::Value::Null,
+                ),
+                (
+                    "POST",
+                    "/channels/3/messages",
+                    200,
+                    serde_json::to_value(routing_message(true, "accepted")).unwrap(),
+                ),
+            ],
+            true,
+        );
         let handler = routing_handler(root.path(), http.clone()).await;
         let message = routing_message(true, "<@9> review this");
         handler.handle_message(&http, &message).await.unwrap();
@@ -3695,26 +4405,56 @@ mod tests {
 
     #[tokio::test]
     async fn thread_history_reads_unregistered_threads_and_preserves_parent_history() {
-        for kind in [ChannelType::PublicThread, ChannelType::PrivateThread, ChannelType::NewsThread] {
+        for kind in [
+            ChannelType::PublicThread,
+            ChannelType::PrivateThread,
+            ChannelType::NewsThread,
+        ] {
             let root = tempfile::tempdir().unwrap();
             let mut target = routing_channel();
             target.id = SerenityChannelId::new(4);
             target.kind = kind;
             let now = Timestamp::now().unix_timestamp();
             let (http, requests) = discord_api(vec![
-                ("GET", "/channels/4", 200, serde_json::to_value(target).unwrap()),
-                ("GET", "/channels/4/messages?&limit=100", 200,
-                    serde_json::json!([history_message(10, now, "target history")])),
-                ("GET", "/channels/2/messages?&limit=100", 200,
-                    serde_json::json!([history_message(11, now, "parent history")])),
+                (
+                    "GET",
+                    "/channels/4",
+                    200,
+                    serde_json::to_value(target).unwrap(),
+                ),
+                (
+                    "GET",
+                    "/channels/4/messages?&limit=100",
+                    200,
+                    serde_json::json!([history_message(10, now, "target history")]),
+                ),
+                (
+                    "GET",
+                    "/channels/2/messages?&limit=100",
+                    200,
+                    serde_json::json!([history_message(11, now, "parent history")]),
+                ),
             ]);
             let messenger = participants_messenger(root.path(), http).await;
-            assert!(messenger.store.session(ThreadId::new(4)).await.unwrap().is_none());
-            let output = messenger.thread_history(ThreadId::new(3), ThreadId::new(4), 1).await.unwrap();
+            assert!(
+                messenger
+                    .store
+                    .session(ThreadId::new(4))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let output = messenger
+                .thread_history(ThreadId::new(3), ThreadId::new(4), 1)
+                .await
+                .unwrap();
             let document: serde_json::Value = serde_json::from_str(&output).unwrap();
             assert_eq!(document["channel_id"], 4);
             assert_eq!(document["messages"][0]["content"], "target history");
-            let output = messenger.channel_history(ThreadId::new(3), 1).await.unwrap();
+            let output = messenger
+                .channel_history(ThreadId::new(3), 1)
+                .await
+                .unwrap();
             let document: serde_json::Value = serde_json::from_str(&output).unwrap();
             assert_eq!(document["channel_id"], 2);
             assert_eq!(document["messages"][0]["content"], "parent history");
@@ -3735,14 +4475,31 @@ mod tests {
                 "type" => target.kind = ChannelType::Text,
                 _ => target.id = SerenityChannelId::new(5),
             }
-            let (http, requests) = discord_api(vec![
-                ("GET", "/channels/4", 200, serde_json::to_value(target).unwrap()),
-            ]);
+            let (http, requests) = discord_api(vec![(
+                "GET",
+                "/channels/4",
+                200,
+                serde_json::to_value(target).unwrap(),
+            )]);
             let mut messenger = participants_messenger(root.path(), http).await;
             // Even another allowed parent is outside this session's scope.
-            Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds[0].allowed_channels.insert(ChannelId::new(9));
-            let error = messenger.thread_history(ThreadId::new(3), ThreadId::new(4), 1).await.unwrap_err();
-            assert!(error.to_string().contains("session's guild and authorized parent"), "{case}: {error}");
+            Arc::make_mut(&mut messenger.config)
+                .discord
+                .as_mut()
+                .expect("discord")
+                .guilds[0]
+                .allowed_channels
+                .insert(ChannelId::new(9));
+            let error = messenger
+                .thread_history(ThreadId::new(3), ThreadId::new(4), 1)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("session's guild and authorized parent"),
+                "{case}: {error}"
+            );
             assert_eq!(requests.join().unwrap().len(), 1);
         }
     }
@@ -3757,18 +4514,35 @@ mod tests {
             let mut days = 1;
             match case {
                 "unknown" => source = ThreadId::new(8),
-                "guild" => Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds.clear(),
-                "parent" => Arc::make_mut(&mut messenger.config).discord.as_mut().expect("discord").guilds[0].allowed_channels.clear(),
+                "guild" => Arc::make_mut(&mut messenger.config)
+                    .discord
+                    .as_mut()
+                    .expect("discord")
+                    .guilds
+                    .clear(),
+                "parent" => Arc::make_mut(&mut messenger.config)
+                    .discord
+                    .as_mut()
+                    .expect("discord")
+                    .guilds[0]
+                    .allowed_channels
+                    .clear(),
                 "zero_days" => days = 0,
                 _ => days = 31,
             }
-            let error = messenger.thread_history(source, ThreadId::new(4), days).await.unwrap_err();
-            assert!(error.to_string().contains(match case {
-                "unknown" => "unknown Discord thread",
-                "guild" => "unconfigured guild",
-                "parent" => "not authorized",
-                _ => "days must be between",
-            }), "{case}: {error}");
+            let error = messenger
+                .thread_history(source, ThreadId::new(4), days)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(match case {
+                    "unknown" => "unknown Discord thread",
+                    "guild" => "unconfigured guild",
+                    "parent" => "not authorized",
+                    _ => "days must be between",
+                }),
+                "{case}: {error}"
+            );
             assert!(requests.join().unwrap().is_empty());
         }
     }
@@ -3780,17 +4554,32 @@ mod tests {
             let mut target = routing_channel();
             target.id = SerenityChannelId::new(4);
             let now = Timestamp::now().unix_timestamp();
-            let page: Vec<_> = (2..=101).rev()
+            let page: Vec<_> = (2..=101)
+                .rev()
                 .map(|id| history_message(id, now, "recent"))
                 .collect();
             let (http, requests) = discord_api(vec![
-                ("GET", "/channels/4", 200, serde_json::to_value(target).unwrap()),
-                ("GET", "/channels/4/messages?&limit=100", 200, serde_json::json!(page)),
-                ("GET", "/channels/4/messages?&limit=100&before=2", 200,
+                (
+                    "GET",
+                    "/channels/4",
+                    200,
+                    serde_json::to_value(target).unwrap(),
+                ),
+                (
+                    "GET",
+                    "/channels/4/messages?&limit=100",
+                    200,
+                    serde_json::json!(page),
+                ),
+                (
+                    "GET",
+                    "/channels/4/messages?&limit=100&before=2",
+                    200,
                     serde_json::json!([
                         history_message(1, now, "oldest included"),
                         history_message(999, now - 172_800, "outside window"),
-                    ])),
+                    ]),
+                ),
             ]);
             let mut messenger = participants_messenger(root.path(), http).await;
             let runtime = &mut Arc::make_mut(&mut messenger.config).runtime;
@@ -3798,7 +4587,9 @@ mod tests {
             if limit == "bytes" {
                 runtime.discord_history_max_bytes = 1;
             }
-            let result = messenger.thread_history(ThreadId::new(3), ThreadId::new(4), 1).await;
+            let result = messenger
+                .thread_history(ThreadId::new(3), ThreadId::new(4), 1)
+                .await;
             if limit == "complete" {
                 let document: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
                 assert_eq!(document["channel_id"], 4);
@@ -3806,7 +4597,14 @@ mod tests {
                 assert_eq!(document["messages"][0]["content"], "oldest included");
             } else {
                 let error = result.unwrap_err().to_string();
-                assert!(error.contains(if limit == "messages" { "100-message limit" } else { "1-byte output limit" }), "{error}");
+                assert!(
+                    error.contains(if limit == "messages" {
+                        "100-message limit"
+                    } else {
+                        "1-byte output limit"
+                    }),
+                    "{error}"
+                );
             }
             assert_eq!(requests.join().unwrap().len(), 3);
         }

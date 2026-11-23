@@ -25,9 +25,14 @@ fn release_version(root: &Path) -> String {
     let day = fields.next().unwrap_or("");
     let release = fields.next().unwrap_or("");
     assert!(
-        year.len() == 4 && month.len() == 2 && day.len() == 2
-            && !release.is_empty() && !release.starts_with('0') && fields.next().is_none()
-            && [year, month, day, release].iter()
+        year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && !release.is_empty()
+            && !release.starts_with('0')
+            && fields.next().is_none()
+            && [year, month, day, release]
+                .iter()
                 .all(|field| field.bytes().all(|byte| byte.is_ascii_digit())),
         "VERSION must use YYYY-MM-DD-# with a positive release counter"
     );
@@ -35,13 +40,18 @@ fn release_version(root: &Path) -> String {
     let month: u32 = month.parse().unwrap();
     let day: u32 = day.parse().unwrap();
     let days = match month {
-        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
         2 => 28,
         4 | 6 | 9 | 11 => 30,
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         _ => 0,
     };
-    assert!(year > 0 && day > 0 && day <= days, "VERSION must contain a valid calendar date");
+    assert!(
+        year > 0 && day > 0 && day <= days,
+        "VERSION must contain a valid calendar date"
+    );
     version.to_owned()
 }
 
@@ -71,17 +81,28 @@ fn main() {
                 }
             }
             let mut revision = git(root, &["rev-parse", "HEAD"]);
-            let dirty = git(root, &[
-                "status", "--porcelain", "--untracked-files=normal", "--",
-                "build.rs", "Cargo.toml", "Cargo.lock", "VERSION", "src",
-            ]);
+            let dirty = git(
+                root,
+                &[
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                    "--",
+                    "build.rs",
+                    "Cargo.toml",
+                    "Cargo.lock",
+                    "VERSION",
+                    "src",
+                ],
+            );
             if !dirty.is_empty() {
                 revision.push_str("-dirty");
             }
             revision
         }
     };
-    let (hash, suffix) = revision.strip_suffix("-dirty")
+    let (hash, suffix) = revision
+        .strip_suffix("-dirty")
         .map_or((revision.as_str(), ""), |hash| (hash, "-dirty"));
     assert!(
         (7..=64).contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),

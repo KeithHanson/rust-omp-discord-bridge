@@ -190,12 +190,7 @@ mod tests {
             unreachable!()
         }
 
-        async fn thread_history(
-            &self,
-            _: ThreadId,
-            _: ThreadId,
-            _: u16,
-        ) -> Result<String> {
+        async fn thread_history(&self, _: ThreadId, _: ThreadId, _: u16) -> Result<String> {
             unreachable!("activity must not request thread history")
         }
 
@@ -203,11 +198,7 @@ mod tests {
             unreachable!()
         }
 
-        async fn upload_file(
-            &self,
-            _: ThreadId,
-            _: crate::omp::UploadRequest,
-        ) -> Result<String> {
+        async fn upload_file(&self, _: ThreadId, _: crate::omp::UploadRequest) -> Result<String> {
             unreachable!("activity must not upload files")
         }
 
@@ -219,10 +210,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn coalesces_updates_and_carries_replacement_ids_through_completion() {
         let (events, mut received) = mpsc::unbounded_channel();
-        let reporter = ActivityReporter::start(
-            Arc::new(Messenger::new(events)),
-            ThreadId::new(1),
-        );
+        let reporter = ActivityReporter::start(Arc::new(Messenger::new(events)), ThreadId::new(1));
         let (id, _, finished) = received.recv().await.unwrap();
         assert_eq!(id, None);
         assert!(!finished);
@@ -286,5 +274,4 @@ mod tests {
         assert_eq!(started.elapsed(), REQUEST_TIMEOUT);
         assert!(received.recv().await.is_none());
     }
-
 }
