@@ -1,6 +1,7 @@
 mod activity;
 pub mod clients;
 pub mod config;
+pub mod control;
 pub mod domain;
 pub mod live_config;
 pub mod omp;

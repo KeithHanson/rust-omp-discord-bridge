@@ -65,6 +65,9 @@ fn ensure_restart_fields_unchanged(current: &AppConfig, candidate: &AppConfig) -
     {
         changed.push("runtime fields other than max_response_bytes, discord_history_max_days, and turn_timeout_seconds");
     }
+    if current.control != candidate.control {
+        changed.push("control");
+    }
     if current.threadwatch.is_some() != candidate.threadwatch.is_some() {
         changed.push("threadwatch");
     } else if let (Some(old), Some(new)) = (&current.threadwatch, &candidate.threadwatch)

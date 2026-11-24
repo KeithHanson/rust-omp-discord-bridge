@@ -47,6 +47,15 @@ discord_history_max_bytes = 131072
 discord_history_timeout_seconds = 30
 turn_timeout_seconds = 3600
 
+# Optional local control socket for external triggers (`omp-client-bridge trigger
+# --channel <id> --prompt <text>`). The socket lets automations start a new OMP
+# session in a configured channel (headline + thread) and wait for the turn to
+# finish. The socket lives in a mode-0700 directory with mode-0600 file permissions;
+# it is enabled by default at ~/.local/state/omp-discord-bridge/control.sock.
+# [control]
+# socket = "~/.local/state/omp-discord-bridge/control.sock"
+# socket = ""   # disable the control socket
+
 # Optional integrated Threadwatch reporting. Preserve data_dir when migrating from
 # the former standalone collector so pending batches/checkpoints remain intact.
 # [threadwatch]

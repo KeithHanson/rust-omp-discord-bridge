@@ -1,15 +1,17 @@
 use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use omp_client_bridge::{
     clients,
     config::AppConfig,
+    control,
     live_config::{LiveConfig, spawn_watcher},
     omp::OmpTransport,
     store::Store,
     threadwatch,
 };
+
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -26,7 +28,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum Command {
     /// Start all configured client adapters.
     Run,
@@ -35,6 +37,22 @@ enum Command {
     /// Validate a replacement without opening or migrating the live database.
     #[command(hide = true)]
     CheckUpdate,
+    /// Start a new OMP session in a Discord channel (headline + thread) and wait for the turn to finish.
+    Trigger {
+        /// Discord channel snowflake to start the session in.
+        #[arg(long)]
+        channel: u64,
+        /// Prompt to send (stdin when omitted).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Read the prompt from a file instead of stdin. Conflicts with --prompt.
+        #[arg(long, conflicts_with = "prompt")]
+        prompt_file: Option<PathBuf>,
+        /// How many seconds to wait for the turn before giving up (still returns
+        /// the thread id; the turn keeps running in the daemon).
+        #[arg(long, default_value_t = 7200)]
+        timeout: u64,
+    },
 }
 
 #[tokio::main]
@@ -107,9 +125,79 @@ async fn execute(cli: Cli) -> Result<()> {
         println!("replacement configuration, token, and OMP RPC startup are valid");
         return Ok(());
     }
+    if matches!(cli.command, Some(Command::Trigger { .. })) {
+        let cmd = match cli.command.unwrap() {
+            Command::Trigger {
+                channel,
+                prompt,
+                prompt_file,
+                timeout,
+            } => (channel, prompt, prompt_file, timeout),
+            _ => unreachable!(),
+        };
+        let (channel, prompt, prompt_file, timeout) = cmd;
+        let prompt = match (prompt, prompt_file) {
+            (Some(_), Some(_)) => {
+                bail!("--prompt and --prompt-file are mutually exclusive");
+            }
+            (Some(p), None) => p,
+            (None, Some(path)) => std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read prompt file {}", path.display()))?,
+            (None, None) => {
+                use std::io::Read as _;
+                let mut input = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut input)
+                    .context("failed to read prompt from stdin")?;
+                input
+            }
+        };
+        let request = control::TriggerRequest {
+            channel_id: channel,
+            prompt: prompt.trim().to_owned(),
+            timeout_seconds: timeout,
+        };
+        let validated = request.validate().context("invalid trigger request")?;
+        let _ = validated;
+        let mut stream = control::connect(
+            &control::socket_path(&config)
+                .context("control socket is disabled in configuration; triggers unavailable")?,
+        )
+        .await
+        .context("failed to connect to the OMP bridge control socket; is the bridge running?")?;
+        control::write_frame(&mut stream, &request).await?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(request.timeout_seconds + 15),
+            control::read_frame::<control::TriggerResponse>(&mut stream),
+        )
+        .await
+        .context("timed out waiting for the trigger response")?
+        .context("failed to read trigger response")?;
+        if response.ok {
+            if let Some(text) = &response.response {
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            }
+            if let Some(thread_id) = response.thread_id {
+                eprintln!("[triggered in thread {thread_id}]");
+            }
+            return Ok(());
+        }
+        if let Some(error) = &response.error {
+            eprintln!("trigger failed: {error}");
+        }
+        if let Some(thread_id) = response.thread_id {
+            eprintln!("[thread {thread_id}]");
+        }
+        std::process::exit(1);
+    }
+
     let store = Store::open(&config.runtime.database_path).await?;
 
     match cli.command.unwrap_or(Command::Run) {
+        Command::Trigger { .. } => unreachable!("trigger handled above"),
         Command::Run => {
             let recovered = store.recover_running().await?;
             if recovered > 0 {

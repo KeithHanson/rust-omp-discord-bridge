@@ -108,6 +108,23 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-24-3
+
+Adds a local control socket so local automations can start a new OMP session in
+any allowlisted Discord channel — headline, thread, session, and turn — without
+a Discord mention, with a synchronous wait for the turn to finish:
+
+```bash
+omp-client-bridge trigger --channel <id> [--prompt <text> | --prompt-file <path> | stdin] [--timeout <seconds>]
+```
+
+The socket is enabled by default at
+`~/.local/state/omp-discord-bridge/control.sock`; `[control] socket = ""` disables it,
+or give an absolute path. It lives in a mode-0700 directory with mode-0600
+permissions, validates the channel against the same guild allowlist as gateway
+messages, and is bounded (8 concurrent triggers, 16 KiB frames, 5 s request
+deadline). `control` changes require a restart.
+
 ### Release 2026-11-23-2
 
 Makes Discord config optional. A bridge with neither `[discord]` nor `[matrix]`
@@ -448,6 +465,35 @@ For migration from a standalone Threadwatch collector:
 5. Start or roll over the bridge using the normal idle-safe procedure. Verify a fresh ready heartbeat and zero queued batches before deleting the retired collector unit/configuration.
 
 Rollback reverses configuration, not data: stop the bridge reporter, restore the standalone collector against the same authoritative state directory, and never restore a stale queue snapshot. The bridge's existing Discord token supplies optional read-only title/avatar lookup; no separate collector Discord credential or bridge JSON file is used.
+
+### Local control socket for external triggers
+
+The optional `[control]` section enables a private Unix socket that lets a local
+automation start a new OMP session in a configured channel — headline, thread,
+session, turn, and a synchronous wait for the turn to finish — without a Discord
+mention. The socket is enabled by default at
+`~/.local/state/omp-discord-bridge/control.sock`; set `socket = ""` to disable it
+or give an absolute path. The parent directory must exist and be mode `0700`, and
+the socket is removed from the filesystem on clean shutdown.
+
+```bash
+# start a session (prompt from stdin) and wait up to 2h for the turn
+omp-client-bridge --config ~/.config/omp-client-bridge/config.toml trigger \
+  --channel 123456789012345678 <<< "Summarize the current state of the project"
+
+# or from a file / a flag, with a shorter wait
+omp-client-bridge trigger --channel 123456789012345678 --prompt-file /tmp/prompt.md --timeout 3600
+```
+
+`--timeout` bounds the synchronous wait (default 7200s, max 7200s); a timed-out
+turn keeps running and the command exits non-zero while printing the thread id.
+The CLI prints the turn's response to stdout and the thread id to stderr, exiting
+non-zero on failure. Concurrent triggers are bounded and the trigger flow uses the
+same guild allowlist as gateway messages: the `--channel` must be in an allowlisted
+`[[discord.guilds]]` policy. Triggers never bypass admission, consent, or identity
+checks — they are just another admitted client. Disabled, an unreachable or
+stale socket fails the CLI immediately with a clear message; the daemon stays up
+with the socket unavailable if the binding fails at startup.
 
 ## Validate and run
 The bridge launches the configured OMP executable and uses its normal authentication sources, including `~/.omp/agent/agent.db`, OMP `.env` files, and environment variables inherited from the bridge process. Leave `omp.model` unset to use OMP's configured default. If set, use an exact provider/model ID shown by `omp models`; `openai-codex` subscription authentication is separate from the API-key-based `openai` provider.

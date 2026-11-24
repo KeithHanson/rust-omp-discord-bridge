@@ -35,8 +35,12 @@ use tokio::{
 
 use crate::{
     config::{AppConfig, GuildPolicy},
+    control::{
+        self, ControlSocket, TriggerRequest, TriggerResponse, headline_preview, wait_for_turn,
+    },
     domain::{
-        ChannelId, ClientKind, GuildId, MessageId, NewSession, SessionStatus, ThreadId, UserId,
+        ChannelId, ClientKind, GuildId, MessageId, NewSession, SessionStatus, ThreadId, TurnStatus,
+        UserId,
     },
     live_config::LiveConfig,
     omp::{ApprovalRequest, OmpTransport},
@@ -138,6 +142,14 @@ pub async fn run(
     let control = receive_control_commands(command_receiver, store.clone(), Arc::clone(&runner));
     tokio::pin!(control);
 
+    let mut control_task = Box::pin(handle_control_listener(
+        Arc::clone(&config),
+        Arc::clone(&http),
+        store.clone(),
+        Arc::clone(&runner),
+        Arc::clone(&admission),
+    ));
+
     let shard_manager = Arc::clone(&client.shard_manager);
     tokio::select! {
         _ = gateway_presence(presence, presence_targets, send_gateway_presence) => {
@@ -146,12 +158,306 @@ pub async fn run(
         result = client.start() => result.context("Discord client stopped"),
         result = auto_update(config_path, &runner, &admission) => result,
         result = &mut control => result,
+        result = &mut control_task => result,
         signal = super::shutdown_signal() => {
             signal?;
             shard_manager.shutdown_all().await;
             Ok(())
         }
     }
+}
+
+/// Serve the private control socket for external triggers. The socket is the
+/// only bridge entry point for prompts that are not gateway messages: it mirrors the
+/// mention flow (headline, thread, session, turn, synchronous wait) so that an
+/// automation can start a session it could not otherwise drive.
+async fn handle_control_listener(
+    config: Arc<AppConfig>,
+    http: Arc<Http>,
+    store: Store,
+    runner: Arc<ThreadQueueRunner>,
+    admission: Arc<tokio::sync::RwLock<()>>,
+) -> Result<()> {
+    let Some(socket_path) = control::socket_path(&config) else {
+        tracing::warn!("control socket is disabled in configuration; triggers unavailable");
+        std::future::pending::<()>().await;
+        unreachable!();
+    };
+    let socket = match ControlSocket::bind(socket_path) {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::error!(error = %error, "control socket unavailable; triggers disabled");
+            std::future::pending::<()>().await;
+            unreachable!();
+        }
+    };
+    if let Err(error) = serve_control(socket, http, store, runner, config, admission).await {
+        tracing::error!(error = %error, "control socket listener failed; triggers disabled");
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
+    unreachable!("control socket listener returned without a failure path");
+}
+
+async fn serve_control(
+    socket: ControlSocket,
+    http: Arc<Http>,
+    store: Store,
+    runner: Arc<ThreadQueueRunner>,
+    config: Arc<AppConfig>,
+    admission: Arc<tokio::sync::RwLock<()>>,
+) -> Result<()> {
+    let handler: control::Handler = std::sync::Arc::new(move |stream| {
+        let http = Arc::clone(&http);
+        let store = store.clone();
+        let runner = Arc::clone(&runner);
+        let config = Arc::clone(&config);
+        let admission = Arc::clone(&admission);
+        Box::pin(async move {
+            handle_control_connection(stream, http, store, runner, config, admission).await;
+        })
+    });
+    socket.serve(handler).await
+}
+
+async fn handle_control_connection(
+    mut stream: tokio::net::UnixStream,
+    http: Arc<Http>,
+    store: Store,
+    runner: Arc<ThreadQueueRunner>,
+    config: Arc<AppConfig>,
+    admission: Arc<tokio::sync::RwLock<()>>,
+) {
+    let request = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        control::read_frame::<TriggerRequest>(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "dropping malformed control request");
+            let _ = control::write_frame(
+                &mut stream,
+                &TriggerResponse::failure("invalid trigger request"),
+            )
+            .await;
+            return;
+        }
+        Err(_) => return,
+    };
+    let prompt = match request.validate() {
+        Ok(prompt) => prompt.to_owned(),
+        Err(error) => {
+            let _ = control::write_frame(
+                &mut stream,
+                &TriggerResponse::failure(format!("invalid request: {error:#}")),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let admission_gate = admission.read().await;
+    let prepared =
+        trigger_prepare(http.as_ref(), &store, &runner, &config, &request, &prompt).await;
+    drop(admission_gate);
+
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ =
+                control::write_frame(&mut stream, &TriggerResponse::failure(format!("{error:#}")))
+                    .await;
+            return;
+        }
+    };
+
+    let outcome = match wait_for_turn(
+        &store,
+        prepared.thread_id,
+        prepared.turn_id,
+        Duration::from_secs(request.timeout_seconds),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ =
+                control::write_frame(&mut stream, &TriggerResponse::failure(format!("{error:#}")))
+                    .await;
+            return;
+        }
+    };
+
+    let response = match outcome {
+        None => TriggerResponse {
+            ok: false,
+            thread_id: Some(prepared.thread_id.get()),
+            guild_id: Some(prepared.guild_id.get()),
+            parent_channel_id: Some(prepared.parent_channel_id.get()),
+            message_id: Some(prepared.headline_id.get()),
+            turn_id: Some(prepared.turn_id),
+            response: None,
+            error: Some(format!(
+                "timed out after {}s waiting for turn {}; it is still running",
+                request.timeout_seconds, prepared.turn_id
+            )),
+        },
+        Some(outcome) => {
+            let error = match outcome.status {
+                TurnStatus::Done => None,
+                TurnStatus::Failed | TurnStatus::Aborted | TurnStatus::Uncertain => {
+                    Some(outcome.error.unwrap_or_else(|| {
+                        format!(
+                            "turn {} failed (status {})",
+                            prepared.turn_id,
+                            outcome.status.as_str()
+                        )
+                    }))
+                }
+                TurnStatus::Queued | TurnStatus::Running => Some(format!(
+                    "turn {} outcome in an unexpected status ({})",
+                    prepared.turn_id,
+                    outcome.status.as_str()
+                )),
+            };
+            TriggerResponse {
+                ok: error.is_none(),
+                thread_id: Some(prepared.thread_id.get()),
+                guild_id: Some(prepared.guild_id.get()),
+                parent_channel_id: Some(prepared.parent_channel_id.get()),
+                message_id: Some(prepared.headline_id.get()),
+                turn_id: Some(prepared.turn_id),
+                response: if error.is_none() {
+                    outcome.response
+                } else {
+                    None
+                },
+                error,
+            }
+        }
+    };
+    let _ = control::write_frame(&mut stream, &response).await;
+}
+
+/// The slice of the trigger flow that admits a session: headline, thread, session,
+/// queued turn, and poke. Holds the admission gate for the whole admission section
+/// and releases before the synchronous wait — the turn proceeds independently of the
+/// gate, and holding it across a wait would wedge config reloads behind it.
+struct PreparedTrigger {
+    thread_id: ThreadId,
+    guild_id: GuildId,
+    parent_channel_id: ChannelId,
+    headline_id: MessageId,
+    turn_id: i64,
+}
+
+async fn trigger_prepare(
+    http: &Http,
+    store: &Store,
+    runner: &Arc<ThreadQueueRunner>,
+    config: &AppConfig,
+    request: &TriggerRequest,
+    prompt: &str,
+) -> Result<PreparedTrigger> {
+    let guild_channel = http
+        .get_channel(SerenityChannelId::new(request.channel_id))
+        .await
+        .context("cannot read trigger channel")?;
+    let Channel::Guild(channel) = guild_channel else {
+        bail!(
+            "trigger channel {} is not a guild channel",
+            request.channel_id
+        );
+    };
+    let guild_id = GuildId::new(channel.guild_id.get());
+    let policy = config
+        .guild_policy(guild_id)
+        .context("no guild policy for trigger channel")?;
+    let channel_id = ChannelId::new(request.channel_id);
+    if !policy.allowed_channels.contains(&channel_id) {
+        bail!(
+            "channel {} is not in the configured allowlist",
+            request.channel_id
+        );
+    }
+
+    let headline_content = format!("🤖 **OMP trigger** — {}", headline_preview(prompt));
+    let headline = SerenityChannelId::new(request.channel_id)
+        .send_message(
+            http,
+            CreateMessage::new()
+                .content(headline_content)
+                .allowed_mentions(CreateAllowedMentions::new()),
+        )
+        .await
+        .context("failed to post OMP trigger headline")?;
+    let thread_name = thread_name(prompt);
+    let builder = CreateThread::new(format!("🛠️ {thread_name}"))
+        .auto_archive_duration(AutoArchiveDuration::from(
+            config
+                .discord
+                .as_ref()
+                .expect("Discord configuration is required")
+                .thread_auto_archive_minutes,
+        ))
+        .audit_log_reason("OMP Discord bridge trigger");
+    let thread = builder
+        .execute(
+            http,
+            (
+                SerenityChannelId::new(request.channel_id),
+                Some(headline.id),
+            ),
+        )
+        .await
+        .context("failed to create Discord session thread")?;
+    let thread_id = ThreadId::new(thread.id.get());
+    let headline_id = MessageId::new(headline.id.get());
+    let input = NewSession {
+        thread_id,
+        guild_id,
+        parent_channel_id: channel_id,
+        trigger_message_id: headline_id,
+        cwd: policy.cwd.clone(),
+        created_by_user_id: UserId::new(headline.id.get()),
+    };
+    match store.create_session(&input).await? {
+        CreateSessionResult::Created(_) => {}
+        CreateSessionResult::Existing(existing) => {
+            if existing.thread_id != input.thread_id {
+                let _ = thread.id.delete(http).await;
+            }
+            bail!("OMP session already exists for this trigger");
+        }
+    }
+
+    let turn_id = match store
+        .enqueue_turn(
+            thread_id,
+            headline_id,
+            input.created_by_user_id,
+            prompt,
+            TurnSource::Human,
+        )
+        .await?
+    {
+        EnqueueResult::Enqueued(turn_id) => turn_id,
+        EnqueueResult::Duplicate => {
+            let _ = thread.id.delete(http).await;
+            bail!("trigger was already admitted");
+        }
+    };
+    runner.poke(thread_id).await;
+
+    Ok(PreparedTrigger {
+        thread_id,
+        guild_id,
+        parent_channel_id: channel_id,
+        headline_id,
+        turn_id,
+    })
 }
 
 async fn receive_control_commands(
@@ -2978,6 +3284,7 @@ mod tests {
                 turn_timeout_seconds: 60,
             },
             threadwatch: None,
+            control: None,
         }
     }
 

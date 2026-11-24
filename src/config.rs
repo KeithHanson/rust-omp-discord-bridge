@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub omp: OmpConfig,
     pub runtime: RuntimeConfig,
     pub threadwatch: Option<ThreadwatchConfig>,
+    pub control: Option<ControlConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,13 @@ pub struct ThreadwatchConfig {
     pub heartbeat_interval_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlConfig {
+    /// The local Unix control socket used by triggers (`trigger --channel ...`).
+    /// `None` disables the control socket.
+    pub socket: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub database_path: PathBuf,
@@ -100,6 +108,7 @@ struct RawConfig {
     #[serde(default)]
     runtime: RawRuntimeConfig,
     threadwatch: Option<RawThreadwatchConfig>,
+    control: Option<RawControlConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +174,13 @@ struct RawThreadwatchConfig {
     collect_interval_ms: u64,
     #[serde(default = "default_threadwatch_heartbeat_interval_ms")]
     heartbeat_interval_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawControlConfig {
+    /// Empty disables the control socket; omitted uses the default path.
+    socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -498,6 +514,21 @@ impl AppConfig {
             })
             .transpose()?;
 
+        let control = match &raw.control {
+            None => Some(ControlConfig {
+                socket: Some(expand_home(&crate::control::default_socket_path()?)?),
+            }),
+            Some(raw) => match &raw.socket {
+                None => Some(ControlConfig {
+                    socket: Some(expand_home(&crate::control::default_socket_path()?)?),
+                }),
+                Some(path) if path.to_string_lossy().trim().is_empty() => None,
+                Some(path) => Some(ControlConfig {
+                    socket: Some(expand_home(path)?),
+                }),
+            },
+        };
+
         Ok(Self {
             discord,
             matrix,
@@ -523,6 +554,7 @@ impl AppConfig {
                 turn_timeout_seconds: raw.runtime.turn_timeout_seconds,
             },
             threadwatch,
+            control,
         })
     }
 
@@ -701,6 +733,7 @@ mod tests {
             },
             runtime: RawRuntimeConfig::default(),
             threadwatch: None,
+            control: None,
         };
 
         let error = AppConfig::from_raw(raw).expect_err("empty channel allowlist must fail");
@@ -737,6 +770,7 @@ mod tests {
             },
             runtime: RawRuntimeConfig::default(),
             threadwatch: None,
+            control: None,
         };
 
         let error = AppConfig::from_raw(raw).expect_err("cwd escape must fail");
@@ -768,6 +802,7 @@ mod tests {
             },
             runtime: RawRuntimeConfig::default(),
             threadwatch: None,
+            control: None,
         })
         .expect("valid config");
         let policy = config.guild_policy(GuildId::new(1)).expect("guild policy");
@@ -896,6 +931,7 @@ mod tests {
                 thinking_level: None,
             },
             runtime,
+            control: None,
             threadwatch: None,
         }
     }
