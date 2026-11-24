@@ -30,7 +30,7 @@ use serenity::{
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Semaphore, mpsc, oneshot, watch},
-    time::Instant,
+    time::{Instant, sleep},
 };
 
 use crate::{
@@ -183,20 +183,32 @@ async fn handle_control_listener(
         std::future::pending::<()>().await;
         unreachable!();
     };
-    let socket = match ControlSocket::bind(socket_path) {
-        Ok(socket) => socket,
-        Err(error) => {
-            tracing::error!(error = %error, "control socket unavailable; triggers disabled");
-            std::future::pending::<()>().await;
-            unreachable!();
+    // A transient bind failure (e.g. a directory that was not mode 0700 at startup)
+    // must not permanently disable triggers: retry with a short backoff so the
+    // listener heals itself once the directory is corrected.
+    loop {
+        let socket = match ControlSocket::bind(socket_path.clone()) {
+            Ok(socket) => socket,
+            Err(error) => {
+                tracing::error!(error = %error, "control socket unavailable; retrying in 5s");
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        if let Err(error) = serve_control(
+            socket,
+            Arc::clone(&http),
+            store.clone(),
+            Arc::clone(&runner),
+            Arc::clone(&config),
+            Arc::clone(&admission),
+        )
+        .await
+        {
+            tracing::error!(error = %error, "control socket listener failed; retrying in 5s");
+            sleep(Duration::from_secs(5)).await;
         }
-    };
-    if let Err(error) = serve_control(socket, http, store, runner, config, admission).await {
-        tracing::error!(error = %error, "control socket listener failed; triggers disabled");
-        std::future::pending::<()>().await;
-        unreachable!();
     }
-    unreachable!("control socket listener returned without a failure path");
 }
 
 async fn serve_control(
