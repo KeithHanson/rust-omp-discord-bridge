@@ -42,6 +42,11 @@ const UI_TIMEOUT: Duration = Duration::from_secs(360);
 // One live prompt and one replacement. Further inputs remain in the durable queue.
 const MAX_PENDING_PROMPTS: usize = 2;
 const MAX_UI_REQUESTS: usize = 32;
+// Synthetic internal prompt id for the missing-final-message nudge: it is
+// never a durable queue row, so it can never collide with turn ids.
+const NUDGE_PROMPT_ID: &str = "nudge-1";
+// Tells the LLM when its turn completes without a final assistant message.
+const MISSING_FINAL_MESSAGE_NUDGE: &str = "You just stopped without sending a final assistant message. Send the final assistant response now.";
 
 #[async_trait]
 pub trait TurnControl: Send + Sync {
@@ -457,6 +462,11 @@ impl OmpTransport {
         let mut drain_queue = true;
         let mut abort_deadline = None;
         let mut deadline = Instant::now() + turn_timeout;
+        // A durable turn completed without a terminal assistant message and no
+        // replacement was dispatched: one nudge prompt must be delivered before
+        // this run may settle. The guard keeps it to a single nudge per run.
+        let mut nudge_needed = false;
+        let mut nudge_sent = false;
         let mut abort_acknowledged = false;
 
         if cancellation.is_cancelled() {
@@ -499,6 +509,10 @@ impl OmpTransport {
                             settled = false;
                             state_dirty = true;
                             deadline = Instant::now() + turn_timeout;
+                            // The run is continuing: the nudge is re-armed only
+                            // when a later durable turn completes.
+                            nudge_needed = false;
+                            nudge_sent = false;
                         }
                         continue;
                     }
@@ -510,6 +524,20 @@ impl OmpTransport {
                 && state_request.is_none()
                 && (abort_deadline.is_none() || abort_acknowledged)
             {
+                if !cancellation.is_cancelled() && nudge_needed && !nudge_sent {
+                    nudge_sent = true;
+                    nudge_needed = false;
+                    tracing::info!(
+                        "OMP turn completed without a terminal message; sending the missing-final-message nudge"
+                    );
+                    // Own the next agent_start: no background run may outrank it.
+                    background_possible = false;
+                    unowned_run = false;
+                    dispatch_nudge_prompt(input, &mut pending, turn_timeout).await?;
+                    settled = false;
+                    deadline = Instant::now() + turn_timeout;
+                    continue;
+                }
                 let (session_path, session_id) = state.ok_or_else(|| {
                     OmpTurnError::Uncertain("OMP omitted persistent session state".to_owned())
                 })?;
@@ -756,18 +784,18 @@ impl OmpTransport {
                                 if kind == Some("prompt_result") && status == TurnStatus::Done {
                                     prompt.publish(ui)?;
                                 }
-                                bounded(IO_TIMEOUT, "recording prompt result", turns.control.record_result(
-                                    prompt.turn_id, status, &prompt.output, error,
-                                )).await?;
-                                if background_possible && pending.iter().any(|next| {
-                                    active == Some(next.turn_id) && !next.acknowledged
-                                }) {
-                                    return Err(OmpTurnError::Uncertain(
-                                        "OMP started an uncorrelated run before acknowledging the replacement".to_owned(),
-                                    ));
-                                }
-                                if last.as_ref().is_none_or(|(id, _, _)| prompt.turn_id > *id) {
-                                    last = Some((prompt.turn_id, prompt.output, status));
+                                if !prompt.synthetic {
+                                    bounded(IO_TIMEOUT, "recording prompt result", turns.control.record_result(
+                                        prompt.turn_id, status, &prompt.output, error,
+                                    )).await?;
+                                    if last.as_ref().is_none_or(|(id, _, _)| prompt.turn_id > *id) {
+                                        last = Some((prompt.turn_id, prompt.output, status));
+                                    }
+                                    if status == TurnStatus::Done && !prompt.terminal_message {
+                                        // Armed for the return guard: a run may not
+                                        // settle until one nudge has been delivered.
+                                        nudge_needed = true;
+                                    }
                                 }
                                 drain_queue = true;
                                 state_dirty = true;
@@ -1009,6 +1037,13 @@ struct PendingPrompt {
     deadline: Instant,
     ack_deadline: Option<Instant>,
     interrupted_deadline: Option<Instant>,
+    // True when the prompt was synthesized by the bridge (missing-final-message
+    // nudge) rather than claimed from the durable queue: such prompts are never
+    // recorded through TurnControl and never feed the run's last-result bookkeeping.
+    synthetic: bool,
+    // True once an assistant message_end with stopReason == "stop" and
+    // nonempty text was captured for this prompt.
+    terminal_message: bool,
 }
 
 fn frame_has_text(frame: &Value) -> bool {
@@ -1072,7 +1107,8 @@ impl PendingPrompt {
                 // Reconcile the final text against this message's deltas, not
                 // against the whole transcript. Missing deltas are filled from
                 // the final content without duplicating the streamed prefix.
-                let mut offset = self.message_start;
+                let message_start = self.message_start;
+                let mut offset = message_start;
                 if let Some(blocks) = frame.pointer("/message/content").and_then(Value::as_array) {
                     for block in blocks {
                         if block.get("type").and_then(Value::as_str) == Some("text")
@@ -1092,12 +1128,14 @@ impl PendingPrompt {
                     }
                 }
                 self.message_start = self.output.len();
+                let stop_reason = frame.pointer("/message/stopReason").and_then(Value::as_str);
+                // A terminal message is a completed assistant answer: stopReason
+                // "stop" with visible text. Tool-use commentary never qualifies.
+                self.terminal_message = stop_reason == Some("stop")
+                    && self.output[message_start..].trim().chars().count() > 0;
                 // OMP also closes incomplete messages on provider failure or
                 // interruption. Preserve them in SQLite, never publish them.
-                if matches!(
-                    frame.pointer("/message/stopReason").and_then(Value::as_str),
-                    Some("aborted" | "error")
-                ) {
+                if matches!(stop_reason, Some("aborted" | "error")) {
                     self.delivery_cursor = self.output.len();
                 } else {
                     return Ok(self.take_message());
@@ -1164,6 +1202,41 @@ async fn dispatch_prompt<W: AsyncWrite + Unpin>(
         deadline: Instant::now() + turn_timeout,
         ack_deadline: interrupt.then_some(interruption_deadline),
         interrupted_deadline: None,
+        synthetic: false,
+        terminal_message: false,
+    });
+    Ok(())
+}
+
+async fn dispatch_nudge_prompt<W: AsyncWrite + Unpin>(
+    input: &mut BufWriter<W>,
+    pending: &mut Vec<PendingPrompt>,
+    turn_timeout: Duration,
+) -> Result<(), OmpTurnError> {
+    send_frame(
+        input,
+        &json!({
+            "id": NUDGE_PROMPT_ID,
+            "type": "prompt",
+            "message": MISSING_FINAL_MESSAGE_NUDGE,
+        }),
+    )
+    .await?;
+    pending.push(PendingPrompt {
+        id: NUDGE_PROMPT_ID.to_owned(),
+        // Synthetic prompt ids never match positive durable turn ids.
+        turn_id: -1,
+        acknowledged: false,
+        interrupt: false,
+        yielded: false,
+        message_start: 0,
+        delivery_cursor: 0,
+        output: String::new(),
+        deadline: Instant::now() + turn_timeout,
+        ack_deadline: None,
+        interrupted_deadline: None,
+        synthetic: true,
+        terminal_message: false,
     });
     Ok(())
 }
@@ -2015,6 +2088,8 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(60),
             ack_deadline: None,
             interrupted_deadline: None,
+            synthetic: false,
+            terminal_message: false,
         }
     }
 
@@ -2137,6 +2212,20 @@ mod tests {
             .await;
         }
 
+        async fn ack_nudge(&mut self) {
+            self.emit(json!({"type": "response", "id": NUDGE_PROMPT_ID, "success": true}))
+                .await;
+        }
+
+        async fn result_nudge(&mut self, status: &str) {
+            self.emit(json!({
+                "type": "prompt_result", "id": NUDGE_PROMPT_ID,
+                "agentInvoked": true, "status": status, "sessionSettled": self.settled,
+                "error": {"message": "provider unavailable"},
+            }))
+            .await;
+        }
+
         async fn delta(&mut self, text: &str) {
             self.emit(json!({
                 "type": "message_update",
@@ -2163,6 +2252,14 @@ mod tests {
                 .expect("driver shutdown deadline")
             {
                 let command: Value = serde_json::from_str(&frame.unwrap()).unwrap();
+                if command["id"].as_str() == Some(NUDGE_PROMPT_ID) {
+                    // A completed turn with no terminal message is nudged once;
+                    // complete the nudge as an empty completion in tests that
+                    // do not exercise it explicitly.
+                    self.ack_nudge().await;
+                    self.result_nudge("completed").await;
+                    continue;
+                }
                 assert_eq!(command["type"], "get_state", "unexpected shutdown command");
                 self.state(&command).await;
             }
@@ -2577,6 +2674,122 @@ mod tests {
             records[0].error.as_deref(),
             Some("input rejected before admission")
         );
+    }
+
+    #[tokio::test]
+    async fn completed_turn_without_terminal_message_is_nudged_once_and_recovers() {
+        let mut run = driver();
+        assert_eq!(run.protocol.command().await["id"], "turn-1");
+        run.protocol.ack(1).await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        // No message_end, no deltas: the LLM produced no terminal message.
+        run.protocol.settled = true;
+        run.protocol.result(1, "completed").await;
+        // The run may not settle before one synthetic nudge is delivered.
+        let nudge = run.protocol.command().await;
+        assert_eq!(nudge["id"], NUDGE_PROMPT_ID);
+        assert_eq!(nudge["type"], "prompt");
+        assert_eq!(nudge["message"], MISSING_FINAL_MESSAGE_NUDGE);
+        run.protocol.ack_nudge().await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.message_end("final answer", "stop").await;
+        run.protocol.result_nudge("completed").await;
+        run.protocol.finish().await;
+        let result = run.task.await.unwrap().unwrap();
+        assert_eq!(result.turn_id, 1);
+        assert!(!result.aborted);
+        // The durable record is the durable turn's own outcome; the nudge
+        // must not become a durable turn.
+        let records = run.control.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, 1);
+        assert_eq!(records[0].status, TurnStatus::Done);
+        assert!(records[0].text.is_empty());
+        assert!(!records[0].error.is_some());
+        // The nudge's assistant output reaches the thread as a delivered message.
+        let messages = run.ui.messages.lock().unwrap();
+        assert_eq!(messages.as_slice(), ["final answer"]);
+    }
+
+    #[tokio::test]
+    async fn completed_turn_with_terminal_message_is_not_nudged() {
+        let mut run = driver();
+        assert_eq!(run.protocol.command().await["id"], "turn-1");
+        run.protocol.ack(1).await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.message_end("final answer", "stop").await;
+        run.protocol.settled = true;
+        run.protocol.result(1, "completed").await;
+        run.protocol.finish().await;
+        let result = run.task.await.unwrap().unwrap();
+        assert_eq!(result.turn_id, 1);
+        assert!(!result.aborted);
+        let messages = run.ui.messages.lock().unwrap();
+        assert_eq!(messages.as_slice(), ["final answer"]);
+    }
+
+    #[tokio::test]
+    async fn completed_turn_with_only_tool_use_commentary_is_nudged() {
+        let mut run = driver();
+        assert_eq!(run.protocol.command().await["id"], "turn-1");
+        run.protocol.ack(1).await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.message_end("let me look", "toolUse").await;
+        run.protocol.settled = true;
+        run.protocol.result(1, "completed").await;
+        // Tool-use commentary is not a terminal message: the run must not
+        // settle until one nudge has been delivered.
+        let nudge = run.protocol.command().await;
+        assert_eq!(nudge["id"], NUDGE_PROMPT_ID);
+        run.protocol.ack_nudge().await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.message_end("final answer", "stop").await;
+        run.protocol.result_nudge("completed").await;
+        run.protocol.finish().await;
+        let result = run.task.await.unwrap().unwrap();
+        assert_eq!(result.turn_id, 1);
+        let messages = run.ui.messages.lock().unwrap();
+        assert_eq!(messages.as_slice(), ["let me look", "final answer"]);
+    }
+
+    #[tokio::test]
+    async fn failed_turn_is_not_nudged() {
+        let mut run = driver();
+        assert_eq!(run.protocol.command().await["id"], "turn-1");
+        run.protocol.ack(1).await;
+        run.protocol.settled = true;
+        run.protocol.result(1, "error").await;
+        run.protocol.finish().await;
+        assert!(run.task.await.unwrap().is_err());
+        let records = run.control.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, TurnStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn nudge_is_sent_at_most_once_per_run() {
+        let mut run = driver();
+        assert_eq!(run.protocol.command().await["id"], "turn-1");
+        run.protocol.ack(1).await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.settled = true;
+        run.protocol.result(1, "completed").await;
+        let nudge = run.protocol.command().await;
+        assert_eq!(nudge["id"], NUDGE_PROMPT_ID);
+        run.protocol.ack_nudge().await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        // The nudge itself also completes without a terminal message.
+        run.protocol.result_nudge("completed").await;
+        run.protocol.finish().await;
+        let result = run.task.await.unwrap().unwrap();
+        assert_eq!(result.turn_id, 1);
+        assert!(!result.aborted);
+        let records = run.control.records.lock().unwrap();
+        // No synthetic or duplicate record for the nudge.
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, 1);
+        let messages = run.ui.messages.lock().unwrap();
+        assert!(messages.is_empty());
     }
 
     #[tokio::test]

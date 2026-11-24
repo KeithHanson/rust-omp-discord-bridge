@@ -169,6 +169,33 @@ A message arriving after the RPC loop commits to shutdown is picked up by the ne
 process using the saved session. The stopped-session check and durable claim are
 atomic, so a stale Discord handler cannot admit new work after `stop`.
 
+## Missing-final-message nudge
+
+A terminal assistant message is an assistant `message_end` with `stopReason == "stop"`
+and nonempty visible text. Tool-use commentary (`toolUse`) and unfinished
+aborted/error messages never count as final.
+
+If a durable turn completes (`prompt_result` status `completed`) without producing a
+terminal assistant message, the bridge may not settle the run. With the OMP process
+still alive, it sends one synthetic internal prompt — never a durable queue row — to
+the same OMP session:
+
+> You just stopped without sending a final assistant message. Send the final assistant response now.
+
+The nudge rides the same delivery path as normal assistant text: its output reaches
+the Discord/Matrix thread as an assistant message. The nudge is never recorded through
+`TurnControl`, never becomes a durable turn, and never becomes the run's last result:
+the durable record and the run's result keep the triggering turn's own outcome.
+
+The nudge is one-shot per run, and only when the run is about to settle: if another
+durable turn is dispatched (interruption), the guard is re-armed and the previous
+nudge is discarded. Aborted, failed, uncertain, and pre-dispatch-ended runs are not
+nudged. If the nudge itself completes without a terminal message, no further nudge
+is sent; the run settles as before.
+
+Whether a message actually reaches the thread remains best-effort, as with all
+assistant output; delivery failures are logged, never promoted into turn failures.
+
 ## Cancellation and shutdown
 
 `stop` first marks the Discord session stopped, then sends RPC `abort` to an active process. The bridge waits up to 15 seconds for all correlated prompt outcomes and a settled session. A missing outcome or unsettled session is uncertain, because tools may already have changed external state; an uncorrelated `agent_end` alone is not completion.

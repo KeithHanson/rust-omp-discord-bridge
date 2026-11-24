@@ -19,6 +19,7 @@ Discord maps one thread to one OMP conversation. Matrix supports room-scoped con
 - `status`, `models`, `model`, `stop`, `new`, and targeted `@Bot kick` controls inside threads;
 - duplicate client event rejection;
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
+- one-shot nudge to the LLM when a completed turn ends without a terminal assistant message, so the model is told it stopped short of a final response (see docs/omp-rpc.md);
 - bounded attachment metadata and Discord-safe response chunking;
 - on-demand OMP access to bounded parent-channel and same-parent thread message history.
 
