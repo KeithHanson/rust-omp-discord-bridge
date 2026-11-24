@@ -462,9 +462,11 @@ impl OmpTransport {
         let mut drain_queue = true;
         let mut abort_deadline = None;
         let mut deadline = Instant::now() + turn_timeout;
-        // A durable turn completed without a terminal assistant message and no
-        // replacement was dispatched: one nudge prompt must be delivered before
-        // this run may settle. The guard keeps it to a single nudge per run.
+        // A durable turn ended without a terminal assistant message and no
+        // replacement was dispatched: one nudge prompt must be delivered
+        // before this run may settle. The guard keeps it to a single nudge
+        // per run. The arming also covers aborted turns: the run may not
+        // settle while the LLM never sent a final message.
         let mut nudge_needed = false;
         let mut nudge_sent = false;
         let mut abort_acknowledged = false;
@@ -791,10 +793,19 @@ impl OmpTransport {
                                     if last.as_ref().is_none_or(|(id, _, _)| prompt.turn_id > *id) {
                                         last = Some((prompt.turn_id, prompt.output, status));
                                     }
-                                    if status == TurnStatus::Done && !prompt.terminal_message {
+                                    if matches!(status, TurnStatus::Done | TurnStatus::Aborted)
+                                        && !prompt.terminal_message
+                                    {
                                         // Armed for the return guard: a run may not
                                         // settle until one nudge has been delivered.
                                         nudge_needed = true;
+                                    } else {
+                                        // A durable turn that either delivered a
+                                        // terminal message or failed clears a nudge
+                                        // armed by an earlier durable turn, so the
+                                        // run may settle on a final answer it did
+                                        // not deliver.
+                                        nudge_needed = false;
                                     }
                                 }
                                 drain_queue = true;
@@ -2750,6 +2761,36 @@ mod tests {
         assert_eq!(result.turn_id, 1);
         let messages = run.ui.messages.lock().unwrap();
         assert_eq!(messages.as_slice(), ["let me look", "final answer"]);
+    }
+
+    #[tokio::test]
+    async fn aborted_turn_without_terminal_message_is_nudged_once() {
+        let mut run = driver();
+        assert_eq!(run.protocol.command().await["id"], "turn-1");
+        run.protocol.ack(1).await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        // No message_end, no deltas: the LLM never sent a final message.
+        run.protocol.settled = true;
+        run.protocol.result(1, "aborted").await;
+        // The run may not settle until one synthetic nudge is delivered.
+        let nudge = run.protocol.command().await;
+        assert_eq!(nudge["id"], NUDGE_PROMPT_ID);
+        assert_eq!(nudge["type"], "prompt");
+        assert_eq!(nudge["message"], MISSING_FINAL_MESSAGE_NUDGE);
+        run.protocol.ack_nudge().await;
+        run.protocol.emit(json!({"type": "agent_start"})).await;
+        run.protocol.message_end("final answer", "stop").await;
+        run.protocol.result_nudge("completed").await;
+        run.protocol.finish().await;
+        let result = run.task.await.unwrap().unwrap();
+        assert_eq!(result.turn_id, 1);
+        assert!(result.aborted);
+        // The durable record stays the durable turn's own outcome.
+        let records = run.control.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, TurnStatus::Aborted);
+        let messages = run.ui.messages.lock().unwrap();
+        assert_eq!(messages.as_slice(), ["final answer"]);
     }
 
     #[tokio::test]

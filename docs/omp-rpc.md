@@ -175,10 +175,10 @@ A terminal assistant message is an assistant `message_end` with `stopReason == "
 and nonempty visible text. Tool-use commentary (`toolUse`) and unfinished
 aborted/error messages never count as final.
 
-If a durable turn completes (`prompt_result` status `completed`) without producing a
-terminal assistant message, the bridge may not settle the run. With the OMP process
-still alive, it sends one synthetic internal prompt — never a durable queue row — to
-the same OMP session:
+If a durable turn completes (`prompt_result` status `completed`) or aborts
+(`prompt_result` status `aborted`) without producing a terminal assistant message, the
+bridge may not settle the run. With the OMP process still alive, it sends one synthetic
+internal prompt — never a durable queue row — to the same OMP session:
 
 > You just stopped without sending a final assistant message. Send the final assistant response now.
 
@@ -187,11 +187,12 @@ the Discord/Matrix thread as an assistant message. The nudge is never recorded t
 `TurnControl`, never becomes a durable turn, and never becomes the run's last result:
 the durable record and the run's result keep the triggering turn's own outcome.
 
-The nudge is one-shot per run, and only when the run is about to settle: if another
-durable turn is dispatched (interruption), the guard is re-armed and the previous
-nudge is discarded. Aborted, failed, uncertain, and pre-dispatch-ended runs are not
-nudged. If the nudge itself completes without a terminal message, no further nudge
-is sent; the run settles as before.
+The nudge is one-shot per run, and only when the run is about to settle and no
+cancellation has been requested: if another durable turn is dispatched
+(interruption), the guard is re-armed and the previous nudge is discarded. Aborted
+turns are nudged exactly like completed turns; failed, uncertain, and
+pre-dispatch-ended runs are not. If the nudge itself completes without a terminal
+message, no further nudge is sent; the run settles as before.
 
 Whether a message actually reaches the thread remains best-effort, as with all
 assistant output; delivery failures are logged, never promoted into turn failures.
