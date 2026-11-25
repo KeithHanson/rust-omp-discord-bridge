@@ -108,6 +108,17 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-25-2
+
+Waits only for idle turns, not title-status workers, before replacing the
+daemon. The automatic update gate previously required the thread-title/status
+reconciler workers to finish as well; those workers can run for minutes
+(Discord rename rate-limit cooldowns plus a separate OMP semantic-review
+subprocess), so a staged release could never reach a fully idle boundary and
+never exec. `rollover_idle()` now requires only the runner drains to be
+empty — actual turns and message/activity deliveries — and an exec may cut
+off a title update in flight.
+
 ### Release 2026-11-25-1
 
 Posts the full prompt in the trigger-created thread. The channel headline
