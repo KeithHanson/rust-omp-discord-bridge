@@ -45,7 +45,7 @@ use crate::{
     live_config::LiveConfig,
     omp::{ApprovalRequest, OmpTransport},
     presence::PresenceSnapshot,
-    render::{chunk_message, thread_name},
+    render::{chunk_message, thread_name, trigger_prompt_messages},
     runner::{ThreadMessenger, ThreadQueueRunner},
     store::{CreateSessionResult, EnqueueResult, Store, TurnSource},
     threadwatch::ControlCommand,
@@ -427,6 +427,17 @@ async fn trigger_prepare(
         .context("failed to create Discord session thread")?;
     let thread_id = ThreadId::new(thread.id.get());
     let headline_id = MessageId::new(headline.id.get());
+    // Humans in the thread must see everything the session was asked to do.
+    // The channel headline deliberately keeps only a short preview, so the full
+    // prompt is posted here, before the session exists, chunked at the message
+    // limit. A failure deletes the thread, matching the duplicate-admission path.
+    for chunk in trigger_prompt_messages(prompt, config.runtime.discord_message_limit) {
+        if let Err(error) = send_without_mentions(http, thread_id, &chunk).await {
+            let _ = thread.id.delete(http).await;
+            return Err(error).context("failed to post the full prompt to the trigger thread");
+        }
+    }
+
     let input = NewSession {
         thread_id,
         guild_id,

@@ -488,12 +488,16 @@ omp-client-bridge trigger --channel 123456789012345678 --prompt-file /tmp/prompt
 `--timeout` bounds the synchronous wait (default 7200s, max 7200s); a timed-out
 turn keeps running and the command exits non-zero while printing the thread id.
 The CLI prints the turn's response to stdout and the thread id to stderr, exiting
-non-zero on failure. Concurrent triggers are bounded and the trigger flow uses the
-same guild allowlist as gateway messages: the `--channel` must be in an allowlisted
-`[[discord.guilds]]` policy. Triggers never bypass admission, consent, or identity
-checks — they are just another admitted client. Disabled, an unreachable or
-stale socket fails the CLI immediately with a clear message; the daemon stays up
-with the socket unavailable if the binding fails at startup.
+non-zero on failure. The channel headline deliberately keeps only a short
+preview of the prompt; the full prompt is posted as the first message(s) in the
+thread — chunked at `runtime.discord_message_limit` — so humans reading the
+thread see everything the session was asked to do. Concurrent triggers are
+bounded and the trigger flow uses the same guild allowlist as gateway messages:
+the `--channel` must be in an allowlisted `[[discord.guilds]]` policy. Triggers
+never bypass admission, consent, or identity checks — they are just another
+admitted client. Disabled, an unreachable or stale socket fails the CLI
+immediately with a clear message; the daemon stays up with the socket unavailable
+if the binding fails at startup.
 
 ## Validate and run
 The bridge launches the configured OMP executable and uses its normal authentication sources, including `~/.omp/agent/agent.db`, OMP `.env` files, and environment variables inherited from the bridge process. Leave `omp.model` unset to use OMP's configured default. If set, use an exact provider/model ID shown by `omp models`; `openai-codex` subscription authentication is separate from the API-key-based `openai` provider.

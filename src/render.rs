@@ -33,6 +33,13 @@ pub fn thread_name(prompt: &str) -> String {
     }
 }
 
+/// Renders the human-facing bodies of a trigger's full prompt for the session
+/// thread. The channel headline keeps only a short preview; humans reading the
+/// thread get the complete prompt, chunked at Discord's message limit.
+pub fn trigger_prompt_messages(prompt: &str, limit: usize) -> Vec<String> {
+    chunk_message(&format!("**Prompt:**\n\n{prompt}"), limit)
+}
+
 pub fn chunk_message(text: &str, limit: usize) -> Vec<String> {
     assert!(limit >= 100, "Discord message limit must be at least 100");
     if text.is_empty() {
@@ -136,6 +143,16 @@ mod tests {
         assert!(chunks.iter().all(|chunk| discord_len(chunk) <= 100));
         assert!(chunks.iter().all(|chunk| chunk.starts_with("```rs\n")));
         assert!(chunks.iter().all(|chunk| chunk.ends_with("```")));
+    }
+
+    #[test]
+    fn trigger_prompt_messages_preserve_the_full_prompt() {
+        let prompt = format!("first line\n{}", "x".repeat(2_500));
+        let chunks = trigger_prompt_messages(&prompt, 100);
+
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| discord_len(chunk) <= 100));
+        assert_eq!(chunks.concat(), format!("**Prompt:**\n\n{prompt}"));
     }
 
     #[test]
