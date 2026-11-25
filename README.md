@@ -258,9 +258,10 @@ The updater requires a `vYYYY-MM-DD-N` tag, the raw
 It verifies the checksum and candidate's `--version`, then runs a bounded
 `check-update` preflight to validate the selected configuration, token, and OMP
 probe **without migrating or otherwise modifying the live database**. Gateway
-admission remains open throughout preflight. The updater then waits until turns,
-message/activity deliveries, title OMP workers, and admitted handlers are all
-idle. Continuous activity can defer an update indefinitely; updates never
+admission remains open throughout preflight. The updater then waits until turns and
+message/activity deliveries are idle with gateway admission closed. Title OMP
+workers are not part of the wait; an exec may cut off a title update in flight.
+Continuous activity can defer an update indefinitely; updates never
 interrupt a turn to meet a deadline.
 
 New work admission is held exclusively only across the final idle recheck and

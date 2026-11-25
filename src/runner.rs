@@ -423,10 +423,10 @@ impl ThreadQueueRunner {
     }
 
     /// Caller must exclude gateway handlers while inspecting this boundary.
-    /// Drains include delivery and activity finalization; title workers are
-    /// separate OMP processes and must also finish before replacing the daemon.
+    /// Only actual turns must be idle; title-worker reconciliation is allowed
+    /// to be cut off by the exec and is intentionally not part of the gate.
     pub(crate) async fn rollover_idle(&self) -> bool {
-        self.draining.lock().await.is_empty() && self.statuses.senders.lock().unwrap().is_empty()
+        self.draining.lock().await.is_empty()
     }
 
     pub async fn poke(self: &Arc<Self>, thread_id: ThreadId) {
@@ -2304,7 +2304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollover_waits_for_turn_and_final_title_worker() {
+    async fn rollover_waits_for_turns_but_not_the_title_worker() {
         let (_directory, store) = fixture().await;
         let (observed, mut incoming) = mpsc::unbounded_channel();
         let transport = Arc::new(ControlledTransport::new(observed, false));
@@ -2329,21 +2329,16 @@ mod tests {
         transport.finish.add_permits(1);
         received(&mut updates).await;
         idle(&runner).await;
-        assert!(
-            !runner.rollover_idle().await,
-            "title subprocess still running"
-        );
-        let sender = runner.statuses.senders.lock().unwrap()[&CONVERSATION].clone();
+        // The drain has settled, but the title worker is still blocked on the
+        // gate — the gate must not wait on it.
+        assert!(!runner.statuses.senders.lock().unwrap().is_empty());
+        assert!(runner.rollover_idle().await);
         title_gate.add_permits(1);
         messenger.wait_status("completed").await;
         assert_eq!(
             store.next_outcome(THREAD, 0).await.unwrap().unwrap().status,
             TurnStatus::Done
         );
-        // SQLite uses real blocking workers; pause only after database work settles.
-        tokio::time::pause();
-        sender.closed().await;
-        assert!(runner.rollover_idle().await);
     }
 
     #[tokio::test]

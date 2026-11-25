@@ -542,7 +542,7 @@ async fn auto_update(
             tracing::warn!(%error, "update preflight failed; keeping current bridge");
             continue;
         }
-        tracing::info!("update staged; waiting for turns, delivery, and title workers to finish");
+        tracing::info!("update staged; waiting for turns to finish");
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             // Never queue a writer behind a handler waiting for a turn: Tokio's
