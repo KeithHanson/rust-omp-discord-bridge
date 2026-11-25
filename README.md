@@ -108,6 +108,15 @@ presence displays `Idle · v[VERSION] · [short commit]`; `--version` displays
 Cargo's SemVer package field is internal Rust metadata, not the public release
 version. Container builds copy the same tracked `VERSION` file.
 
+### Release 2026-11-25-1
+
+Posts the full prompt in the trigger-created thread. The channel headline
+deliberately keeps only a short preview, which left the rest of the prompt
+invisible to humans reading the thread. The full prompt is now posted as the
+first message(s) in the thread — chunked at `runtime.discord_message_limit`
+and mention-suppressed — before the session is admitted. On post failure the
+thread is deleted and the trigger fails, matching the duplicate-admission path.
+
 ### Release 2026-11-24-3
 
 Adds a local control socket so local automations can start a new OMP session in
