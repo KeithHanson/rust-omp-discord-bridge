@@ -128,6 +128,16 @@ first message(s) in the thread — chunked at `runtime.discord_message_limit`
 and mention-suppressed — before the session is admitted. On post failure the
 thread is deleted and the trigger fails, matching the duplicate-admission path.
 
+### Release 2026-11-26-2
+
+Gates the post-to-channel toolset to silent sessions. Normal sessions no longer
+receive `discord_send_message_channel`, `discord_send_message_thread`, or
+`discord_convert_message_to_thread`, and uploads are limited to the current
+thread (no `target`/`thread_id` arguments) — the bridge coordinates the output
+instead of letting the AI publish a result to the channel and write a response
+that is automatically sent. `--silent` sessions keep the full toolset, which is
+their only publishing path.
+
 ### Release 2026-11-26-1
 
 Extends silent triggers with a full post-to-channel toolset: `discord_send_message_channel`
