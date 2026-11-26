@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd TEXT NOT NULL,
     created_by_user_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('active', 'stopped')),
+    silent INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
@@ -160,6 +161,10 @@ impl Store {
                 "ALTER TABLE sessions ADD COLUMN latest_human_message_id TEXT",
             ),
             ("model", "ALTER TABLE sessions ADD COLUMN model TEXT"),
+            (
+                "silent",
+                "ALTER TABLE sessions ADD COLUMN silent INTEGER NOT NULL DEFAULT 0",
+            ),
             (
                 "conversation_id",
                 "ALTER TABLE sessions ADD COLUMN conversation_id INTEGER REFERENCES client_conversations(id)",
@@ -408,7 +413,7 @@ impl Store {
         require_thread_admitted(&mut transaction, input.thread_id).await?;
         let now = now_ms()?;
         let result = sqlx::query(
-            "INSERT INTO sessions (thread_id, conversation_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO sessions (thread_id, conversation_id, guild_id, parent_channel_id, trigger_message_id, cwd, created_by_user_id, status, silent, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?) ON CONFLICT DO NOTHING",
         )
         .bind(input.thread_id.to_string())
         .bind(conversation_id.get())
@@ -417,6 +422,7 @@ impl Store {
         .bind(input.trigger_message_id.to_string())
         .bind(input.cwd.to_string_lossy().into_owned())
         .bind(input.created_by_user_id.to_string())
+        .bind(i64::from(input.silent))
         .bind(now)
         .bind(now)
         .execute(&mut *transaction)
@@ -911,6 +917,7 @@ fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Session> {
         cwd: row.try_get::<String, _>("cwd")?.into(),
         created_by_user_id: parse_id(row.try_get("created_by_user_id")?, "created_by_user_id")?,
         status: SessionStatus::from_database(row.try_get("status")?)?,
+        silent: row.try_get::<i64, _>("silent")? != 0,
     })
 }
 
@@ -978,6 +985,7 @@ mod tests {
             trigger_message_id: MessageId::new(trigger),
             cwd: std::env::temp_dir(),
             created_by_user_id: UserId::new(3),
+            silent: false,
         }
     }
 

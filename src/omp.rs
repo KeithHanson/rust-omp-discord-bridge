@@ -25,7 +25,7 @@ use tokio_util::{
 
 use crate::{
     config::OmpConfig,
-    domain::{Session, ThreadId, Turn, TurnStatus},
+    domain::{MessageId, Session, ThreadId, Turn, TurnStatus},
     live_config::LiveConfig,
 };
 
@@ -35,6 +35,9 @@ const DISCORD_HISTORY_TOOL: &str = "discord_channel_history";
 const DISCORD_THREAD_HISTORY_TOOL: &str = "discord_thread_history";
 const DISCORD_PARTICIPANTS_TOOL: &str = "discord_thread_participants";
 const DISCORD_UPLOAD_TOOL: &str = "discord_upload_file";
+const DISCORD_SEND_CHANNEL_MESSAGE_TOOL: &str = "discord_send_message_channel";
+const DISCORD_SEND_THREAD_MESSAGE_TOOL: &str = "discord_send_message_thread";
+const DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL: &str = "discord_convert_message_to_thread";
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 // Preserve Discord's five-minute approval window plus bounded HTTP overhead.
@@ -73,11 +76,25 @@ pub struct ApprovalRequest {
     pub details: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadTarget {
+    Channel,
+    Thread,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UploadRequest {
     pub path: PathBuf,
     pub caption: Option<String>,
+    /// Which target the file is posted to: the parent channel, or a thread
+    /// (the session's current thread, or an explicit bot-created thread).
+    #[serde(default)]
+    pub target: Option<UploadTarget>,
+    /// Explicit thread id, required with `target: "thread"` outside a
+    /// non-silent session's own current thread.
+    pub thread_id: Option<String>,
 }
 
 #[async_trait]
@@ -92,6 +109,17 @@ pub trait OmpUi: Send + Sync {
     async fn thread_history(&self, thread_id: ThreadId, days: u16) -> Result<String, String>;
     async fn thread_participants(&self) -> Result<String, String>;
     async fn upload_file(&self, request: UploadRequest) -> Result<String, String>;
+    async fn send_channel_message(&self, text: &str) -> Result<String, String>;
+    async fn send_thread_message(
+        &self,
+        text: &str,
+        thread_id: Option<ThreadId>,
+    ) -> Result<String, String>;
+    async fn convert_message_to_thread(
+        &self,
+        message_id: MessageId,
+        name: Option<&str>,
+    ) -> Result<String, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -1567,13 +1595,15 @@ where
             }, {
                 "name": DISCORD_UPLOAD_TOOL,
                 "label": "Discord Upload File",
-                "description": "Upload one local regular file to this session's current Discord thread. Relative paths resolve against the session working directory; files must be inside the configured allowed root and within the attachment size limit. Optional caption; mentions are disabled. Returns the message and attachment URLs. Upload only files the user authorized sharing; never upload credentials or private files without permission. On timeout or interruption delivery may have occurred: inspect the thread before retrying.",
+                "description": "Upload one local regular file to this session's current Discord thread, to the session's parent channel (target \"channel\"), or to a bot-created thread (target \"thread\" plus thread_id). Relative paths resolve against the session working directory; files must be inside the configured allowed root and within the attachment size limit. Optional caption; mentions are disabled. Returns the message and attachment URLs. Upload only files the user authorized sharing; never upload credentials or private files without permission. On timeout or interruption delivery may have occurred: inspect the thread before retrying.",
                 "loadMode": "essential",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "minLength": 1},
-                        "caption": {"type": "string"}
+                        "caption": {"type": "string"},
+                        "target": {"type": "string", "enum": ["channel", "thread"]},
+                        "thread_id": {"type": "string", "pattern": "^[0-9]+$", "minLength": 1, "maxLength": 20}
                     },
                     "required": ["path"],
                     "additionalProperties": false
@@ -1590,6 +1620,47 @@ where
                         "days": {"type": "integer", "minimum": 1, "maximum": max_history_days}
                     },
                     "required": ["thread_id", "days"],
+                    "additionalProperties": false
+                }
+            }, {
+                "name": DISCORD_SEND_CHANNEL_MESSAGE_TOOL,
+                "label": "Discord Send Message To Channel",
+                "description": "Post a message to this session's parent Discord channel. Mentions are disabled. Post only content the user authorized sharing; never post credentials, private data, or secrets.",
+                "loadMode": "essential",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "minLength": 1}
+                    },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }
+            }, {
+                "name": DISCORD_SEND_THREAD_MESSAGE_TOOL,
+                "label": "Discord Send Message To Thread",
+                "description": "Post a message to this session's current Discord thread, or to an explicit thread created earlier in this session (pass its thread_id). Mentions are disabled. Post only content the user authorized sharing; never post credentials, private data, or secrets.",
+                "loadMode": "essential",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "minLength": 1},
+                        "thread_id": {"type": "string", "pattern": "^[0-9]+$", "minLength": 1, "maxLength": 20}
+                    },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }
+            }, {
+                "name": DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL,
+                "label": "Discord Convert Message To Thread",
+                "description": "Turn a message in this session's parent Discord channel into a thread and return the new thread ID. Post only content the user authorized sharing; the thread is created in the parent channel where the message lives. Use the message_id returned by the send-message tool (or an upload result).",
+                "loadMode": "essential",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message_id": {"type": "string", "pattern": "^[0-9]+$", "minLength": 1, "maxLength": 20},
+                        "name": {"type": "string", "minLength": 1, "maxLength": 100}
+                    },
+                    "required": ["message_id"],
                     "additionalProperties": false
                 }
             }]
@@ -1619,6 +1690,9 @@ where
                         DISCORD_PARTICIPANTS_TOOL,
                         DISCORD_UPLOAD_TOOL,
                         DISCORD_THREAD_HISTORY_TOOL,
+                        DISCORD_SEND_CHANNEL_MESSAGE_TOOL,
+                        DISCORD_SEND_THREAD_MESSAGE_TOOL,
+                        DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL,
                     ]
                     .iter()
                     .all(|required| names.iter().any(|name| name.as_str() == Some(*required)))
@@ -1725,6 +1799,23 @@ async fn service_response(frame: &Value, ui: &dyn OmpUi, max_history_days: u16) 
                 Err(error) => Err(format!("Invalid upload arguments: {error}")),
             }
         }
+        Some(DISCORD_SEND_CHANNEL_MESSAGE_TOOL) => match send_text_arguments(frame) {
+            Ok(text) => ui.send_channel_message(&text).await,
+            Err(error) => Err(error),
+        },
+        Some(DISCORD_SEND_THREAD_MESSAGE_TOOL) => match send_thread_arguments(frame) {
+            Ok((text, thread_id)) => ui.send_thread_message(&text, thread_id).await,
+            Err(error) => Err(error),
+        },
+        Some(DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL) => {
+            match convert_message_to_thread_arguments(frame) {
+                Ok((message_id, name)) => {
+                    ui.convert_message_to_thread(message_id, name.as_deref())
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
         _ => Err("OMP requested an unknown bridge-owned tool".to_owned()),
     };
     history_response(id, result)
@@ -1744,6 +1835,21 @@ fn history_response(id: &str, result: Result<String, String>) -> Value {
             "result": {"content": [{"type": "text", "text": error}]}
         }),
     }
+}
+fn send_text_arguments(frame: &Value) -> Result<String, String> {
+    let arguments = frame
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "send arguments must be an object".to_owned())?;
+    if arguments.keys().any(|key| key != "text") {
+        return Err("send message tool accepts only `text`".to_owned());
+    }
+    arguments
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(|text| text.to_owned())
+        .ok_or_else(|| "`text` must be a non-empty string".to_owned())
 }
 
 fn history_days(frame: &Value, max_history_days: u16) -> Result<u16, String> {
@@ -1784,6 +1890,80 @@ fn thread_history_arguments(
         return Err(invalid_id());
     }
     Ok((ThreadId::new(id), history_days(frame, max_history_days)?))
+}
+
+fn send_thread_arguments(frame: &Value) -> Result<(String, Option<ThreadId>), String> {
+    let arguments = frame
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "send arguments must be an object".to_owned())?;
+    if arguments
+        .keys()
+        .any(|key| key != "text" && key != "thread_id")
+    {
+        return Err("`discord_send_message_thread` accepts only `text` and `thread_id`".to_owned());
+    }
+    let text = arguments
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(|text| text.to_owned())
+        .ok_or_else(|| "`text` must be a non-empty string".to_owned())?;
+    let thread_id = match arguments.get("thread_id") {
+        None => None,
+        Some(id) => Some(parse_snowflake_id(id, "thread_id")?),
+    };
+    Ok((text, thread_id.map(ThreadId::new)))
+}
+
+fn convert_message_to_thread_arguments(
+    frame: &Value,
+) -> Result<(MessageId, Option<String>), String> {
+    let arguments = frame
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "convert arguments must be an object".to_owned())?;
+    if arguments
+        .keys()
+        .any(|key| key != "message_id" && key != "name")
+    {
+        return Err(
+            "`discord_convert_message_to_thread` accepts only `message_id` and `name`".to_owned(),
+        );
+    }
+    let message_id = parse_snowflake_id(
+        arguments.get("message_id").unwrap_or(&Value::Null),
+        "message_id",
+    )?;
+    let name = arguments
+        .get("name")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| name.trim().to_owned())
+                .ok_or_else(|| "`name` must be a non-empty string".to_owned())
+        })
+        .transpose()?;
+    if let Some(name) = &name
+        && name.chars().count() > 100
+    {
+        return Err("`name` must be at most 100 characters".to_owned());
+    }
+    Ok((MessageId::new(message_id), name))
+}
+
+fn parse_snowflake_id(value: &Value, field: &str) -> Result<u64, String> {
+    let invalid = || format!("`{field}` must be a nonzero decimal u64 string");
+    let id = value.as_str().ok_or_else(invalid)?;
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let id = id.parse::<u64>().map_err(|_| invalid())?;
+    if id == 0 {
+        return Err(invalid());
+    }
+    Ok(id)
 }
 
 async fn service_ui_request(frame: &Value, ui: &dyn OmpUi) -> Value {
@@ -2071,6 +2251,26 @@ mod tests {
 
         async fn upload_file(&self, _request: UploadRequest) -> Result<String, String> {
             self.channel_history(1).await
+        }
+
+        async fn send_channel_message(&self, _text: &str) -> Result<String, String> {
+            Ok("ok".to_owned())
+        }
+
+        async fn send_thread_message(
+            &self,
+            _text: &str,
+            _thread_id: Option<ThreadId>,
+        ) -> Result<String, String> {
+            Ok("ok".to_owned())
+        }
+
+        async fn convert_message_to_thread(
+            &self,
+            _message_id: MessageId,
+            _name: Option<&str>,
+        ) -> Result<String, String> {
+            Ok("ok".to_owned())
         }
     }
 
@@ -3457,6 +3657,26 @@ mod tests {
         async fn upload_file(&self, _request: UploadRequest) -> Result<String, String> {
             panic!("prompts do not upload files")
         }
+
+        async fn send_channel_message(&self, _text: &str) -> Result<String, String> {
+            panic!("prompts do not send channel messages")
+        }
+
+        async fn send_thread_message(
+            &self,
+            _text: &str,
+            _thread_id: Option<ThreadId>,
+        ) -> Result<String, String> {
+            panic!("prompts do not send thread messages")
+        }
+
+        async fn convert_message_to_thread(
+            &self,
+            _message_id: MessageId,
+            _name: Option<&str>,
+        ) -> Result<String, String> {
+            panic!("prompts do not convert messages to threads")
+        }
     }
 
     #[tokio::test]
@@ -3693,6 +3913,26 @@ mod tests {
         async fn upload_file(&self, _request: UploadRequest) -> Result<String, String> {
             panic!("history requests do not upload files")
         }
+
+        async fn send_channel_message(&self, _text: &str) -> Result<String, String> {
+            panic!("history requests do not send channel messages")
+        }
+
+        async fn send_thread_message(
+            &self,
+            _text: &str,
+            _thread_id: Option<ThreadId>,
+        ) -> Result<String, String> {
+            panic!("history requests do not send thread messages")
+        }
+
+        async fn convert_message_to_thread(
+            &self,
+            _message_id: MessageId,
+            _name: Option<&str>,
+        ) -> Result<String, String> {
+            panic!("history requests do not convert messages to threads")
+        }
     }
 
     #[test]
@@ -3743,6 +3983,123 @@ mod tests {
             Some(&Value::String("history for 7 days".to_owned()))
         );
         assert!(response.get("isError").is_none());
+    }
+
+    async fn call_tool(tool_name: &str, arguments: Value) -> Value {
+        let (writer, reader) = tokio::io::duplex(1_024);
+        let mut input = BufWriter::new(writer);
+        service_frame(
+            &json!({
+                "type": "host_tool_call",
+                "id": "tool-call-1",
+                "toolName": tool_name,
+                "arguments": arguments
+            }),
+            &mut input,
+            &TestUi::default(),
+            30,
+        )
+        .await
+        .expect("service tool");
+        let mut responses = FramedRead::new(reader, LinesCodec::new());
+        serde_json::from_str(&responses.next().await.unwrap().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_thread_message_tool_validates_arguments() {
+        for (arguments, error) in [
+            (json!({"text": ""}), "`text` must be a non-empty string"),
+            (json!({"text": 42}), "`text` must be a non-empty string"),
+            (
+                json!({"text": "ok", "thread_id": ""}),
+                "`thread_id` must be a nonzero decimal u64 string",
+            ),
+            (
+                json!({"text": "ok", "thread_id": "01x"}),
+                "`thread_id` must be a nonzero decimal u64 string",
+            ),
+            (
+                json!({"text": "ok", "thread_id": "0"}),
+                "`thread_id` must be a nonzero decimal u64 string",
+            ),
+            (
+                json!({"text": "ok", "thread_id": 42}),
+                "`thread_id` must be a nonzero decimal u64 string",
+            ),
+            (
+                json!({"text": "ok", "thread_id": "123", "extra": true}),
+                "`discord_send_message_thread` accepts only `text` and `thread_id`",
+            ),
+        ] {
+            let response = call_tool(DISCORD_SEND_THREAD_MESSAGE_TOOL, arguments).await;
+            assert_eq!(response["id"], "tool-call-1");
+            assert_eq!(response["isError"], true);
+            assert_eq!(response["result"]["content"][0]["text"], error);
+        }
+        let response = call_tool(
+            DISCORD_SEND_THREAD_MESSAGE_TOOL,
+            json!({"text": "ok", "thread_id": "42"}),
+        )
+        .await;
+        assert_eq!(response["isError"], Value::Null);
+        assert_eq!(response["result"]["content"][0]["text"], "ok");
+    }
+
+    #[tokio::test]
+    async fn convert_message_to_thread_tool_validates_arguments() {
+        for (arguments, error) in [
+            (
+                json!({"message_id": ""}),
+                "`message_id` must be a nonzero decimal u64 string",
+            ),
+            (
+                json!({"message_id": "abc"}),
+                "`message_id` must be a nonzero decimal u64 string",
+            ),
+            (
+                json!({"message_id": "0"}),
+                "`message_id` must be a nonzero decimal u64 string",
+            ),
+            (
+                json!({"message_id": 42}),
+                "`message_id` must be a nonzero decimal u64 string",
+            ),
+            (
+                json!({"message_id": "42", "name": ""}),
+                "`name` must be a non-empty string",
+            ),
+            (
+                json!({"message_id": "42", "name": "  "}),
+                "`name` must be a non-empty string",
+            ),
+            (
+                json!({"message_id": "42", "name": "x".repeat(101)}),
+                "`name` must be at most 100 characters",
+            ),
+            (
+                json!({"message_id": "42", "message_id2": "1"}),
+                "`discord_convert_message_to_thread` accepts only `message_id` and `name`",
+            ),
+        ] {
+            let response = call_tool(DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL, arguments).await;
+            assert_eq!(response["id"], "tool-call-1");
+            assert_eq!(response["isError"], true);
+            assert_eq!(response["result"]["content"][0]["text"], error);
+        }
+        let response = call_tool(
+            DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL,
+            json!({"message_id": "42", "name": "Screenshot report"}),
+        )
+        .await;
+        assert_eq!(response["isError"], Value::Null);
+        assert_eq!(response["result"]["content"][0]["text"], "ok");
+        let response = call_tool(
+            DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL,
+            json!({"message_id": "42"}),
+        )
+        .await;
+        assert_eq!(response["isError"], Value::Null);
+        assert_eq!(response["result"]["content"][0]["text"], "ok");
     }
 
     async fn participant_rpc(arguments: Value, fail: bool) -> Value {
@@ -3966,6 +4323,30 @@ mod tests {
                 DISCORD_UPLOAD_TOOL,
                 DISCORD_THREAD_HISTORY_TOOL
             ]),
+            json!([
+                DISCORD_HISTORY_TOOL,
+                DISCORD_PARTICIPANTS_TOOL,
+                DISCORD_UPLOAD_TOOL,
+                DISCORD_THREAD_HISTORY_TOOL,
+                DISCORD_SEND_CHANNEL_MESSAGE_TOOL
+            ]),
+            json!([
+                DISCORD_HISTORY_TOOL,
+                DISCORD_PARTICIPANTS_TOOL,
+                DISCORD_UPLOAD_TOOL,
+                DISCORD_THREAD_HISTORY_TOOL,
+                DISCORD_SEND_CHANNEL_MESSAGE_TOOL,
+                DISCORD_SEND_THREAD_MESSAGE_TOOL
+            ]),
+            json!([
+                DISCORD_HISTORY_TOOL,
+                DISCORD_PARTICIPANTS_TOOL,
+                DISCORD_UPLOAD_TOOL,
+                DISCORD_THREAD_HISTORY_TOOL,
+                DISCORD_SEND_CHANNEL_MESSAGE_TOOL,
+                DISCORD_SEND_THREAD_MESSAGE_TOOL,
+                DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL
+            ]),
         ] {
             let (writer, reader) = tokio::io::duplex(8_192);
             let (response_writer, response_reader) = tokio::io::duplex(1_024);
@@ -3982,7 +4363,7 @@ mod tests {
             .unwrap();
             let mut frames = FramedRead::new(response_reader, LinesCodec::new());
             let result = register_host_tools(&mut input, &mut frames, &HistoryUi(false), 30).await;
-            assert_eq!(result.is_ok(), names.as_array().unwrap().len() == 4);
+            assert_eq!(result.is_ok(), names.as_array().unwrap().len() == 7);
             let mut commands = FramedRead::new(reader, LinesCodec::new());
             let command: Value =
                 serde_json::from_str(&commands.next().await.unwrap().unwrap()).unwrap();
@@ -4011,7 +4392,35 @@ mod tests {
                 command["tools"][3]["parameters"]["additionalProperties"],
                 false
             );
-            assert_eq!(command["tools"].as_array().unwrap().len(), 4);
+            assert_eq!(
+                command["tools"][4]["name"],
+                DISCORD_SEND_CHANNEL_MESSAGE_TOOL
+            );
+            assert_eq!(
+                command["tools"][4]["parameters"]["required"],
+                json!(["text"])
+            );
+            assert_eq!(
+                command["tools"][5]["name"],
+                DISCORD_SEND_THREAD_MESSAGE_TOOL
+            );
+            assert_eq!(
+                command["tools"][5]["parameters"]["required"],
+                json!(["text"])
+            );
+            assert_eq!(
+                command["tools"][6]["name"],
+                DISCORD_CONVERT_MESSAGE_TO_THREAD_TOOL
+            );
+            assert_eq!(
+                command["tools"][6]["parameters"]["required"],
+                json!(["message_id"])
+            );
+            assert_eq!(
+                command["tools"][6]["parameters"]["properties"]["message_id"]["type"],
+                "string"
+            );
+            assert_eq!(command["tools"].as_array().unwrap().len(), 7);
         }
     }
 

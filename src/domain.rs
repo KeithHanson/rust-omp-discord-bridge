@@ -232,6 +232,10 @@ pub struct Session {
     pub cwd: PathBuf,
     pub created_by_user_id: UserId,
     pub status: SessionStatus,
+    /// True for unattended sessions created by a silent trigger: no Discord
+    /// thread, headline, prompt post, activity embeds, or automatic thread
+    /// responses. The AI posts results through the send-message host tools.
+    pub silent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +246,7 @@ pub struct NewSession {
     pub trigger_message_id: MessageId,
     pub cwd: PathBuf,
     pub created_by_user_id: UserId,
+    pub silent: bool,
 }
 
 #[derive(Debug, Clone)]

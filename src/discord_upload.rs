@@ -10,14 +10,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 impl DiscordMessenger {
     pub(super) async fn upload_file_inner(
         &self,
-        thread_id: ThreadId,
+        session: crate::domain::Session,
+        target_channel_id: crate::domain::ChannelId,
         request: crate::omp::UploadRequest,
     ) -> Result<String> {
-        let session = self
-            .store
-            .session(thread_id)
-            .await?
-            .context("upload requested for an unknown Discord thread")?;
         let policy = self
             .config
             .guild_policy(session.guild_id)
@@ -43,10 +39,10 @@ impl DiscordMessenger {
             message = message.content(caption);
         }
         // Do not retry this POST: a lost response is not evidence that Discord rejected it.
-        let sent = SerenityChannelId::new(thread_id.get())
+        let sent = SerenityChannelId::new(target_channel_id.get())
             .send_message(&self.http, message).await
             .context("Discord upload failed; delivery may have succeeded. Check the thread before retrying; no automatic retry was made")?;
-        if sent.channel_id.get() != thread_id.get() || sent.attachments.len() != 1 {
+        if sent.channel_id.get() != target_channel_id.get() || sent.attachments.len() != 1 {
             bail!(
                 "Discord upload returned an inconsistent receipt; delivery may have succeeded. Check the thread before retrying"
             );
@@ -55,7 +51,7 @@ impl DiscordMessenger {
         Ok(serde_json::json!({
             "message_id": sent.id.to_string(),
             "channel_id": sent.channel_id.to_string(),
-            "message_url": format!("https://discord.com/channels/{}/{}/{}", session.guild_id, thread_id, sent.id),
+            "message_url": format!("https://discord.com/channels/{}/{}/{}", session.guild_id, target_channel_id, sent.id),
             "attachment": {
                 "filename": attachment.filename,
                 "size": attachment.size,

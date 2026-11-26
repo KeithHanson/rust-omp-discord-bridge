@@ -37,7 +37,7 @@ enum Command {
     /// Validate a replacement without opening or migrating the live database.
     #[command(hide = true)]
     CheckUpdate,
-    /// Start a new OMP session in a Discord channel (headline + thread) and wait for the turn to finish.
+    /// Start a new OMP session in a Discord channel and wait for the turn to finish; --silent drops no thread.
     Trigger {
         /// Discord channel snowflake to start the session in.
         #[arg(long)]
@@ -52,6 +52,10 @@ enum Command {
         /// the thread id; the turn keeps running in the daemon).
         #[arg(long, default_value_t = 7200)]
         timeout: u64,
+        /// Start an unattended session that drops no new thread, headline, or prompt post.
+        /// The AI posts any results through its send-message host tools.
+        #[arg(long)]
+        silent: bool,
     },
 }
 
@@ -132,10 +136,11 @@ async fn execute(cli: Cli) -> Result<()> {
                 prompt,
                 prompt_file,
                 timeout,
-            } => (channel, prompt, prompt_file, timeout),
+                silent,
+            } => (channel, prompt, prompt_file, timeout, silent),
             _ => unreachable!(),
         };
-        let (channel, prompt, prompt_file, timeout) = cmd;
+        let (channel, prompt, prompt_file, timeout, silent) = cmd;
         let prompt = match (prompt, prompt_file) {
             (Some(_), Some(_)) => {
                 bail!("--prompt and --prompt-file are mutually exclusive");
@@ -156,6 +161,7 @@ async fn execute(cli: Cli) -> Result<()> {
             channel_id: channel,
             prompt: prompt.trim().to_owned(),
             timeout_seconds: timeout,
+            silent,
         };
         let validated = request.validate().context("invalid trigger request")?;
         let _ = validated;
@@ -182,6 +188,8 @@ async fn execute(cli: Cli) -> Result<()> {
             }
             if let Some(thread_id) = response.thread_id {
                 eprintln!("[triggered in thread {thread_id}]");
+            } else if let Some(turn_id) = response.turn_id {
+                eprintln!("[silent trigger, turn {turn_id}]");
             }
             return Ok(());
         }
@@ -190,6 +198,8 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         if let Some(thread_id) = response.thread_id {
             eprintln!("[thread {thread_id}]");
+        } else if let Some(turn_id) = response.turn_id {
+            eprintln!("[turn {turn_id}]");
         }
         std::process::exit(1);
     }

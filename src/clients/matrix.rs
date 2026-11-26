@@ -310,6 +310,37 @@ impl ThreadMessenger for MatrixMessenger {
     async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()> {
         self.send(thread_id, content).await
     }
+    async fn send_channel_message(
+        &self,
+        _channel_id: ChannelId,
+        _content: &str,
+    ) -> Result<MessageId> {
+        anyhow::bail!("channel message send is not supported by the Matrix client")
+    }
+    async fn create_thread_from_message(
+        &self,
+        _session_thread_id: ThreadId,
+        _message_id: MessageId,
+        _name: Option<&str>,
+    ) -> Result<ThreadId> {
+        anyhow::bail!("thread creation is not supported by the Matrix client")
+    }
+    async fn send_to_thread(
+        &self,
+        _session_thread_id: ThreadId,
+        _target_thread_id: ThreadId,
+        _content: &str,
+    ) -> Result<()> {
+        anyhow::bail!("explicit thread sends are not supported by the Matrix client")
+    }
+    async fn upload_file_to_channel(
+        &self,
+        _session_thread_id: ThreadId,
+        _target_channel_id: ChannelId,
+        _request: UploadRequest,
+    ) -> Result<String> {
+        anyhow::bail!("channel uploads are not supported by the Matrix client")
+    }
     async fn send_image(&self, thread_id: ThreadId, data: Vec<u8>, filename: String) -> Result<()> {
         let _access = thread_access(&self.store, thread_id).await?;
         let uri = upload_media(&self.http, &data, "image/png", &filename).await?;
@@ -772,6 +803,7 @@ impl<'a> MatrixSync<'a> {
                 trigger_message_id: message_id,
                 cwd: policy.cwd.clone(),
                 created_by_user_id: actor_id,
+                silent: false,
             };
             match self
                 .store

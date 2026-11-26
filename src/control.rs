@@ -52,6 +52,11 @@ pub struct TriggerRequest {
     pub channel_id: u64,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// When true, the trigger starts an unattended session that drops no new
+    /// thread, headline, or prompt post: the session just does the work and
+    /// the AI posts results through its send-message host tools.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 fn default_timeout_seconds() -> u64 {
@@ -109,6 +114,25 @@ impl TriggerResponse {
             error: Some(error.into()),
         }
     }
+}
+/// A unique synthetic snowflake for a silent session. There is no headline or
+/// thread to take identity from, so the id is derived here and never used
+/// against the Discord API; the top bit marks it as synthetic and keeps it
+/// clear of real Discord snowflakes.
+pub fn synthetic_id(request: &TriggerRequest) -> u64 {
+    use sha2::{Digest, Sha256};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let digest = Sha256::digest(
+        format!(
+            "silent-trigger:{nanos}:{}:{}",
+            request.channel_id, request.prompt
+        )
+        .as_bytes(),
+    );
+    u64::from_be_bytes(digest[..8].try_into().expect("truncated hash")) | (1u64 << 63)
 }
 
 /// Reads one bounded, newline-terminated JSON frame from a stream.
@@ -318,6 +342,7 @@ mod tests {
             prompt: "  summarize the repo  ".into(),
             channel_id: 99,
             timeout_seconds: 10,
+            silent: false,
         };
         assert_eq!(valid.validate().unwrap(), "summarize the repo");
 

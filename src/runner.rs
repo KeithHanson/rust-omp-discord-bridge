@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::{
     sync::{Mutex, Notify, Semaphore, mpsc, watch},
     time::timeout,
@@ -19,10 +19,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     activity::ActivityReporter,
-    domain::{ConversationId, MessageId, SessionStatus, ThreadId, Turn, TurnStatus},
+    domain::{ChannelId, ConversationId, MessageId, SessionStatus, ThreadId, Turn, TurnStatus},
     live_config::LiveConfig,
     omp::{
-        AgentTransport, ApprovalRequest, OmpTurnError, OmpUi, TurnControl, TurnInput, UploadRequest,
+        AgentTransport, ApprovalRequest, OmpTurnError, OmpUi, TurnControl, TurnInput,
+        UploadRequest, UploadTarget,
     },
     presence::{PresenceSnapshot, PresenceTracker, WorkingPresence},
     render::chunk_message,
@@ -48,6 +49,19 @@ struct MessageDelivery {
 
 impl MessageDelivery {
     fn new() -> (Self, mpsc::Receiver<QueuedMessage>) {
+        let (sender, receiver) = mpsc::channel(MAX_PENDING_MESSAGES);
+        (
+            Self {
+                sender,
+                assistant_enqueued: AtomicBool::new(false),
+            },
+            receiver,
+        )
+    }
+
+    /// A delivery for silent sessions: the queue is drained and dropped, so no
+    /// message can ever reach a channel.
+    fn discard() -> (Self, mpsc::Receiver<QueuedMessage>) {
         let (sender, receiver) = mpsc::channel(MAX_PENDING_MESSAGES);
         (
             Self {
@@ -96,7 +110,12 @@ async fn deliver_messages(
     mut receiver: mpsc::Receiver<QueuedMessage>,
     message_limit: usize,
     send_timeout: Duration,
+    silent: bool,
 ) {
+    if silent {
+        while receiver.recv().await.is_some() {}
+        return;
+    }
     while let Some(message) = receiver.recv().await {
         // Parse/render the complete assistant message before Discord chunking:
         // a table may span many text-message limits.
@@ -158,6 +177,33 @@ pub trait ThreadMessenger: Send + Sync {
     async fn send(&self, thread_id: ThreadId, content: &str) -> Result<()>;
     async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()>;
     async fn send_image(&self, thread_id: ThreadId, data: Vec<u8>, filename: String) -> Result<()>;
+    /// Post a mention-suppressed message to a channel that may not be a session thread.
+    /// Returns the posted message id.
+    async fn send_channel_message(&self, channel_id: ChannelId, content: &str)
+    -> Result<MessageId>;
+    /// Turn a message in the session's parent channel into a thread. The new
+    /// thread id is returned; it is a real snowflake and is never synthetic.
+    async fn create_thread_from_message(
+        &self,
+        session_thread_id: ThreadId,
+        message_id: MessageId,
+        name: Option<&str>,
+    ) -> Result<ThreadId>;
+    /// Send to an explicit thread in the parent channel of the session.
+    async fn send_to_thread(
+        &self,
+        session_thread_id: ThreadId,
+        target_thread_id: ThreadId,
+        content: &str,
+    ) -> Result<()>;
+    /// Upload to a guild channel in the session's parent channel (the parent
+    /// channel itself, or a thread under it).
+    async fn upload_file_to_channel(
+        &self,
+        session_thread_id: ThreadId,
+        target_channel_id: ChannelId,
+        request: UploadRequest,
+    ) -> Result<String>;
     async fn create_activity(
         &self,
         thread_id: ThreadId,
@@ -492,15 +538,17 @@ impl ThreadQueueRunner {
                     let idle = counts.queued == 0
                         && counts.running == 0
                         && !runner.active.lock().unwrap().contains_key(&conversation_id);
-                    Ok::<_, anyhow::Error>(Some((
-                        session.is_some_and(|session| session.status == SessionStatus::Active)
-                            && counts.queued > 0,
-                        idle,
-                    )))
+                    Ok::<_, anyhow::Error>(session.map(|session| {
+                        (
+                            session.silent,
+                            session.status == SessionStatus::Active && counts.queued > 0,
+                            idle,
+                        )
+                    }))
                 }
                 .await;
                 match remaining {
-                    Ok(Some((true, _))) => {
+                    Ok(Some((_, true, _))) => {
                         // Reset may make new work runnable before a stopped drain settles.
                         if cancellation.is_cancelled() {
                             cancellation = CancellationToken::new();
@@ -508,15 +556,19 @@ impl ThreadQueueRunner {
                         }
                         continue 'drain;
                     }
-                    Ok(Some((false, idle))) => runner.statuses.set(
-                        conversation_id,
-                        thread_id,
-                        if idle {
-                            ThreadStatus::Completed
-                        } else {
-                            ThreadStatus::Working
-                        },
-                    ),
+                    Ok(Some((silent, false, idle))) => {
+                        if !silent {
+                            runner.statuses.set(
+                                conversation_id,
+                                thread_id,
+                                if idle {
+                                    ThreadStatus::Completed
+                                } else {
+                                    ThreadStatus::Working
+                                },
+                            );
+                        }
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         tracing::error!(thread_id = %thread_id, error = %error, "failed to inspect remaining queue");
@@ -799,9 +851,16 @@ impl ThreadQueueRunner {
             if self.store.counts(thread_id).await?.queued == 0 {
                 return Ok(());
             }
-            self.statuses
-                .set(conversation_id, thread_id, ThreadStatus::Working);
-            let presence = presence.get_or_insert_with(|| self.presence.engage(conversation_id));
+            if !session.silent {
+                self.statuses
+                    .set(conversation_id, thread_id, ThreadStatus::Working);
+            }
+            let presence = if session.silent {
+                None
+            } else {
+                presence.get_or_insert_with(|| self.presence.engage(conversation_id));
+                presence.as_ref()
+            };
 
             let _permit = tokio::select! {
                 biased;
@@ -840,7 +899,7 @@ impl ThreadQueueRunner {
         &self,
         turn: &Turn,
         active: &ActiveRun,
-        presence: &WorkingPresence,
+        presence: Option<&WorkingPresence>,
     ) -> Result<()> {
         // Reload after permit acquisition and claiming; the earlier drain
         // snapshot may predate a session reset while waiting for capacity.
@@ -854,15 +913,25 @@ impl ThreadQueueRunner {
         {
             active.cancellation.cancel();
         }
-        let activity = ActivityReporter::start(Arc::clone(&self.messenger), turn.thread_id);
-        let (delivery, receiver) = MessageDelivery::new();
+        let activity = if session.silent {
+            ActivityReporter::silent()
+        } else {
+            ActivityReporter::start(Arc::clone(&self.messenger), turn.thread_id)
+        };
+        let (delivery, receiver) = if session.silent {
+            MessageDelivery::discard()
+        } else {
+            MessageDelivery::new()
+        };
         let run = async {
             let ui = RunnerUi {
                 messenger: Arc::clone(&self.messenger),
                 thread_id: turn.thread_id,
+                parent_channel_id: session.parent_channel_id,
                 activity: &activity,
                 delivery: &delivery,
                 presence,
+                silent: session.silent,
             };
             let control = RunnerControl {
                 runner: self,
@@ -950,6 +1019,7 @@ impl ThreadQueueRunner {
                 receiver,
                 self.message_limit,
                 DELIVERY_TIMEOUT,
+                session.silent,
             )
         );
         activity.finish(status).await;
@@ -1013,9 +1083,11 @@ impl TurnControl for RunnerControl<'_> {
 struct RunnerUi<'a> {
     messenger: Arc<dyn ThreadMessenger>,
     thread_id: ThreadId,
+    parent_channel_id: ChannelId,
     activity: &'a ActivityReporter,
     delivery: &'a MessageDelivery,
-    presence: &'a WorkingPresence,
+    presence: Option<&'a WorkingPresence>,
+    silent: bool,
 }
 
 #[async_trait]
@@ -1029,7 +1101,14 @@ impl OmpUi for RunnerUi<'_> {
     }
 
     async fn confirm(&self, request: ApprovalRequest) -> bool {
-        let _approval = self.presence.awaiting_approval();
+        if self.silent {
+            // Unattended: no human can approve. Deny safely.
+            return false;
+        }
+        let _approval = self
+            .presence
+            .expect("non-silent UI has presence")
+            .awaiting_approval();
         self.activity.update("Waiting for your approval");
         let approved = self.messenger.confirm(self.thread_id, request).await;
         self.activity.update("Working");
@@ -1037,18 +1116,33 @@ impl OmpUi for RunnerUi<'_> {
     }
 
     async fn prompt(&self, request: Value) -> Value {
-        let _waiting = self.presence.awaiting_approval();
+        if self.silent {
+            let id = request
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return json!({"type": "extension_ui_response", "id": id, "cancelled": true});
+        }
+        let _waiting = self
+            .presence
+            .expect("non-silent UI has presence")
+            .awaiting_approval();
         self.activity.update("Waiting for your answer");
         let response = self.messenger.prompt(self.thread_id, request).await;
         self.activity.update("Working");
         response
     }
 
-    async fn notify(&self, message: &str) {
-        self.messenger.notify(self.thread_id, message).await;
+    async fn notify(&self, _message: &str) {
+        if !self.silent {
+            self.messenger.notify(self.thread_id, _message).await;
+        }
     }
 
     async fn channel_history(&self, days: u16) -> Result<String, String> {
+        if self.silent {
+            return Err("silent session has no thread access".to_owned());
+        }
         self.messenger
             .channel_history(self.thread_id, days)
             .await
@@ -1056,6 +1150,9 @@ impl OmpUi for RunnerUi<'_> {
     }
 
     async fn thread_history(&self, thread_id: ThreadId, days: u16) -> Result<String, String> {
+        if self.silent {
+            return Err("silent session has no thread access".to_owned());
+        }
         self.messenger
             .thread_history(self.thread_id, thread_id, days)
             .await
@@ -1063,6 +1160,9 @@ impl OmpUi for RunnerUi<'_> {
     }
 
     async fn thread_participants(&self) -> Result<String, String> {
+        if self.silent {
+            return Err("silent session has no thread access".to_owned());
+        }
         self.messenger
             .thread_participants(self.thread_id)
             .await
@@ -1070,10 +1170,110 @@ impl OmpUi for RunnerUi<'_> {
     }
 
     async fn upload_file(&self, request: UploadRequest) -> Result<String, String> {
-        self.messenger
-            .upload_file(self.thread_id, request)
+        let target = request.target.unwrap_or(if self.silent {
+            UploadTarget::Channel
+        } else {
+            UploadTarget::Thread
+        });
+        match target {
+            UploadTarget::Channel => {
+                if request.thread_id.is_some() {
+                    return Err("`thread_id` is only valid with target \"thread\"".to_owned());
+                }
+                self.messenger
+                    .upload_file_to_channel(self.thread_id, self.parent_channel_id, request)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            }
+            UploadTarget::Thread => {
+                let explicit = match request.thread_id.as_deref() {
+                    Some(text) => {
+                        let id = text.parse::<u64>().map_err(|_| {
+                            "`thread_id` must be a nonzero decimal u64 string".to_owned()
+                        })?;
+                        if id == 0 {
+                            return Err(
+                                "`thread_id` must be a nonzero decimal u64 string".to_owned()
+                            );
+                        }
+                        Some(ThreadId::new(id))
+                    }
+                    None => None,
+                };
+                match explicit {
+                    Some(explicit_id) => self
+                        .messenger
+                        .upload_file_to_channel(self.thread_id, ChannelId::new(explicit_id.get()), request)
+                        .await
+                        .map_err(|error| format!("{error:#}")),
+                    None => {
+                        if self.silent {
+                            return Err(
+                                "silent session has no current thread to upload to; pass target \"channel\" or a thread_id from discord_convert_message_to_thread"
+                                    .to_owned(),
+                            );
+                        }
+                        self.messenger
+                            .upload_file(self.thread_id, request)
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_channel_message(&self, text: &str) -> Result<String, String> {
+        let message_id = self
+            .messenger
+            .send_channel_message(self.parent_channel_id, text)
             .await
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(format!(
+            "Message posted to the parent channel (message id {})",
+            message_id.get()
+        ))
+    }
+
+    async fn send_thread_message(
+        &self,
+        text: &str,
+        thread_id: Option<ThreadId>,
+    ) -> Result<String, String> {
+        if let Some(target) = thread_id {
+            self.messenger
+                .send_to_thread(self.thread_id, target, text)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            return Ok(format!("Message posted to thread {}", target.get()));
+        }
+        if self.silent {
+            return Err(
+                "silent session has no thread to post to; pass the thread_id returned by discord_convert_message_to_thread"
+                    .to_owned(),
+            );
+        }
+        self.messenger
+            .send_assistant(self.thread_id, text)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok("Message posted to the thread".to_owned())
+    }
+
+    async fn convert_message_to_thread(
+        &self,
+        message_id: MessageId,
+        name: Option<&str>,
+    ) -> Result<String, String> {
+        let thread_id = self
+            .messenger
+            .create_thread_from_message(self.thread_id, message_id, name)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(format!(
+            "Message posted as thread (thread id {})",
+            thread_id.get()
+        ))
     }
 }
 
@@ -1131,6 +1331,7 @@ mod tests {
             receiver,
             100,
             DELIVERY_TIMEOUT,
+            false,
         )
         .await;
         let sent = messenger.sent.lock().await;
@@ -1309,6 +1510,10 @@ mod tests {
     #[derive(Default)]
     struct FakeMessenger {
         sent: Mutex<Vec<String>>,
+        channel_sent: Mutex<Vec<(ChannelId, String)>>,
+        thread_sent: Mutex<Vec<(ThreadId, String)>>,
+        channel_uploads: Mutex<Vec<(ChannelId, String)>>,
+        converted_threads: Mutex<Vec<(ThreadId, MessageId, ThreadId)>>,
         attempts: Mutex<Vec<String>>,
         delivered: Option<mpsc::UnboundedSender<String>>,
         send_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
@@ -1387,6 +1592,61 @@ mod tests {
             self.send(thread_id, content).await
         }
 
+        async fn send_channel_message(
+            &self,
+            channel_id: ChannelId,
+            content: &str,
+        ) -> Result<MessageId> {
+            self.channel_sent
+                .lock()
+                .await
+                .push((channel_id, content.to_owned()));
+            Ok(MessageId::new(1))
+        }
+
+        async fn create_thread_from_message(
+            &self,
+            session_thread_id: ThreadId,
+            message_id: MessageId,
+            _name: Option<&str>,
+        ) -> Result<ThreadId> {
+            let new_thread = ThreadId::new(7777);
+            self.converted_threads
+                .lock()
+                .await
+                .push((session_thread_id, message_id, new_thread));
+            Ok(new_thread)
+        }
+
+        async fn send_to_thread(
+            &self,
+            _session_thread_id: ThreadId,
+            target_thread_id: ThreadId,
+            content: &str,
+        ) -> Result<()> {
+            self.thread_sent
+                .lock()
+                .await
+                .push((target_thread_id, content.to_owned()));
+            Ok(())
+        }
+
+        async fn upload_file_to_channel(
+            &self,
+            _session_thread_id: ThreadId,
+            target_channel_id: ChannelId,
+            request: UploadRequest,
+        ) -> Result<String> {
+            let target = format!("channel:{}", target_channel_id.get());
+            self.channel_uploads
+                .lock()
+                .await
+                .push((target_channel_id, target.clone()));
+            Ok(format!(
+                "ok upload to {target} via {}",
+                request.path.file_name().unwrap().to_string_lossy()
+            ))
+        }
         async fn send_image(
             &self,
             thread_id: ThreadId,
@@ -1478,12 +1738,8 @@ mod tests {
             Ok("[]".to_owned())
         }
 
-        async fn upload_file(
-            &self,
-            _thread_id: ThreadId,
-            _request: UploadRequest,
-        ) -> Result<String> {
-            panic!("unexpected file upload")
+        async fn upload_file(&self, _thread_id: ThreadId, request: UploadRequest) -> Result<String> {
+            Ok(format!("ok thread upload of {}", request.path.to_string_lossy()))
         }
 
         async fn thread_status(&self, _thread_id: ThreadId, status: &str) -> Result<()> {
@@ -1518,6 +1774,7 @@ mod tests {
                 trigger_message_id: MessageId::new(3),
                 cwd: directory.path().to_owned(),
                 created_by_user_id: UserId::new(4),
+                silent: false,
             })
             .await
             .unwrap();
@@ -1571,9 +1828,11 @@ mod tests {
         let ui = RunnerUi {
             messenger,
             thread_id: THREAD,
+            parent_channel_id: ChannelId::new(2),
             activity: &activity,
             delivery: &delivery,
-            presence: &working,
+            presence: Some(&working),
+            silent: false,
         };
         let request = ApprovalRequest {
             title: "Allow?".into(),
@@ -1657,9 +1916,11 @@ mod tests {
         let ui = RunnerUi {
             messenger: messenger.clone(),
             thread_id: THREAD,
+            parent_channel_id: ChannelId::new(2),
             activity: &activity,
             delivery: &delivery,
-            presence: &working,
+            presence: Some(&working),
+            silent: false,
         };
         let request = serde_json::json!({
             "type": "extension_ui_request", "id": "form-field", "method": "input",
@@ -1812,6 +2073,7 @@ mod tests {
                 trigger_message_id: MessageId::new(30),
                 cwd: directory.path().to_owned(),
                 created_by_user_id: UserId::new(4),
+                silent: false,
             })
             .await
             .unwrap();
@@ -2650,7 +2912,7 @@ mod tests {
             gate.add_permits(1);
         };
         tokio::join!(
-            deliver_messages(&messenger, THREAD, receiver, 100, DELIVERY_TIMEOUT),
+            deliver_messages(&messenger, THREAD, receiver, 100, DELIVERY_TIMEOUT, false),
             release,
         );
         assert_eq!(
@@ -2862,6 +3124,7 @@ mod tests {
                 trigger_message_id: MessageId::new(30),
                 cwd: directory.path().to_owned(),
                 created_by_user_id: UserId::new(4),
+                silent: false,
             })
             .await
             .unwrap();
@@ -3592,5 +3855,129 @@ allowed_root = "{root}"
             error.to_string().contains("configuration file path"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn silent_sessions_require_a_thread_id_to_send_to_a_thread() {
+        let messenger = Arc::new(FakeMessenger::default());
+        let activity = ActivityReporter::silent();
+        let (delivery, _receiver) = MessageDelivery::new();
+        let ui = RunnerUi {
+            messenger: messenger.clone(),
+            thread_id: THREAD,
+            parent_channel_id: ChannelId::new(2),
+            activity: &activity,
+            delivery: &delivery,
+            presence: None,
+            silent: true,
+        };
+        let error = ui
+            .send_thread_message("hi", None)
+            .await
+            .expect_err("silent session without a thread id must not post");
+        assert!(
+            error.contains("discord_convert_message_to_thread"),
+            "{error}"
+        );
+        assert!(
+            messenger.thread_sent.lock().await.is_empty(),
+            "no send should reach the messenger"
+        );
+        let response = ui
+            .send_thread_message("hi", Some(ThreadId::new(7777)))
+            .await
+            .unwrap();
+        assert!(response.contains("7777"), "{response}");
+        let sent = messenger.thread_sent.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, ThreadId::new(7777));
+        assert_eq!(sent[0].1, "hi");
+    }
+
+    #[tokio::test]
+    async fn silent_sessions_convert_channel_messages_to_threads() {
+        let messenger = Arc::new(FakeMessenger::default());
+        let activity = ActivityReporter::silent();
+        let (delivery, _receiver) = MessageDelivery::new();
+        let ui = RunnerUi {
+            messenger: messenger.clone(),
+            thread_id: THREAD,
+            parent_channel_id: ChannelId::new(2),
+            activity: &activity,
+            delivery: &delivery,
+            presence: None,
+            silent: true,
+        };
+        let response = ui
+            .convert_message_to_thread(MessageId::new(42), Some("Screenshot report"))
+            .await
+            .unwrap();
+        assert!(response.contains("thread id 7777"), "{response}");
+        let converted = messenger.converted_threads.lock().await;
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].1, MessageId::new(42));
+        assert_eq!(converted[0].2, ThreadId::new(7777));
+    }
+
+    #[tokio::test]
+    async fn silent_sessions_upload_to_channel_by_default() {
+        let messenger = Arc::new(FakeMessenger::default());
+        let activity = ActivityReporter::silent();
+        let (delivery, _receiver) = MessageDelivery::new();
+        let ui = RunnerUi {
+            messenger: messenger.clone(),
+            thread_id: THREAD,
+            parent_channel_id: ChannelId::new(2),
+            activity: &activity,
+            delivery: &delivery,
+            presence: None,
+            silent: true,
+        };
+        let path = std::path::PathBuf::from("report.txt");
+        let error = ui
+            .upload_file(UploadRequest {
+                path: path.clone(),
+                caption: None,
+                target: Some(UploadTarget::Thread),
+                thread_id: None,
+            })
+            .await
+            .expect_err("silent thread upload without a thread id is refused");
+        assert!(
+            error.contains("discord_convert_message_to_thread"),
+            "{error}"
+        );
+        assert!(
+            messenger.channel_uploads.lock().await.is_empty(),
+            "refused upload must not reach the messenger"
+        );
+        let response = ui
+            .upload_file(UploadRequest {
+                path: path.clone(),
+                caption: None,
+                target: None,
+                thread_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(response.contains("channel:2"), "{response}");
+        assert_eq!(
+            messenger.channel_uploads.lock().await.len(),
+            1,
+            "default silent upload goes to the channel"
+        );
+        let response = ui
+            .upload_file(UploadRequest {
+                path: path.clone(),
+                caption: None,
+                target: Some(UploadTarget::Thread),
+                thread_id: Some("7777".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert!(response.contains("channel:7777"), "{response}");
+        let channel_uploads = messenger.channel_uploads.lock().await;
+        assert_eq!(channel_uploads.len(), 2, "explicit-thread uploads go through the channel-style path");
+        assert_eq!(channel_uploads[1].0, ChannelId::new(7777));
     }
 }

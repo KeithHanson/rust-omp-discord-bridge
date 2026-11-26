@@ -83,6 +83,23 @@ impl OmpUi for Ui {
     ) -> Result<String, String> {
         Err("Discord is deliberately unavailable in this local smoke test".into())
     }
+    async fn send_channel_message(&self, _: &str) -> Result<String, String> {
+        Err("Discord is deliberately unavailable in this local smoke test".into())
+    }
+    async fn send_thread_message(
+        &self,
+        _: &str,
+        _: Option<ThreadId>,
+    ) -> Result<String, String> {
+        Err("Discord is deliberately unavailable in this local smoke test".into())
+    }
+    async fn convert_message_to_thread(
+        &self,
+        _: MessageId,
+        _: Option<&str>,
+    ) -> Result<String, String> {
+        Err("Discord is deliberately unavailable in this local smoke test".into())
+    }
 }
 
 fn turn(id: i64, content: &str) -> Turn {
@@ -125,6 +142,7 @@ async fn main() -> Result<()> {
         cwd: workspace.clone(),
         created_by_user_id: UserId::new(1),
         status: SessionStatus::Active,
+        silent: false,
     };
     let ui = Ui {
         command_started: Notify::new(),

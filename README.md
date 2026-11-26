@@ -128,6 +128,15 @@ first message(s) in the thread — chunked at `runtime.discord_message_limit`
 and mention-suppressed — before the session is admitted. On post failure the
 thread is deleted and the trigger fails, matching the duplicate-admission path.
 
+### Release 2026-11-26-1
+
+Extends silent triggers with a full post-to-channel toolset: `discord_send_message_channel`
+returns the posted message ID, `discord_convert_message_to_thread` turns a channel message
+into a thread (returning the thread ID), and `discord_send_message_thread` takes an optional
+`thread_id` to post into such a bot-created thread. `discord_upload_file` gains an optional
+`target` (`"channel"` or `"thread"`) and `thread_id`; silent sessions default uploads to the
+channel. Explicit threads must live in the session's parent channel.
+
 ### Release 2026-11-24-3
 
 Adds a local control socket so local automations can start a new OMP session in
@@ -144,6 +153,19 @@ or give an absolute path. It lives in a mode-0700 directory with mode-0600
 permissions, validates the channel against the same guild allowlist as gateway
 messages, and is bounded (8 concurrent triggers, 16 KiB frames, 5 s request
 deadline). `control` changes require a restart.
+
+`--silent` turns the trigger into an unattended session: no thread is created,
+no headline is posted, the prompt is not posted anywhere, and no activity card
+or idle-presence is engaged. The session is admitted with the same checks and
+allowlist rules as a normal trigger, and the AI posts results through its
+send-message host tools instead. The session is identity-bearing only in the
+durable store: it uses a synthetic snowflake (top bit set, never used against
+the Discord API) as both its thread and message id. Silent sessions have no
+Discord thread, so thread-based host tools report "silent session has no
+thread access" — except the tools that target the parent channel or an explicit
+bot-created thread. Approvals and prompts are auto-declined and cancelled, never
+answered by an unattended session. The CLI prints the turn id (not a thread
+id) on success and exits non-zero on failure.
 
 ### Release 2026-11-23-2
 
@@ -253,6 +275,58 @@ release, including a draft, is refused. Failed uploads leave the draft for manua
 inspection; remove an abandoned draft only after checking its state, then retry.
 Never overwrite or retag a published release: commit a new `VERSION` instead.
 No service is installed or restarted by the release script.
+
+### Deploy a candidate build to the test bot
+
+`scripts/test-candidate.sh` builds the current checkout and deploys it to
+an experimental test bot, leaving the test bot running. It never touches the
+running production service, never opens the live database, and never
+rebinds the production control socket.
+
+The test bot lives in its own dedicated setup, separate from the production
+bot:
+
+```
+~/.config/omp-client-bridge-test/config.toml   (mode 600)
+~/.config/omp-client-bridge-test/<token file>  (mode 600)
+~/.local/state/omp-client-bridge-test/          (0700, persistent)
+```
+
+Create the config once (the script prints the exact minimal template if the
+setup is missing), and keep the token file mode 600. The `[control] socket`,
+`[runtime] database_path`, and `[omp] session_dir` in that config must all
+live under the state directory: the script refuses to run otherwise, so a
+candidate can never open the production database or bind the production
+socket.
+
+```bash
+scripts/test-candidate.sh           # release build + deploy to the test bot
+scripts/test-candidate.sh --debug   # faster debug build
+scripts/test-candidate.sh --build-only
+```
+
+On a successful run the script:
+
+1. builds the checkout into `target/candidate/<profile>/`
+2. validates the test bot's config, token, and state layout
+3. stops the running test bot (if any)
+4. replaces the stable binary at `~/.local/state/omp-client-bridge-test/omp-client-bridge`
+5. starts the test bot from that binary and leaves it running
+
+The state directory is persistent: the test bot's database, sessions, and
+`bridge.log` survive between deploys, so the test bot behaves like a small
+production-like deployment of the candidate. Trigger the test bot by hand
+for testing:
+
+```bash
+~/.local/state/omp-client-bridge-test/omp-client-bridge --config \
+  ~/.config/omp-client-bridge-test/config.toml trigger \
+  --channel <test channel id> [--silent] --prompt-file /path/to/prompt.md
+```
+
+To try the candidate against the real bot (which stops and restarts the
+running service and can interrupt active turns), follow the deployment section
+below instead: build into `target/release/` and install the binaries there.
 
 ### Automatic binary updates
 
@@ -504,10 +578,20 @@ omp-client-bridge --config ~/.config/omp-client-bridge/config.toml trigger \
 
 # or from a file / a flag, with a shorter wait
 omp-client-bridge trigger --channel 123456789012345678 --prompt-file /tmp/prompt.md --timeout 3600
+
+# unattended session: no thread, headline, or prompt post
+omp-client-bridge trigger --channel 123456789012345678 --prompt-file /tmp/prompt.md --silent
 ```
 
 `--timeout` bounds the synchronous wait (default 7200s, max 7200s); a timed-out
 turn keeps running and the command exits non-zero while printing the thread id.
+`--silent` drops the thread, headline, prompt post, activity cards, and idle-presence
+engagement; the AI posts results through its send-message host tools. The session is
+identity-bearing only in the durable store (synthetic thread/message id), thread-based
+host tools report "silent session has no thread access" except the tools that target the
+parent channel or an explicit bot-created thread, and approvals/prompts are
+auto-declined/cancelled — never answered by an unattended session. The CLI prints the
+turn id (not a thread id) on success.
 The CLI prints the turn's response to stdout and the thread id to stderr, exiting
 non-zero on failure. The channel headline deliberately keeps only a short
 preview of the prompt; the full prompt is posted as the first message(s) in the
@@ -725,11 +809,36 @@ files are accepted, with reads bounded by `runtime.max_attachment_bytes`
 (25,000,000 bytes by default). Discord can impose a lower limit.
 Uploads share `runtime.discord_history_timeout_seconds`. Opened-file containment
 checks require Linux `/proc/self/fd`, including in containers.
-The result contains the posted message and attachment URLs. No target channel
-argument is accepted. Upload only files authorized for sharing; the allowed root
-is a file-access boundary, not permission to disclose its contents.
+The result contains the posted message and attachment URLs. Upload only files authorized for
+sharing; the allowed root is a file-access boundary, not permission to disclose its contents.
 Interrupted or timed-out uploads may already be visible: inspect the thread
 before retrying rather than creating duplicate attachments.
+The file can target the parent channel with `{"path":"report.pdf","target":"channel"}`,
+or an explicit bot-created thread with `{"path":"report.pdf","target":"thread","thread_id":"12345"}`;
+silent sessions default to the channel. The target thread must be in the session's
+parent channel.
+
+OMP can call `discord_send_message_channel` with `{"text":"..."}` to post a message
+to the parent Discord channel that authorized the session. Mentions are disabled.
+This is the primary "publish the result" tool for `--silent` sessions: a silent
+trigger creates no thread, and the AI posts results here. It is available to every
+session, not just silent ones. The result includes the posted message ID, which
+`discord_convert_message_to_thread` takes as its input. Posting only authorized content: the tool never
+bypasses the fact that the channel is public to the session's guild.
+
+OMP can call `discord_convert_message_to_thread` with
+`{"message_id":"123456789012345678","name":"Screenshot report"}` to turn a message in the
+parent channel into a thread and get back the new thread ID. `name` is optional
+(default "Bot thread", ≤100 characters). The message must be one the bot posted
+in this channel — the tools do not validate sender identity, so only thread your own
+messages. The new thread is created in the parent channel where the message lives.
+
+OMP can call `discord_send_message_thread` with `{"text":"..."}` to post a message
+to the current managed thread. Mentions are disabled. It also accepts an optional
+`thread_id` (the ID returned by `discord_convert_message_to_thread`) for bot-created
+threads — the only thread-targeted send available to silent sessions. Both
+arguments are validated (nonzero decimal string); an explicit thread must be in
+the session's parent channel.
 
 Thread titles are reviewed approximately once a minute while the queue is not
 completed. A separate, tool-free OMP call reads bounded recent conversation

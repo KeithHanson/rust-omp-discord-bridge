@@ -302,13 +302,19 @@ async fn handle_control_connection(
         }
     };
 
+    let thread_id = if request.silent {
+        None
+    } else {
+        Some(prepared.thread_id.get())
+    };
+    let message_id = prepared.headline_id.map(|id| id.get());
     let response = match outcome {
         None => TriggerResponse {
             ok: false,
-            thread_id: Some(prepared.thread_id.get()),
+            thread_id,
             guild_id: Some(prepared.guild_id.get()),
             parent_channel_id: Some(prepared.parent_channel_id.get()),
-            message_id: Some(prepared.headline_id.get()),
+            message_id,
             turn_id: Some(prepared.turn_id),
             response: None,
             error: Some(format!(
@@ -336,10 +342,10 @@ async fn handle_control_connection(
             };
             TriggerResponse {
                 ok: error.is_none(),
-                thread_id: Some(prepared.thread_id.get()),
+                thread_id,
                 guild_id: Some(prepared.guild_id.get()),
                 parent_channel_id: Some(prepared.parent_channel_id.get()),
-                message_id: Some(prepared.headline_id.get()),
+                message_id,
                 turn_id: Some(prepared.turn_id),
                 response: if error.is_none() {
                     outcome.response
@@ -361,7 +367,7 @@ struct PreparedTrigger {
     thread_id: ThreadId,
     guild_id: GuildId,
     parent_channel_id: ChannelId,
-    headline_id: MessageId,
+    headline_id: Option<MessageId>,
     turn_id: i64,
 }
 
@@ -393,6 +399,13 @@ async fn trigger_prepare(
             "channel {} is not in the configured allowlist",
             request.channel_id
         );
+    }
+
+    if request.silent {
+        return trigger_prepare_silent(
+            store, runner, policy, guild_id, channel_id, request, prompt,
+        )
+        .await;
     }
 
     let headline_content = format!("🤖 **OMP trigger** — {}", headline_preview(prompt));
@@ -445,6 +458,7 @@ async fn trigger_prepare(
         trigger_message_id: headline_id,
         cwd: policy.cwd.clone(),
         created_by_user_id: UserId::new(headline.id.get()),
+        silent: false,
     };
     match store.create_session(&input).await? {
         CreateSessionResult::Created(_) => {}
@@ -478,7 +492,63 @@ async fn trigger_prepare(
         thread_id,
         guild_id,
         parent_channel_id: channel_id,
-        headline_id,
+        headline_id: Some(headline_id),
+        turn_id,
+    })
+}
+
+/// The silent variant of trigger admission: same channel allowlist checks, but
+/// no headline, thread, or prompt post. The session just does the work, and the
+/// AI posts results through its send-message host tools. Identity is a
+/// synthetic snowflake (top bit set, never used against the Discord API), so it
+/// cannot collide with a real thread or headline.
+async fn trigger_prepare_silent(
+    store: &Store,
+    runner: &Arc<ThreadQueueRunner>,
+    policy: &GuildPolicy,
+    guild_id: GuildId,
+    channel_id: ChannelId,
+    request: &TriggerRequest,
+    prompt: &str,
+) -> Result<PreparedTrigger> {
+    let synthetic = control::synthetic_id(request);
+    let thread_id = ThreadId::new(synthetic);
+    let identity = MessageId::new(synthetic);
+    let user_id = UserId::new(synthetic);
+    let input = NewSession {
+        thread_id,
+        guild_id,
+        parent_channel_id: channel_id,
+        trigger_message_id: identity,
+        cwd: policy.cwd.clone(),
+        created_by_user_id: user_id,
+        silent: true,
+    };
+    match store.create_session(&input).await? {
+        CreateSessionResult::Created(_) => {}
+        CreateSessionResult::Existing(_) => {
+            bail!("OMP session already exists for this trigger");
+        }
+    }
+    let turn_id = match store
+        .enqueue_turn(
+            thread_id,
+            identity,
+            input.created_by_user_id,
+            prompt,
+            TurnSource::Human,
+        )
+        .await?
+    {
+        EnqueueResult::Enqueued(turn_id) => turn_id,
+        EnqueueResult::Duplicate => bail!("trigger was already admitted"),
+    };
+    runner.poke(thread_id).await;
+    Ok(PreparedTrigger {
+        thread_id,
+        guild_id,
+        parent_channel_id: channel_id,
+        headline_id: None,
         turn_id,
     })
 }
@@ -774,6 +844,155 @@ impl ThreadMessenger for DiscordMessenger {
         send_without_mentions(&self.http, thread_id, content).await
     }
 
+    async fn send_channel_message(
+        &self,
+        channel_id: ChannelId,
+        content: &str,
+    ) -> Result<MessageId> {
+        let sent = SerenityChannelId::new(channel_id.get())
+            .send_message(
+                &self.http,
+                CreateMessage::new()
+                    .content(operational_content(content))
+                    .allowed_mentions(CreateAllowedMentions::new()),
+            )
+            .await?;
+        Ok(MessageId::new(sent.id.get()))
+    }
+
+    async fn create_thread_from_message(
+        &self,
+        session_thread_id: ThreadId,
+        message_id: MessageId,
+        name: Option<&str>,
+    ) -> Result<ThreadId> {
+        let session = self
+            .store
+            .session(session_thread_id)
+            .await?
+            .context("thread creation requested for an unknown session")?;
+        let policy = self
+            .config
+            .guild_policy(session.guild_id)
+            .context("thread creation requested for an unconfigured guild")?;
+        if !policy.allowed_channels.contains(&session.parent_channel_id) {
+            bail!("session parent channel is not authorized for thread creation");
+        }
+        let name = name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Bot thread");
+        let builder = CreateThread::new(name)
+            .auto_archive_duration(AutoArchiveDuration::from(
+                self.config
+                    .discord
+                    .as_ref()
+                    .expect("Discord configuration is required")
+                    .thread_auto_archive_minutes,
+            ))
+            .audit_log_reason("OMP Discord bridge session");
+        let thread = builder
+            .execute(
+                &self.http,
+                (
+                    SerenityChannelId::new(session.parent_channel_id.get()),
+                    Some(serenity::all::MessageId::new(message_id.get())),
+                ),
+            )
+            .await
+            .context("failed to create Discord thread from message")?;
+        Ok(ThreadId::new(thread.id.get()))
+    }
+
+    async fn send_to_thread(
+        &self,
+        session_thread_id: ThreadId,
+        target_thread_id: ThreadId,
+        content: &str,
+    ) -> Result<()> {
+        let session = self
+            .store
+            .session(session_thread_id)
+            .await?
+            .context("thread send requested for an unknown session")?;
+        let policy = self
+            .config
+            .guild_policy(session.guild_id)
+            .context("thread send requested for an unconfigured guild")?;
+        if !policy.allowed_channels.contains(&session.parent_channel_id) {
+            bail!("session parent channel is not authorized for sends");
+        }
+        let channel = self
+            .http
+            .get_channel(SerenityChannelId::new(target_thread_id.get()))
+            .await
+            .context("cannot read target thread")?;
+        let Channel::Guild(channel) = channel else {
+            bail!("target thread is not a guild channel");
+        };
+        if channel.parent_id.map(|id| id.get()) != Some(session.parent_channel_id.get()) {
+            bail!("target thread is not in the session's parent channel");
+        }
+        let mut bots = Vec::new();
+        for id in textual_user_mentions(content) {
+            if let Ok(user) = self.http.get_user(serenity::all::UserId::new(id)).await
+                && user.bot
+            {
+                bots.push(user.id);
+            }
+        }
+        SerenityChannelId::new(target_thread_id.get())
+            .send_message(
+                &self.http,
+                CreateMessage::new()
+                    .content(content)
+                    .allowed_mentions(bot_reply_mentions(bots)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn upload_file_to_channel(
+        &self,
+        session_thread_id: ThreadId,
+        target_channel_id: ChannelId,
+        request: crate::omp::UploadRequest,
+    ) -> Result<String> {
+        let _access = thread_access(&self.store, session_thread_id).await?;
+        let session = self
+            .store
+            .session(session_thread_id)
+            .await?
+            .context("upload requested for an unknown session")?;
+        let policy = self
+            .config
+            .guild_policy(session.guild_id)
+            .context("upload requested for an unconfigured guild")?;
+        if !policy.allowed_channels.contains(&session.parent_channel_id) {
+            bail!("session parent channel is not authorized for uploads");
+        }
+        if target_channel_id != session.parent_channel_id {
+            let channel = self
+                .http
+                .get_channel(SerenityChannelId::new(target_channel_id.get()))
+                .await
+                .context("cannot read target channel")?;
+            let Channel::Guild(channel) = channel else {
+                bail!("target channel is not a guild channel");
+            };
+            if channel.parent_id.map(|id| id.get()) != Some(session.parent_channel_id.get()) {
+                bail!("target channel is not the session's parent channel or a thread under it");
+            }
+        }
+        tokio::time::timeout(
+            Duration::from_secs(self.config.runtime.discord_history_timeout_seconds),
+            self.upload_file_inner(session, target_channel_id, request),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!(
+            "Discord upload timed out; delivery may have succeeded. Check the thread before retrying; no automatic retry was made"
+        ))?
+    }
     async fn send_assistant(&self, thread_id: ThreadId, content: &str) -> Result<()> {
         let _access = thread_access(&self.store, thread_id).await?;
         // The runner's send deadline includes user lookups as well as delivery.
@@ -924,9 +1143,18 @@ impl ThreadMessenger for DiscordMessenger {
         request: crate::omp::UploadRequest,
     ) -> Result<String> {
         let _access = thread_access(&self.store, thread_id).await?;
+        let session = self
+            .store
+            .session(thread_id)
+            .await?
+            .context("upload requested for an unknown Discord thread")?;
         tokio::time::timeout(
             Duration::from_secs(self.config.runtime.discord_history_timeout_seconds),
-            self.upload_file_inner(thread_id, request),
+            self.upload_file_inner(
+                session,
+                ChannelId::new(thread_id.get()),
+                request,
+            ),
         )
         .await
         .map_err(|_| anyhow::anyhow!(
@@ -1735,6 +1963,7 @@ impl DiscordHandler {
             trigger_message_id: MessageId::new(message.id.get()),
             cwd: policy.cwd.clone(),
             created_by_user_id: UserId::new(message.author.id.get()),
+            silent: false,
         };
         let session = match self.store.create_session(&input).await? {
             CreateSessionResult::Created(session) | CreateSessionResult::Existing(session) => {
@@ -1803,6 +2032,7 @@ impl DiscordHandler {
             trigger_message_id: MessageId::new(message.id.get()),
             cwd: policy.cwd.clone(),
             created_by_user_id: UserId::new(message.author.id.get()),
+            silent: false,
         };
         match self.store.create_session(&input).await? {
             CreateSessionResult::Created(_) => {}
@@ -3553,6 +3783,7 @@ mod tests {
                 trigger_message_id: MessageId::new(100),
                 cwd: root.to_owned(),
                 created_by_user_id: UserId::new(7),
+                silent: false,
             })
             .await
             .unwrap();
@@ -3634,6 +3865,8 @@ mod tests {
                     crate::omp::UploadRequest {
                         path: "report.txt".into(),
                         caption: Some("@everyone <@7> report".into()),
+                        target: None,
+                        thread_id: None,
                     },
                 )
                 .await
@@ -3710,6 +3943,8 @@ mod tests {
                     crate::omp::UploadRequest {
                         path: "missing".into(),
                         caption: None,
+                        target: None,
+                        thread_id: None,
                     },
                 )
                 .await
@@ -3744,6 +3979,8 @@ mod tests {
                 crate::omp::UploadRequest {
                     path: "report.txt".into(),
                     caption: None,
+                    target: None,
+                    thread_id: None,
                 },
             )
             .await
@@ -4214,7 +4451,9 @@ mod tests {
                     crate::omp::UploadRequest {
                         path: "must-not-open".into(),
                         caption: None,
-                    }
+                        target: None,
+                        thread_id: None,
+                    },
                 )
                 .await
                 .unwrap_err()
@@ -4304,6 +4543,7 @@ mod tests {
                 trigger_message_id: MessageId::new(99),
                 cwd: root.path().to_path_buf(),
                 created_by_user_id: UserId::new(7),
+                silent: false,
             })
             .await
             .unwrap();
@@ -4358,6 +4598,7 @@ mod tests {
                 trigger_message_id: MessageId::new(99),
                 cwd: root.path().to_path_buf(),
                 created_by_user_id: UserId::new(7),
+                silent: false,
             })
             .await
             .unwrap();
@@ -4419,6 +4660,7 @@ mod tests {
                 trigger_message_id: MessageId::new(99),
                 cwd: root.path().to_path_buf(),
                 created_by_user_id: UserId::new(7),
+                silent: false,
             })
             .await
             .unwrap();

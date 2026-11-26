@@ -20,7 +20,7 @@ struct Activity {
 
 pub(crate) struct ActivityReporter {
     sender: watch::Sender<Activity>,
-    worker: JoinHandle<()>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl ActivityReporter {
@@ -35,7 +35,22 @@ impl ActivityReporter {
                 tracing::warn!(%thread_id, %error, "activity message delivery stopped");
             }
         });
-        Self { sender, worker }
+        Self {
+            sender,
+            worker: Some(worker),
+        }
+    }
+    /// A quiet reporter for silent (unattended) sessions: there is no thread to
+    /// embed into, so activity updates and completion are dropped.
+    pub(crate) fn silent() -> Self {
+        let (sender, _receiver) = watch::channel(Activity {
+            label: "Starting OMP",
+            finished: false,
+        });
+        Self {
+            sender,
+            worker: None,
+        }
     }
 
     pub(crate) fn update(&self, label: &'static str) {
@@ -53,7 +68,9 @@ impl ActivityReporter {
             label,
             finished: true,
         });
-        if let Err(error) = self.worker.await {
+        if let Some(worker) = self.worker
+            && let Err(error) = worker.await
+        {
             tracing::warn!(%error, "activity message task failed");
         }
     }
@@ -145,6 +162,36 @@ mod tests {
         }
 
         async fn send(&self, _: ThreadId, _: &str) -> Result<()> {
+            unreachable!("activity must use the activity delivery methods")
+        }
+
+        async fn send_channel_message(
+            &self,
+            _: crate::domain::ChannelId,
+            _: &str,
+        ) -> Result<MessageId> {
+            unreachable!("activity must use the activity delivery methods")
+        }
+
+        async fn create_thread_from_message(
+            &self,
+            _: ThreadId,
+            _: MessageId,
+            _: Option<&str>,
+        ) -> Result<ThreadId> {
+            unreachable!("activity must use the activity delivery methods")
+        }
+
+        async fn send_to_thread(&self, _: ThreadId, _: ThreadId, _: &str) -> Result<()> {
+            unreachable!("activity must use the activity delivery methods")
+        }
+
+        async fn upload_file_to_channel(
+            &self,
+            _: ThreadId,
+            _: crate::domain::ChannelId,
+            _: crate::omp::UploadRequest,
+        ) -> Result<String> {
             unreachable!("activity must use the activity delivery methods")
         }
 
