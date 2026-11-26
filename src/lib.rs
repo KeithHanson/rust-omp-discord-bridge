@@ -1,4 +1,5 @@
 mod activity;
+pub mod voice;
 pub mod config;
 pub mod clients;
 pub mod domain;

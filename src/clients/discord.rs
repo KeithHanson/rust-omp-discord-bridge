@@ -22,7 +22,7 @@ use serenity::{
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
         EditMessage, Embed, EventHandler, GatewayIntents, GetMessages, GuildChannel, Http,
         Interaction, Member, Message, MessageFlags, OnlineStatus, Ready, ResumedEvent, ThreadMember,
-        ThreadMembersUpdateEvent, Timestamp, User,
+        ThreadMembersUpdateEvent, Timestamp, User, VoiceState,
     },
     builder::Builder,
     gateway::{ActivityData, ShardMessenger},
@@ -31,6 +31,11 @@ use serenity::{
 use tokio::{
     sync::{Semaphore, mpsc, oneshot, watch},
     time::Instant,
+};
+
+use songbird::{
+    Config as SongbirdConfig, SerenityInit, Songbird,
+    driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
 };
 
 use crate::{
@@ -44,6 +49,7 @@ use crate::{
     store::{CreateSessionResult, EnqueueResult, Store, TurnSource},
     threadwatch::ControlCommand,
     titles::{ReviewedTitle, TitleReviewer},
+    voice::VoiceBridge,
 };
 
 #[path = "../discord_prompts.rs"]
@@ -102,6 +108,26 @@ pub async fn run(live_config: LiveConfig, store: Store, command_receiver: mpsc::
     let presence = runner.subscribe_presence();
     let (presence_target, presence_targets) = watch::channel(None);
     let admission = Arc::new(tokio::sync::RwLock::new(()));
+
+    // Voice bridge: created only when the [voice] section is present.
+    let voice = config.voice.clone().map(|voice_config| {
+        let songbird = Songbird::serenity_from_config(SongbirdConfig::default().decode_mode(
+            DecodeMode::Decode(DecodeConfig::new(Channels::Mono, SampleRate::Hz16000)),
+        ));
+        let allowed_guilds: std::collections::HashSet<u64> = config
+            .discord
+            .guilds
+            .iter()
+            .map(|policy| policy.id.get())
+            .collect();
+        let bridge = Arc::new(VoiceBridge::new(
+            voice_config,
+            allowed_guilds,
+            Arc::clone(&songbird),
+        ));
+        (bridge, songbird)
+    });
+
     let handler = DiscordHandler {
         config: Arc::clone(&config),
         store: store.clone(),
@@ -111,10 +137,20 @@ pub async fn run(live_config: LiveConfig, store: Store, command_receiver: mpsc::
         bot_user_id,
         presence_target,
         admission: Arc::clone(&admission),
+        voice: voice.as_ref().map(|(bridge, _)| Arc::clone(bridge)),
     };
-    let intents =
+
+    let mut intents =
         GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
-    let mut client = Client::builder(&token, intents)
+    if voice.is_some() {
+        intents |= GatewayIntents::GUILD_VOICE_STATES;
+    }
+
+    let mut builder = Client::builder(&token, intents);
+    if let Some((_, songbird)) = &voice {
+        builder = builder.register_songbird_with(Arc::clone(songbird));
+    }
+    let mut client = builder
         .event_handler(handler)
         .await
         .context("failed to create Discord client")?;
@@ -1170,6 +1206,7 @@ struct DiscordHandler {
     bot_user_id: Arc<AtomicU64>,
     presence_target: watch::Sender<Option<ShardMessenger>>,
     admission: Arc<tokio::sync::RwLock<()>>,
+    voice: Option<Arc<VoiceBridge>>,
 }
 
 #[async_trait]
@@ -1178,11 +1215,21 @@ impl EventHandler for DiscordHandler {
         self.bot_user_id
             .store(ready.user.id.get(), Ordering::Release);
         self.presence_target.send_replace(Some(context.shard));
+        if let Some(voice) = &self.voice {
+            voice.set_bot_name(ready.user.name.to_string());
+        }
         tracing::info!(user = %ready.user.name, "Discord bridge connected");
     }
 
     async fn resume(&self, context: Context, _event: ResumedEvent) {
         self.presence_target.send_replace(Some(context.shard));
+    }
+
+    async fn voice_state_update(&self, _context: Context, _old: Option<VoiceState>, new: VoiceState) {
+        let Some(voice) = &self.voice else { return };
+        if let Err(error) = voice.on_voice_state_update(&new).await {
+            tracing::warn!(error = %error, "voice bridge failed to update");
+        }
     }
 
     async fn thread_members_update(&self, _context: Context, event: ThreadMembersUpdateEvent) {
@@ -2548,6 +2595,7 @@ mod tests {
                 turn_timeout_seconds: 60,
             },
             threadwatch: None,
+            voice: None,
         }
     }
 
@@ -3320,6 +3368,7 @@ mod tests {
             bot_user_id: Arc::new(AtomicU64::new(9)),
             presence_target: watch::channel(None).0,
             admission: Arc::new(tokio::sync::RwLock::new(())),
+            voice: None,
         }
     }
 

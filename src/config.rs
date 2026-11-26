@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub omp: OmpConfig,
     pub runtime: RuntimeConfig,
     pub threadwatch: Option<ThreadwatchConfig>,
+    pub voice: Option<VoiceConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,32 @@ pub struct ThreadwatchConfig {
     pub heartbeat_interval_ms: u64,
 }
 
+/// Voice bridge configuration. Absence of the section disables the feature;
+/// every other section is ignored when the voice bridge is off.
+#[derive(Debug, Clone)]
+pub struct VoiceConfig {
+    /// WebSocket URL of the voice model (e.g. llama serve /v1/realtime).
+    pub model_url: String,
+    /// HTTP(S) endpoint that answers hand_off requests with the words the
+    /// voice assistant should say next.
+    pub hand_off_url: String,
+    /// Discord user the bridge serves: it joins the operator's voice channel.
+    pub operator_user_id: u64,
+    /// System-prompt template for the voice model. `{bot_name}` is substituted
+    /// at runtime with the bridged Discord bot's name.
+    pub system_prompt: String,
+}
+
+impl VoiceConfig {
+    /// Render the system prompt with the actual bot name substituted.
+    pub fn render_system_prompt(&self, bot_name: &str) -> String {
+        self.system_prompt.replace("{bot_name}", bot_name)
+    }
+}
+
+/// Default system prompt when `voice.system_prompt` is omitted.
+pub const DEFAULT_VOICE_SYSTEM_PROMPT: &str = "You are a voice agent. Your name: {bot_name}. Your only job is to interpret the voice requests from a human operator and hand them off to another AI to process. That AI will produce results and tell you what to say next. You will ALWAYS ask this AI via the hand_off tool for every request, but you will also respond to the human operator when you do - letting them know you're thinking or processing their message. Phrases like 'let me think about that...' or 'got it... one sec...' and other similar phrases are acceptable while waiting on the tool call responses.";
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub database_path: PathBuf,
@@ -100,6 +127,7 @@ struct RawConfig {
     #[serde(default)]
     runtime: RawRuntimeConfig,
     threadwatch: Option<RawThreadwatchConfig>,
+    voice: Option<RawVoiceConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +192,15 @@ struct RawThreadwatchConfig {
     collect_interval_ms: u64,
     #[serde(default = "default_threadwatch_heartbeat_interval_ms")]
     heartbeat_interval_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVoiceConfig {
+    model_url: String,
+    hand_off_url: String,
+    operator_user_id: String,
+    system_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,6 +413,58 @@ impl AppConfig {
             .transpose()?;
 
 
+        let voice = raw
+            .voice
+            .map(|config| -> Result<VoiceConfig> {
+                let url = reqwest::Url::parse(&config.model_url)
+                    .context("voice.model_url must be a WebSocket origin")?;
+                if !matches!(url.scheme(), "ws" | "wss")
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                    || url.host_str().is_none()
+                {
+                    bail!("voice.model_url must be a WebSocket URL (ws:// or wss://)");
+                }
+                let hand_off = reqwest::Url::parse(&config.hand_off_url)
+                    .context("voice.hand_off_url must be an HTTP(S) URL")?;
+                if !matches!(hand_off.scheme(), "http" | "https")
+                    || !hand_off.username().is_empty()
+                    || hand_off.password().is_some()
+                    || hand_off.host_str().is_none()
+                {
+                    bail!("voice.hand_off_url must be an HTTP(S) URL");
+                }
+                let operator_user_id = config
+                    .operator_user_id
+                    .parse::<u64>()
+                    .context("voice.operator_user_id must be a Discord user id")?;
+                if operator_user_id == 0 {
+                    bail!("voice.operator_user_id must be a non-zero Discord user id");
+                }
+                let system_prompt = match config.system_prompt {
+                    Some(prompt) => {
+                        let prompt = prompt.trim().to_owned();
+                        if prompt.is_empty() {
+                            bail!("voice.system_prompt must not be empty");
+                        }
+                        if prompt.len() > 4_096 {
+                            bail!("voice.system_prompt must be at most 4096 characters");
+                        }
+                        prompt
+                    }
+                    None => DEFAULT_VOICE_SYSTEM_PROMPT.to_owned(),
+                };
+                Ok(VoiceConfig {
+                    model_url: url.to_string(),
+                    hand_off_url: hand_off.to_string(),
+                    operator_user_id,
+                    system_prompt,
+                })
+            })
+            .transpose()?;
+
         if raw.runtime.max_concurrency == 0 {
             bail!("runtime.max_concurrency must be at least 1");
         }
@@ -478,6 +567,7 @@ impl AppConfig {
                 turn_timeout_seconds: raw.runtime.turn_timeout_seconds,
             },
             threadwatch,
+            voice,
         })
     }
 
@@ -656,6 +746,7 @@ mod tests {
             },
             runtime: RawRuntimeConfig::default(),
             threadwatch: None,
+            voice: None,
         };
 
         let error = AppConfig::from_raw(raw).expect_err("empty channel allowlist must fail");
@@ -692,6 +783,7 @@ mod tests {
             },
             runtime: RawRuntimeConfig::default(),
             threadwatch: None,
+            voice: None,
         };
 
         let error = AppConfig::from_raw(raw).expect_err("cwd escape must fail");
@@ -723,6 +815,7 @@ mod tests {
             },
             runtime: RawRuntimeConfig::default(),
             threadwatch: None,
+            voice: None,
         })
         .expect("valid config");
         let policy = config.guild_policy(GuildId::new(1)).expect("guild policy");
@@ -757,6 +850,75 @@ mod tests {
     }
 
 
+    #[test]
+    fn voice_section_is_optional_and_disabled_by_absence() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        assert!(raw.voice.is_none());
+        let config = AppConfig::from_raw(raw).expect("valid config without voice");
+        assert!(config.voice.is_none(), "absent voice section must leave the feature off");
+    }
+
+    #[test]
+    fn voice_section_applies_default_prompt_template_and_validates_urls() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.voice = Some(RawVoiceConfig {
+            model_url: "wss://host.example/v1/realtime".to_owned(),
+            hand_off_url: "https://host.example:8999/delegate".to_owned(),
+            operator_user_id: "345678901234567890".to_owned(),
+            system_prompt: None,
+        });
+        let config = AppConfig::from_raw(raw).expect("valid voice config");
+        let voice = config.voice.expect("voice config");
+        assert!(voice.system_prompt.contains("{bot_name}"), "default prompt must keep the bot-name placeholder");
+        assert!(voice.system_prompt.contains("hand_off"));
+
+        let rendered = voice.render_system_prompt("Aria");
+        assert!(rendered.contains("Aria"));
+        assert!(!rendered.contains("{bot_name}"));
+
+        let mut bad = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        bad.voice = Some(RawVoiceConfig {
+            model_url: "https://host.example/v1/realtime".to_owned(),
+            hand_off_url: "https://host.example:8999/delegate".to_owned(),
+            operator_user_id: "345678901234567890".to_owned(),
+            system_prompt: None,
+        });
+        assert!(AppConfig::from_raw(bad).is_err(), "model_url must be ws(s)");
+
+        let mut bad = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        bad.voice = Some(RawVoiceConfig {
+            model_url: "wss://host.example/v1/realtime".to_owned(),
+            hand_off_url: "ws://host.example:8999/delegate".to_owned(),
+            operator_user_id: "345678901234567890".to_owned(),
+            system_prompt: None,
+        });
+        assert!(AppConfig::from_raw(bad).is_err(), "hand_off_url must be http(s)");
+    }
+
+    #[test]
+    fn voice_system_prompt_is_bounded_and_nonempty() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        raw.voice = Some(RawVoiceConfig {
+            model_url: "wss://host.example/v1/realtime".to_owned(),
+            hand_off_url: "https://host.example:8999/delegate".to_owned(),
+            operator_user_id: "345678901234567890".to_owned(),
+            system_prompt: Some("   ".to_owned()),
+        });
+        assert!(AppConfig::from_raw(raw).is_err(), "blank system prompt must fail");
+
+        let mut oversized = raw_with_runtime(root.path(), RawRuntimeConfig::default());
+        oversized.voice = Some(RawVoiceConfig {
+            model_url: "wss://host.example/v1/realtime".to_owned(),
+            hand_off_url: "https://host.example:8999/delegate".to_owned(),
+            operator_user_id: "345678901234567890".to_owned(),
+            system_prompt: Some("x".repeat(4_097)),
+        });
+        assert!(AppConfig::from_raw(oversized).is_err(), "oversized system prompt must fail");
+    }
+
     fn raw_with_runtime(root: &Path, runtime: RawRuntimeConfig) -> RawConfig {
         RawConfig {
             discord: RawDiscordConfig {
@@ -780,6 +942,7 @@ mod tests {
             },
             runtime,
             threadwatch: None,
+            voice: None,
         }
     }
 

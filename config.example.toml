@@ -53,3 +53,13 @@ turn_timeout_seconds = 3600
 # data_dir = "~/.local/state/threadwatch-collector"
 # collect_interval_ms = 2000
 # heartbeat_interval_ms = 10000
+
+# Optional voice bridge. Absent means the bridge never joins voice channels.
+# When present, the bridge joins the voice channel whenever the operator is in one.
+# The operator is the Discord user whose state triggers the join.
+# [voice]
+# model_url = "wss://192.168.1.173:8998/v1/realtime"        # ws:// or wss://
+# hand_off_url = "https://192.168.1.173:8999/delegate"      # http:// or https://
+# operator_user_id = "345678901234567890"                    # Discord user id
+# system_prompt = "You are a voice agent. Your name: {bot_name}. ..."  # optional; default provided
+# ({bot_name} is substituted with the bot's Discord name.)

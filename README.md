@@ -21,6 +21,7 @@ Discord maps one thread to one OMP conversation. Matrix supports room-scoped con
 - restart recovery that marks interrupted turns uncertain instead of replaying them;
 - bounded attachment metadata and Discord-safe response chunking;
 - on-demand OMP access to bounded parent-channel and same-parent thread message history.
+- optional voice-to-voice bridge for the configured operator, joining their voice channel with a voice model and a single `hand_off` tool (see Voice bridge below).
 
 Discord attachments are passed as bounded CDN metadata. Matrix media is downloaded through the authenticated media API into the protected OMP session state directory.
 
@@ -421,6 +422,40 @@ For migration from a standalone Threadwatch collector:
 5. Start or roll over the bridge using the normal idle-safe procedure. Verify a fresh ready heartbeat and zero queued batches before deleting the retired collector unit/configuration.
 
 Rollback reverses configuration, not data: stop the bridge reporter, restore the standalone collector against the same authoritative state directory, and never restore a stale queue snapshot. The bridge's existing Discord token supplies optional read-only title/avatar lookup; no separate collector Discord credential or bridge JSON file is used.
+
+### Voice bridge
+
+The optional `[voice]` section runs a voice-to-voice bridge for the operator. When the configured
+operator enters a voice channel, the bridge joins that channel as well; when the operator leaves,
+the bridge leaves and tears down the session. Absent the section, the bridge is never constructed:
+the feature is disabled and every voice hook is a no-op.
+
+```toml
+[voice]
+model_url = "wss://192.168.1.173:8998/v1/realtime"        # ws:// or wss://
+hand_off_url = "https://192.168.1.173:8999/delegate"      # http:// or https://
+operator_user_id = "345678901234567890"                    # Discord user id
+system_prompt = "You are a voice agent. Your name: {bot_name}. ..."  # optional; default provided
+```
+
+- `operator_user_id` is required: the operator's voice state is the only state that triggers a
+  join or leave. The bridge does not react to other users in the channel.
+- The Discord token, gateway intents, and existing guild allowlists all apply as documented —
+  the bridge joins only in configured guilds and only for the configured operator.
+- The voice model is offered exactly one tool: `hand_off`. When the model calls it, the bridge
+  POSTs `{question, context}` to `hand_off_url` and injects the reply back into the voice model as
+  text for it to say. The response body should be a JSON object with `ok: true` and `reply`.
+- Speech capture uses a voice-activity detector (16 kHz mono PCM derived by songbird from the
+  channel); an utterance is sent when 80 ms of silence follows speech or at a 30 second cap.
+- The voice model speaks 24 kHz mono PCM; the bridge buffers the model's audio and pipes it back
+  into the channel through songbird.
+- `system_prompt` is a template; `{bot_name}` is substituted with the bot's Discord name. The
+  default prompt asks the voice agent to always ask the configured hand_off service for every
+  request and to also respond to the operator while waiting.
+
+`check` validates the voice configuration (URLs, operator id, prompt bounds) without opening a
+socket. Running the bridge with `run` and a real [voice] section is the only way to exercise the
+voice pipeline end-to-end.
 
 ## Validate and run
 The bridge launches the configured OMP executable and uses its normal authentication sources, including `~/.omp/agent/agent.db`, OMP `.env` files, and environment variables inherited from the bridge process. Leave `omp.model` unset to use OMP's configured default. If set, use an exact provider/model ID shown by `omp models`; `openai-codex` subscription authentication is separate from the API-key-based `openai` provider.
