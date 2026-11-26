@@ -55,8 +55,10 @@ A local OMP 18.20.0 smoke probe exercised the real HTML `ask` tool with a radio 
 The bridge does not pass `--approval-mode` or `--auto-approve`. OMP's project configuration in the session working directory governs `tools.approvalMode`; when the project does not set it, OMP's normal configuration layering and default apply. Read-only calls and approved actions retain their normal OMP capabilities.
 
 Before the first prompt in each process, the bridge registers `discord_channel_history`,
-`discord_thread_history`, `discord_thread_participants`, and `discord_upload_file`
-with `set_host_tools`, and requires OMP to acknowledge all four.
+`discord_thread_history`, `discord_thread_participants`, and `discord_upload_file` with `set_host_tools`, and requires OMP to acknowledge all four.
+Only `--silent` sessions additionally register the post-to-channel toolset:
+`discord_send_message_channel`, `discord_send_message_thread`, and `discord_convert_message_to_thread`, which post to the parent channel or an explicit bot-created thread (an upload's `target`/`thread_id` arguments are likewise silent-session-only).
+Normal sessions coordinate the output through the bridge itself and receive no channel-target posting tools.
 Both history tools require integer `days` from 1 through
 `runtime.discord_history_max_days`. The channel tool reads the managed session's
 authorized parent channel. The thread tool additionally requires `thread_id` as
@@ -86,6 +88,7 @@ file to the current session thread, with mentions disabled, and returns a JSON
 delivery receipt. Relative paths use the session working directory; resolved files
 must remain inside `omp.allowed_root`. File reads are bounded by
 `runtime.max_attachment_bytes`; Discord may enforce a lower upload limit.
+In `--silent` sessions the upload tool additionally accepts `target` (`"channel"` or `"thread"`) and `thread_id`; silent sessions default uploads to the parent channel, where non-silent sessions upload to the current thread.
 Uploads are external side effects: cancellation or a transport error can leave an
 already-posted attachment. Inspect the thread before retrying an uncertain upload.
 File access is not permission to publish secrets or unrelated private information.

@@ -816,13 +816,15 @@ before retrying rather than creating duplicate attachments.
 The file can target the parent channel with `{"path":"report.pdf","target":"channel"}`,
 or an explicit bot-created thread with `{"path":"report.pdf","target":"thread","thread_id":"12345"}`;
 silent sessions default to the channel. The target thread must be in the session's
-parent channel.
+parent channel. These channel/thread target options are available to `--silent` sessions only;
+in normal sessions the AI uploads to the session's current thread.
 
 OMP can call `discord_send_message_channel` with `{"text":"..."}` to post a message
 to the parent Discord channel that authorized the session. Mentions are disabled.
 This is the primary "publish the result" tool for `--silent` sessions: a silent
-trigger creates no thread, and the AI posts results here. It is available to every
-session, not just silent ones. The result includes the posted message ID, which
+trigger creates no thread, and the AI posts results here. It is available to silent
+sessions only — normal sessions coordinate the output through the bridge, and the AI
+has no channel-target posting tools. The result includes the posted message ID, which
 `discord_convert_message_to_thread` takes as its input. Posting only authorized content: the tool never
 bypasses the fact that the channel is public to the session's guild.
 
@@ -832,13 +834,14 @@ parent channel into a thread and get back the new thread ID. `name` is optional
 (default "Bot thread", ≤100 characters). The message must be one the bot posted
 in this channel — the tools do not validate sender identity, so only thread your own
 messages. The new thread is created in the parent channel where the message lives.
+Silent sessions only — normal sessions do not get this tool.
 
 OMP can call `discord_send_message_thread` with `{"text":"..."}` to post a message
 to the current managed thread. Mentions are disabled. It also accepts an optional
 `thread_id` (the ID returned by `discord_convert_message_to_thread`) for bot-created
 threads — the only thread-targeted send available to silent sessions. Both
 arguments are validated (nonzero decimal string); an explicit thread must be in
-the session's parent channel.
+the session's parent channel. Silent sessions only — normal sessions do not get this tool.
 
 Thread titles are reviewed approximately once a minute while the queue is not
 completed. A separate, tool-free OMP call reads bounded recent conversation
