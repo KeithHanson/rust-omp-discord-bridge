@@ -114,15 +114,16 @@ pub async fn run(live_config: LiveConfig, store: Store, command_receiver: mpsc::
         let songbird = Songbird::serenity_from_config(SongbirdConfig::default().decode_mode(
             DecodeMode::Decode(DecodeConfig::new(Channels::Mono, SampleRate::Hz16000)),
         ));
-        let allowed_guilds: std::collections::HashSet<u64> = config
+        let guild_cwds: std::collections::HashMap<u64, std::path::PathBuf> = config
             .discord
             .guilds
             .iter()
-            .map(|policy| policy.id.get())
+            .map(|policy| (policy.id.get(), policy.cwd.clone()))
             .collect();
         let bridge = Arc::new(VoiceBridge::new(
             voice_config,
-            allowed_guilds,
+            config.omp.clone(),
+            guild_cwds,
             Arc::clone(&songbird),
         ));
         (bridge, songbird)

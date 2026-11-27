@@ -1260,7 +1260,7 @@ async fn cancel_requests<W: AsyncWrite + Unpin>(
     .await
 }
 
-fn take_frames(
+pub(crate) fn take_frames(
     process: &mut Child,
 ) -> Result<FramedRead<tokio::process::ChildStdout, LinesCodec>, OmpTurnError> {
     let stdout = process
@@ -1273,7 +1273,7 @@ fn take_frames(
     ))
 }
 
-async fn expect_ready<R: AsyncRead + Unpin>(
+pub(crate) async fn expect_ready<R: AsyncRead + Unpin>(
     frames: &mut FramedRead<R, LinesCodec>,
 ) -> Result<(), OmpTurnError> {
     loop {
@@ -1293,7 +1293,7 @@ async fn expect_ready<R: AsyncRead + Unpin>(
     }
 }
 
-fn next_frame(
+pub(crate) fn next_frame(
     frame: Option<Result<String, tokio_util::codec::LinesCodecError>>,
     accepted: bool,
 ) -> Result<Value, OmpTurnError> {
@@ -1320,7 +1320,7 @@ fn next_frame(
         .map_err(|error| OmpTurnError::Protocol(format!("OMP emitted invalid JSON: {error}")))
 }
 
-async fn send_frame<W>(input: &mut BufWriter<W>, frame: &Value) -> Result<(), OmpTurnError>
+pub(crate) async fn send_frame<W>(input: &mut BufWriter<W>, frame: &Value) -> Result<(), OmpTurnError>
 where
     W: AsyncWrite + Unpin,
 {

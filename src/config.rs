@@ -79,17 +79,18 @@ pub struct ThreadwatchConfig {
 
 /// Voice bridge configuration. Absence of the section disables the feature;
 /// every other section is ignored when the voice bridge is off.
+///
+/// The bridge runs the voice session as an OMP live session (the same
+/// machinery as the TUI's /live): omp captures the operator's speech through a
+/// virtual audio path, speaks back through the virtual speaker, and delegates
+/// tool work into the session it drives.
 #[derive(Debug, Clone)]
 pub struct VoiceConfig {
-    /// WebSocket URL of the voice model (e.g. llama serve /v1/realtime).
-    pub model_url: String,
-    /// HTTP(S) endpoint that answers hand_off requests with the words the
-    /// voice assistant should say next.
-    pub hand_off_url: String,
     /// Discord user the bridge serves: it joins the operator's voice channel.
     pub operator_user_id: u64,
-    /// System-prompt template for the voice model. `{bot_name}` is substituted
-    /// at runtime with the bridged Discord bot's name.
+    /// System-prompt template for the live session, rendered as a Handlebars
+    /// template with `{{username}}` and `{{firstName}}` of the local OS account.
+    /// `{bot_name}` is substituted at runtime with the bridged Discord bot's name.
     pub system_prompt: String,
 }
 
@@ -101,7 +102,11 @@ impl VoiceConfig {
 }
 
 /// Default system prompt when `voice.system_prompt` is omitted.
-pub const DEFAULT_VOICE_SYSTEM_PROMPT: &str = "You are a voice agent. Your name: {bot_name}. Your only job is to interpret the voice requests from a human operator and hand them off to another AI to process. That AI will produce results and tell you what to say next. You will ALWAYS ask this AI via the hand_off tool for every request, but you will also respond to the human operator when you do - letting them know you're thinking or processing their message. Phrases like 'let me think about that...' or 'got it... one sec...' and other similar phrases are acceptable while waiting on the tool call responses.";
+///
+/// Rendered by OMP as a Handlebars template with `{{username}}` and
+/// `{{firstName}}` of the local OS account; `{bot_name}` is substituted by the
+/// bridge before the prompt reaches OMP.
+pub const DEFAULT_VOICE_SYSTEM_PROMPT: &str = "You: voice assistant of the omp coding agent, speaking to a human operator in a Discord voice channel.\n\n<critical>\n- You + omp coding agent: one assistant, not separate agents.\n- You MUST delegate repository work, coding, tool use, verification to the omp backend.\n- You MUST keep conversation natural while the backend works.\n</critical>\n\nThe operator speaks to you in a Discord voice channel. Respond directly, briefly, conversationally, with speech-friendly phrasing; never use markdown, code blocks, or long lists, and never read implementation detail aloud unless requested.\n\nThe operator's OS account: {{username}}. First name: {{firstName}}.\nYour name is {bot_name}.\n\nRepository work, investigation, coding changes, commands, or verification: promptly create a delegation with a complete plain-language request and all relevant conversational context; never attempt tool work yourself. Keep going naturally while the backend works. A request arriving mid-work starts a new delegation that steers the same backend session.\n\nTreat delegation context as your own internal progress and results. Never describe the backend as another assistant. Briefly acknowledge active work; never claim changes, findings, or verification before the backend reports. Commentary is for conversational continuity, never a recitation.\n\nContext beginning with \"Agent Final Message:\" is the backend's final visible answer; present its useful result naturally as your own, never mention the label, a delegation, or the backend.\n\nGreetings, clarification, and ordinary conversation needing no repository or tools: answer directly without delegation. Ask a concise clarifying question only when an execution request is genuinely underspecified.\n\nPreserve one-assistant continuity: converse here, delegate execution, and communicate the returned result as your own.";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -197,8 +202,6 @@ struct RawThreadwatchConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVoiceConfig {
-    model_url: String,
-    hand_off_url: String,
     operator_user_id: String,
     system_prompt: Option<String>,
 }
@@ -416,26 +419,6 @@ impl AppConfig {
         let voice = raw
             .voice
             .map(|config| -> Result<VoiceConfig> {
-                let url = reqwest::Url::parse(&config.model_url)
-                    .context("voice.model_url must be a WebSocket origin")?;
-                if !matches!(url.scheme(), "ws" | "wss")
-                    || !url.username().is_empty()
-                    || url.password().is_some()
-                    || url.query().is_some()
-                    || url.fragment().is_some()
-                    || url.host_str().is_none()
-                {
-                    bail!("voice.model_url must be a WebSocket URL (ws:// or wss://)");
-                }
-                let hand_off = reqwest::Url::parse(&config.hand_off_url)
-                    .context("voice.hand_off_url must be an HTTP(S) URL")?;
-                if !matches!(hand_off.scheme(), "http" | "https")
-                    || !hand_off.username().is_empty()
-                    || hand_off.password().is_some()
-                    || hand_off.host_str().is_none()
-                {
-                    bail!("voice.hand_off_url must be an HTTP(S) URL");
-                }
                 let operator_user_id = config
                     .operator_user_id
                     .parse::<u64>()
@@ -457,8 +440,6 @@ impl AppConfig {
                     None => DEFAULT_VOICE_SYSTEM_PROMPT.to_owned(),
                 };
                 Ok(VoiceConfig {
-                    model_url: url.to_string(),
-                    hand_off_url: hand_off.to_string(),
                     operator_user_id,
                     system_prompt,
                 })
@@ -860,19 +841,16 @@ mod tests {
     }
 
     #[test]
-    fn voice_section_applies_default_prompt_template_and_validates_urls() {
+    fn voice_section_applies_default_prompt_template_and_validates_id() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
         raw.voice = Some(RawVoiceConfig {
-            model_url: "wss://host.example/v1/realtime".to_owned(),
-            hand_off_url: "https://host.example:8999/delegate".to_owned(),
             operator_user_id: "345678901234567890".to_owned(),
             system_prompt: None,
         });
         let config = AppConfig::from_raw(raw).expect("valid voice config");
         let voice = config.voice.expect("voice config");
         assert!(voice.system_prompt.contains("{bot_name}"), "default prompt must keep the bot-name placeholder");
-        assert!(voice.system_prompt.contains("hand_off"));
 
         let rendered = voice.render_system_prompt("Aria");
         assert!(rendered.contains("Aria"));
@@ -880,21 +858,17 @@ mod tests {
 
         let mut bad = raw_with_runtime(root.path(), RawRuntimeConfig::default());
         bad.voice = Some(RawVoiceConfig {
-            model_url: "https://host.example/v1/realtime".to_owned(),
-            hand_off_url: "https://host.example:8999/delegate".to_owned(),
-            operator_user_id: "345678901234567890".to_owned(),
+            operator_user_id: "not-a-number".to_owned(),
             system_prompt: None,
         });
-        assert!(AppConfig::from_raw(bad).is_err(), "model_url must be ws(s)");
+        assert!(AppConfig::from_raw(bad).is_err(), "operator_user_id must be a Discord user id");
 
         let mut bad = raw_with_runtime(root.path(), RawRuntimeConfig::default());
         bad.voice = Some(RawVoiceConfig {
-            model_url: "wss://host.example/v1/realtime".to_owned(),
-            hand_off_url: "ws://host.example:8999/delegate".to_owned(),
-            operator_user_id: "345678901234567890".to_owned(),
+            operator_user_id: "0".to_owned(),
             system_prompt: None,
         });
-        assert!(AppConfig::from_raw(bad).is_err(), "hand_off_url must be http(s)");
+        assert!(AppConfig::from_raw(bad).is_err(), "operator_user_id must be non-zero");
     }
 
     #[test]
@@ -902,8 +876,6 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let mut raw = raw_with_runtime(root.path(), RawRuntimeConfig::default());
         raw.voice = Some(RawVoiceConfig {
-            model_url: "wss://host.example/v1/realtime".to_owned(),
-            hand_off_url: "https://host.example:8999/delegate".to_owned(),
             operator_user_id: "345678901234567890".to_owned(),
             system_prompt: Some("   ".to_owned()),
         });
@@ -911,8 +883,6 @@ mod tests {
 
         let mut oversized = raw_with_runtime(root.path(), RawRuntimeConfig::default());
         oversized.voice = Some(RawVoiceConfig {
-            model_url: "wss://host.example/v1/realtime".to_owned(),
-            hand_off_url: "https://host.example:8999/delegate".to_owned(),
             operator_user_id: "345678901234567890".to_owned(),
             system_prompt: Some("x".repeat(4_097)),
         });

@@ -57,6 +57,17 @@ fn ensure_restart_fields_unchanged(current: &AppConfig, candidate: &AppConfig) -
     {
         changed.push("runtime fields other than max_response_bytes, discord_history_max_days, and turn_timeout_seconds");
     }
+    let voice_changed = match (&current.voice, &candidate.voice) {
+        (Some(old), Some(new)) => {
+            old.operator_user_id != new.operator_user_id
+                || old.system_prompt != new.system_prompt
+        }
+        (None, None) => false,
+        _ => true,
+    };
+    if voice_changed {
+        changed.push("voice");
+    }
     if current.threadwatch.is_some() != candidate.threadwatch.is_some() {
         changed.push("threadwatch");
     } else if let (Some(old), Some(new)) = (&current.threadwatch, &candidate.threadwatch) {
